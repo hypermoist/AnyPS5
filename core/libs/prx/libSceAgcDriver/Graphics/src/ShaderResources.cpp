@@ -3399,9 +3399,88 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
-void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+    if (_set == VK_NULL_HANDLE || usesBda || moved.empty()) return {};
+    auto result = std::make_shared<DrawBindings>();
+    std::vector<VkDescriptorBufferInfo> infos;
+    std::vector<std::size_t> selected;
+    infos.reserve(moved.size());
+    for (const auto& entry : moved) {
+        const auto& item = allocations[entry.allocation];
+        if (!entry.words.empty()) {
+            auto buffer = std::make_shared<Buffer>(context, entry.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            std::memcpy(buffer->Bytes().data(), entry.words.data(), entry.size);
+            for (const auto& patch : dataPatches) {
+                if (patch.allocation == entry.allocation && patch.byte < entry.size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+            }
+            infos.push_back({buffer->Handle(), 0, entry.size});
+            result->snapshots.push_back({0, std::move(buffer)});
+        } else {
+            const auto begin = entry.address - item.adjustment;
+            const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
+            const auto* import = HostImportFor(context, begin, bytes);
+            if (import != nullptr && (begin - import->base) % context.limits.minStorageBufferOffsetAlignment == 0) {
+                infos.push_back({import->buffer, begin - import->base, bytes});
+                recorder.NotePendingRead(begin, bytes, Recorder::ReadKind::DispatchElement);
+            } else {
+                const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+                const auto generation = GuestMemory::CollectWrites(begin, bytes);
+                auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
+                if (buffer == nullptr) {
+                    buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                    std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                    recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                }
+                infos.push_back({buffer->Handle(), 0, bytes});
+                result->snapshots.push_back({begin, std::move(buffer)});
+            }
+        }
+        selected.push_back(entry.allocation);
+    }
+    Require(context.descriptorCache != nullptr, "moved buffer bindings require a descriptor cache");
+    std::map<VkDescriptorType, std::uint32_t> counts;
+    for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
+    std::vector<VkDescriptorPoolSize> sizes;
+    for (const auto& [type, count] : counts) sizes.push_back({type, count});
+    result->cache = context.descriptorCache;
+    result->allocation = result->cache->Allocate(_layout, sizes);
+    Require(result->allocation.set != VK_NULL_HANDLE, "moved buffer descriptor allocation failed");
+    std::vector<VkCopyDescriptorSet> copies;
+    for (const auto& binding : bindings) {
+        VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+        copy.srcSet = _set;
+        copy.srcBinding = binding.layout.binding;
+        copy.dstSet = result->allocation.set;
+        copy.dstBinding = binding.layout.binding;
+        copy.descriptorCount = binding.layout.descriptorCount;
+        copies.push_back(copy);
+    }
+    const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
+    update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
+    std::vector<VkWriteDescriptorSet> writes;
+    for (const auto& binding : bindings) {
+        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+            const auto found = std::find(selected.begin(), selected.end(), binding.allocations[element]);
+            if (found == selected.end()) continue;
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = result->allocation.set;
+            write.dstBinding = binding.layout.binding;
+            write.dstArrayElement = static_cast<std::uint32_t>(element);
+            write.descriptorCount = 1;
+            write.descriptorType = binding.layout.descriptorType;
+            write.pBufferInfo = &infos[static_cast<std::size_t>(found - selected.begin())];
+            writes.push_back(write);
+        }
+    }
+    update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    recorder.Keep(result);
+    return result;
+}
+
+void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set) const {
     if (_set == VK_NULL_HANDLE) return;
-    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
+    const auto bound = set != VK_NULL_HANDLE ? set : _set;
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &bound, 0, nullptr);
 }
 
 namespace {
