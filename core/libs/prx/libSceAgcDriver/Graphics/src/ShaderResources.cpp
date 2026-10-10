@@ -774,7 +774,10 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 }
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
-void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+std::array<std::atomic<std::uint64_t>, 4> storageEvictions{};
+
+void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it, std::size_t reason = 0) {
+    storageEvictions[reason].fetch_add(1, std::memory_order_relaxed);
     it->texture->SetCached(false);
     noteUncached(it->texture);
     it->texture->Flush();
@@ -848,18 +851,18 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     if (resource.mipCount > AllocatedLevels(resource)) {
         auto allocated = resource;
         allocated.mipCount = AllocatedLevels(resource);
-        if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evictStorage(cache, found);
+        if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evictStorage(cache, found, 1);
     }
     auto it = findStorage(cache, key);
     if (it != cache.entries.end() && MetadataMoved(*it->texture, resource)) {
-        evictStorage(cache, it);
+        evictStorage(cache, it, 2);
         it = cache.entries.end();
     }
     if (profile) {
         static auto lastLive = std::chrono::steady_clock::now();
         if (std::chrono::steady_clock::now() - lastLive > std::chrono::seconds(10)) {
             lastLive = std::chrono::steady_clock::now();
-            AgcDriver::ProfilePrint_nid_no_patch("[storage-live] cache %llu MiB of budget %llu MiB; live images: %s\n", static_cast<unsigned long long>(cache.bytes >> 20u), static_cast<unsigned long long>(storageBudget(context) >> 20u), LiveStorageReport().c_str());
+            AgcDriver::ProfilePrint_nid_no_patch("[storage-live] cache %llu MiB of budget %llu MiB; created %llu; evictions: mips %llu, metadata %llu, budget %llu; live images: %s\n", static_cast<unsigned long long>(cache.bytes >> 20u), static_cast<unsigned long long>(storageBudget(context) >> 20u), static_cast<unsigned long long>(counters.storageCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storageEvictions[1].exchange(0)), static_cast<unsigned long long>(storageEvictions[2].exchange(0)), static_cast<unsigned long long>(storageEvictions[3].exchange(0)), LiveStorageReport().c_str());
         }
     }
     if (it != cache.entries.end()) {
@@ -883,7 +886,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
     entry.accounted = heldBytes(*entry.texture);
     const auto budget = storageBudget(context);
-    while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evictStorage(cache, std::prev(cache.entries.end()));
+    while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evictStorage(cache, std::prev(cache.entries.end()), 3);
     cache.bytes += entry.accounted;
     auto texture = entry.texture;
     cache.entries.push_front(std::move(entry));
