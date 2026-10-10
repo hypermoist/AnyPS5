@@ -997,7 +997,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
     }
     if (args == nullptr) Require(draw.indexCount != 0 && draw.instanceCount != 0, "zero-count indexed draws are unsupported");
-    else Require((!state.stages.mesh || draw.indexed) && !state.stages.tessellation && !state.rectList, "indirect draw on a non-vertex path must be resolved by the driver");
+    else Require(!state.stages.tessellation && !state.rectList, "indirect draw on a non-vertex path must be resolved by the driver");
     inputs.indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
     const auto indexBytes = inputs.indexBytes;
     APS5_LOG_OUT_DEBUG("Index buffer bytes=%llu", static_cast<unsigned long long>(indexBytes));
@@ -1365,7 +1365,7 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
 
 std::shared_ptr<Buffer> recordMeshArguments(const Context& context, VkCommandBuffer commands, Recorder* recorder, bool recorded, const State& state, const Pm4::DrawParameters& draw, const IndirectRecord& indirect, const std::function<void(std::uint32_t)>& countBarrier) {
     const auto* args = indirect.args;
-    const auto rules = MeshArgumentRulesFor(context, *state.stages.mesh, draw.indexCount);
+    const auto rules = MeshArgumentRulesFor(context, *state.stages.mesh, draw.indexed ? draw.indexCount : std::numeric_limits<std::uint32_t>::max());
     auto arguments = std::make_shared<Buffer>(context, ShaderRecompiler::MeshArgumentBytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     if (indirect.path == IndirectDrawPath::Gpu && recorder != nullptr && indirect.argumentImport->address != 0) {
         const std::array<std::uint32_t, 7> words{rules.indexCount, rules.inputSize, rules.step, rules.primitivesPerGroup, rules.maxGroups, rules.maxInstances, rules.maxTotal};

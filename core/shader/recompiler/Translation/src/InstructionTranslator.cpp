@@ -288,7 +288,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         for (std::uint32_t reg = 4u; reg < 8u; reg++) {
             entryIr.SetScalarReg(static_cast<ScalarReg>(reg), u32(0u));
         }
-        entryIr.SetVectorReg(static_cast<VectorReg>(5), entryIr.IAdd(draw(1u), entryIr.Select(indexed, index, inputVertex)));
+        entryIr.SetVectorReg(static_cast<VectorReg>(5), entryIr.IAdd(draw(1u), entryIr.Select(indexed, index, entryIr.IAdd(inputVertex, firstIndex))));
         entryIr.SetVectorReg(static_cast<VectorReg>(6), u32(0u));
         entryIr.SetVectorReg(static_cast<VectorReg>(7), u32(0u));
         entryIr.SetVectorReg(static_cast<VectorReg>(8), entryIr.IAdd(draw(2u), builtin(StageInputKind::WorkgroupId, 1u)));
