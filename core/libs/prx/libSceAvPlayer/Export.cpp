@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 #include "SceTypes.hpp"
@@ -32,6 +33,7 @@ extern "C" {
 
 int APS5_VABI sceAvPlayerAddSource(AvPlayerInternal* h, const char* filename) {
     if (!h || !filename) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    std::fprintf(stderr, "[avplayer] %p add source %s\n", static_cast<void*>(h), filename);
     return ToPlayer(h)->AddSource(filename, SourceTypeUnknown);
 }
 
@@ -143,6 +145,7 @@ int APS5_VABI sceAvPlayerResume(AvPlayerInternal* h) {
 
 int APS5_VABI sceAvPlayerSetAvSyncMode(AvPlayerInternal* h, uint32_t sync_mode) {
     if (!h) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    std::fprintf(stderr, "[avplayer] %p sync mode %u\n", static_cast<void*>(h), sync_mode);
     return ToPlayer(h)->SetAvSyncMode(sync_mode);
 }
 
