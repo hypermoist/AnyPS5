@@ -245,6 +245,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.interpolationFunctions = supports(spv::CapabilityInterpolationFunction);
     translateOptions.floatMode = request.context.floatMode;
     translateOptions.float32FlushToZero = HardwareFloat32Flush(request);
+    translateOptions.relaxedFloat = request.target.relaxedFloat;
     translateOptions.inputInfo = inputInfo;
 
     constexpr InstructionTranslator translator;

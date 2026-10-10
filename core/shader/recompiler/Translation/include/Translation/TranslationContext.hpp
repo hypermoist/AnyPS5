@@ -26,6 +26,7 @@ public:
     void SetEntryRounding(const RoundingState& state) { setRounding(state); }
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
     void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
+    void SetRelaxedFloat(bool relaxed) { relaxedFloat = relaxed; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
     void TranslateUnlinkedCall(const RdnaInstruction& instruction);
@@ -379,6 +380,7 @@ private:
     std::optional<ShaderFloatMode> floatMode;
     std::optional<ShaderFloatMode> declaredFloatMode;
     RoundingState rounding;
+    bool relaxedFloat = false;
     bool ieeeMode = false;
     bool nativeFloat16 = false;
     IrBuilder ir;
