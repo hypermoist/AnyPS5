@@ -256,18 +256,24 @@ VideoOutDriver::VideoOutDriver() {
     }
     try {
         AgcDriverWaitIdle_nid_postfix();
-        std::promise<void> started;
-        auto attached = started.get_future();
-        presentThread = std::jthread([this, &started](std::stop_token token) {
+        // The window is created and attached on the calling thread. Created on the presentation
+        // thread while this one waited, SDL's X11 backend (XWayland under KWin) never saw the
+        // MapNotify it blocks on in SDL_CreateWindow, and the first VideoOut call never returned.
+        try {
+            window.Ensure(VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT);
+            const auto extensions = windowExtensions(window.Handle());
+            AgcDriverAttachWindow_nid_postfix({window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr});
+        } catch (...) {
+            window.Destroy();
+            throw;
+        }
+        presentThread = std::jthread([this](std::stop_token token) {
             try {
                 AgcDriverRaiseWorkerThreadPriority_nid_postfix("presenter");
             } catch (...) {
-                started.set_exception(std::current_exception());
-                return;
             }
-            presentLoop(token, started);
+            presentLoop(token);
         });
-        attached.get();
         vblankThread = std::jthread([this](std::stop_token token) { vblankLoop(token); });
         LibcRegisterShutdown_nid_postfix([] { VideoOutDriver::Get().Shutdown(); });
     } catch (...) {
@@ -545,17 +551,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     timing.Mark("notify_game");
 }
 
-void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& started) {
-    try {
-        window.Ensure(VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT);
-        const auto extensions = windowExtensions(window.Handle());
-        AgcDriverAttachWindow_nid_postfix({window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr});
-    } catch (...) {
-        window.Destroy();
-        started.set_exception(std::current_exception());
-        return;
-    }
-    started.set_value();
+void VideoOutDriver::presentLoop(std::stop_token token) {
     std::shared_ptr<FlipRequest> current;
 #if APS5_ENABLE_TIMING_LOG
     std::unique_ptr<FrameTimingLog> timingLog;
