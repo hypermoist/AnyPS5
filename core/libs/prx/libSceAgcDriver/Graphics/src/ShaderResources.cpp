@@ -781,7 +781,7 @@ std::atomic<std::uint64_t> storageFrame{1};
 std::list<CachedStorageTexture>::iterator storageVictim(StorageTextureCache& cache) {
     static const bool lru = std::getenv("APS5_STORAGE_LRU") != nullptr;
     const auto frame = storageFrame.load(std::memory_order_relaxed);
-    if (!lru) {
+    if (!lru && cache.entries.back().usedFrame + 2u >= frame) {
         for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
             if (it->usedFrame != frame) return it;
         }
