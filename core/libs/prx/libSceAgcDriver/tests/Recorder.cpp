@@ -1120,6 +1120,65 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
     Require(texel(*past, 3) == 0x77777777u, "the level past the last mip was not read from its addrlib tail slot");
 }
 
+void largeDrawInputTests(const Device& device) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: large draw inputs not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 8u << 20u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the large input block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the large input block refused: large draw inputs not tested\n";
+        return;
+    }
+    const auto element = address + 65536;
+    constexpr std::uint32_t elementBytes = 5u << 20u;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u};
+    binding.bufferWritten = {false};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    {
+        auto snapshotContext = context;
+        DescriptorCache cache(snapshotContext);
+        snapshotContext.descriptorCache = &cache;
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, compute);
+        Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "a read-only draw input above the snapshot limit was copied");
+        const auto info = snapshotRecorder.DescribePendingRead(element, 16);
+        Require(info.has_value() && info->kind == Recorder::ReadKind::DispatchElement && snapshotRecorder.PendingReadOverlaps(element + elementBytes - 4, 4), "a draw input bound in place was not noted as a pending read");
+        snapshotRecorder.Sync();
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    std::free(block);
+#endif
+}
+
 void resourceReadTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -4853,6 +4912,7 @@ int main(int argc, char** argv) {
         resourceReadTests(device, recorder);
         readWrittenStagingTests(device, recorder);
         depthSurfaceProofTests(device, recorder);
+        largeDrawInputTests(device);
         misalignedSnapshotTests(device, recorder);
         misalignedRegionTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
