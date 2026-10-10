@@ -243,7 +243,7 @@ void Driver::execute(const Submission& submission) {
             currentPacketOffset() = cursor;
             if (gateOpened()) {
                 gateOpened() = false;
-                timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
+                timed(&WorkerProfile::dispatchMs, [&] { skipFailed("dispatch group", [&] { resolveGroupAhead(submission, queue, cursor); }); });
             }
             if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { skipFailed("dispatch", [&] { dispatch(queue, packet, submission); }); });
             else timed(&WorkerProfile::dispatchMs, [&] { skipFailed("dispatch", [&] { dispatchIndirect(queue, packet, submission); }); });
