@@ -3224,6 +3224,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+        static const std::size_t snapshotLimit = [] {
+            const char* value = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
+            return static_cast<std::size_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : 4ull) << 20u;
+        }();
+        if (override == moved.end() && bytes > snapshotLimit) {
+            recorder.NotePendingRead(begin, bytes, Recorder::ReadKind::DispatchElement);
+            continue;
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
