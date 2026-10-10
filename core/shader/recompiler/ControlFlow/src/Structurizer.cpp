@@ -519,8 +519,13 @@ std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock
     }
     const auto joinsAt = [&](std::uint32_t join, std::uint32_t other) {
         const auto& arm = graph.FindBlock(other);
+        const auto through = [&](std::uint32_t successor) {
+            const auto& next = graph.FindBlock(successor);
+            return next.terminator.kind == TerminatorKind::Branch && next.successors.size() == 1u && next.predecessors.size() == 1u ? next.successors.front() : successor;
+        };
         const bool armLeavesOrJoins = arm.terminator.kind == TerminatorKind::ConditionalBranch && arm.predecessors.size() == 1u && std::all_of(arm.successors.begin(), arm.successors.end(), [&](std::uint32_t successor) {
-            return successor == join || successor == loop->continueBlock || successor == loop->mergeBlock;
+            const auto target = through(successor);
+            return target == join || target == loop->continueBlock || target == loop->mergeBlock;
         });
         return armLeavesOrJoins && isInsideLoopConstruct(graph, *loop, other) && isInsideLoopConstruct(graph, *loop, join) && graph.Dominates(block.id, join);
     };
@@ -643,6 +648,12 @@ bool splitSharedMergeBlock(ControlFlowGraph& graph, std::uint32_t merge, const s
 
     if (constructPredecessors.empty() || (!forceSplit && !hasExternalPredecessor)) {
         return false;
+    }
+    if (constructPredecessors.size() == 1u) {
+        const auto& only = graph.FindBlock(constructPredecessors.front());
+        if (only.instructionBegin == only.instructionEnd && only.terminator.kind == TerminatorKind::Branch && only.successors.size() == 1u) {
+            return false;
+        }
     }
 
     const auto syntheticMerge = appendSyntheticBranchBlock(graph, merge);
