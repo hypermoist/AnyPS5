@@ -472,6 +472,11 @@ std::uint64_t forcedCacheBudget() {
 }
 
 std::uint64_t storageBudget(const Context& context) {
+    static const std::uint64_t storageForced = [] {
+        const char* text = std::getenv("APS5_STORAGE_CACHE_MIB");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) << 20u : 0u;
+    }();
+    if (storageForced != 0) return storageForced;
     const auto forced = forcedCacheBudget();
     return forced != 0 ? forced : TextureCacheBudget(context.memory);
 }
