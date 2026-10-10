@@ -101,6 +101,11 @@ int APS5_VABI sceNpEntitlementAccessGetEntitlementKey(
     return errorNoEntitlement;
 }
 
+int APS5_VABI sceNpEntitlementAccessGetGameTrialsFlag() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 int APS5_VABI sceNpEntitlementAccessInitialize(const NpEntitlementAccessInitParam* init_param, NpEntitlementAccessBootParam* boot_param) {
     (void)init_param;
     (void)boot_param;
