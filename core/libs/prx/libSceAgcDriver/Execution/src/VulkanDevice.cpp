@@ -349,8 +349,7 @@ struct VulkanDevice::State {
 
     template<typename TFunction>
     TFunction DeviceFunction(const char* name) const {
-        ++Graphics::DeviceProcLookups();
-        auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
+        auto function = reinterpret_cast<TFunction>(Graphics::CachedDeviceProc(device, deviceProc, name));
         if (function == nullptr) {
             throw std::runtime_error(std::string("Vulkan device function missing: ") + name);
         }
