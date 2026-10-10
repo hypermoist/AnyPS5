@@ -1,6 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
-#include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
@@ -9,7 +8,6 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <new>
 #include <string>
 #include <vector>
 
@@ -19,7 +17,8 @@ using AgcDriver::Graphics::Require;
 using ShaderRecompiler::ShaderStage;
 
 constexpr std::uint32_t Threads = 64;
-constexpr std::size_t BlockBytes = 65536;
+alignas(256) std::array<std::uint32_t, Threads> Input{};
+alignas(256) std::array<std::uint32_t, Threads> Output{};
 
 alignas(256) constexpr std::array<std::uint32_t, 9> SquareCode{0x34020082u, 0xe0301000u, 0x80000201u, 0xbf8c3f70u, 0x10040502u, 0xe0701000u, 0x80010201u, 0xbf810000u, 0u};
 
@@ -43,9 +42,14 @@ ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const
         device.Target(),
         {0, 0, 0, 128}
     };
-    request.useCache = false;
     request.target.relaxedFloat = relaxed;
     return ShaderRecompiler::Recompile(request);
+}
+
+void Square(AgcDriver::VulkanDevice& device, const std::uint32_t* input, const std::uint32_t* output) {
+    const auto result = Compile(device, input, output, true);
+    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(SquareCode.data()));
+    device.WaitIdle();
 }
 
 bool IsNan(std::uint32_t bits) {
@@ -58,44 +62,27 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        auto* block = static_cast<std::uint32_t*>(::operator new(BlockBytes, std::align_val_t{BlockBytes}));
-        std::memset(block, 0, BlockBytes);
-        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
-        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, BlockBytes, true, true);
-        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
-        int failures = 0;
-        try {
-            auto* input = block;
-            auto* output = block + 4096;
-            const std::array<float, 6> normals{1.5f, -2.0f, 0.375f, 1024.0f, -0.0f, 3.0e19f};
-            for (std::uint32_t tid = 0; tid < Threads; ++tid) input[tid] = std::bit_cast<std::uint32_t>(normals[tid % normals.size()]);
-            input[7] = 0x7f812345u;
-            input[8] = 0xffc00001u;
-            input[9] = 0x7f800000u;
-            const auto exact = Compile(*device, input, output, false);
-            const auto relaxed = Compile(*device, input, output, true);
-            Require(relaxed.spirv.size() < exact.spirv.size(), "relaxed float: the module kept the NaN result emulation (" + std::to_string(relaxed.spirv.size()) + " words, exact " + std::to_string(exact.spirv.size()) + ")");
-            std::fill(output, output + Threads, 0xdeadbeefu);
-            device->Dispatch(relaxed, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(SquareCode.data()));
-            device->WaitIdle();
-            for (std::uint32_t tid = 0; tid < Threads; ++tid) {
-                const float value = std::bit_cast<float>(input[tid]);
-                if (tid == 7 || tid == 8) {
-                    Require(IsNan(output[tid]), "relaxed float: thread " + std::to_string(tid) + " squared a NaN into a non-NaN");
-                    continue;
-                }
-                const auto wanted = std::bit_cast<std::uint32_t>(value * value);
-                Require(output[tid] == wanted, "relaxed float: thread " + std::to_string(tid) + " stored " + std::to_string(output[tid]) + ", expected " + std::to_string(wanted));
+        auto* input = Input.data();
+        auto* output = Output.data();
+        const std::array<float, 6> normals{1.5f, -2.0f, 0.375f, 1024.0f, -0.0f, 3.0e19f};
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) input[tid] = std::bit_cast<std::uint32_t>(normals[tid % normals.size()]);
+        input[7] = 0x7f812345u;
+        input[8] = 0xffc00001u;
+        input[9] = 0x7f800000u;
+        const auto exactWords = Compile(*device, input, output, false).spirv.size();
+        const auto relaxedWords = Compile(*device, input, output, true).spirv.size();
+        Require(relaxedWords < exactWords, "relaxed float: the module kept the NaN result emulation (" + std::to_string(relaxedWords) + " words, exact " + std::to_string(exactWords) + ")");
+        std::fill(output, output + Threads, 0xdeadbeefu);
+        Square(*device, input, output);
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+            const float value = std::bit_cast<float>(input[tid]);
+            if (tid == 7 || tid == 8) {
+                Require(IsNan(output[tid]), "relaxed float: thread " + std::to_string(tid) + " squared a NaN into a non-NaN");
+                continue;
             }
-        } catch (const std::exception& error) {
-            std::cerr << error.what() << '\n';
-            failures = 1;
+            const auto wanted = std::bit_cast<std::uint32_t>(value * value);
+            Require(output[tid] == wanted, "relaxed float: thread " + std::to_string(tid) + " stored " + std::to_string(output[tid]) + ", expected " + std::to_string(wanted));
         }
-        mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
-        GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
-        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
-        ::operator delete(block, std::align_val_t{BlockBytes});
-        if (failures != 0) return 1;
         std::puts("relaxed float tests passed");
         return 0;
     } catch (const std::exception& error) {
