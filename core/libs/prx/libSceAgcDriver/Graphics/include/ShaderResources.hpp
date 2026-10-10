@@ -117,6 +117,7 @@ public:
     ShaderResources& operator=(const ShaderResources&) = delete;
     VkDescriptorSetLayout Layout() const;
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set = VK_NULL_HANDLE) const;
+    bool ReferencesUncachedStorage() const;
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -529,6 +530,7 @@ public:
     static std::uint64_t Touches();
     void Clear();
     std::size_t Size() const;
+    void DropUncached(std::vector<std::shared_ptr<ShaderResources>>& dropped);
 
 private:
     void erase(const Key& key);

@@ -2215,6 +2215,24 @@ FrameDumps& Dumps() {
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
+    static const bool sweep = std::getenv("APS5_NO_TEMPLATE_SWEEP") == nullptr;
+    static auto lastSweep = std::chrono::steady_clock::now();
+    if (sweep && state->recorder && std::chrono::steady_clock::now() - lastSweep > std::chrono::seconds(1)) {
+        lastSweep = std::chrono::steady_clock::now();
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        std::vector<std::shared_ptr<Graphics::ShaderResources>> dropped;
+        state->resourceCache.DropUncached(dropped);
+        for (auto& resources : dropped) state->recorder->Keep(std::move(resources));
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        static std::uint64_t droppedTotal = 0;
+        droppedTotal += dropped.size();
+        static auto lastReport = std::chrono::steady_clock::now();
+        if (profile && std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
+            lastReport = std::chrono::steady_clock::now();
+            AgcDriver::ProfilePrint_nid_no_patch("[template-sweep] %llu templates holding evicted storage images dropped (10 s)\n", static_cast<unsigned long long>(droppedTotal));
+            droppedTotal = 0;
+        }
+    }
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     if (buffer.tilingMode == 1) {

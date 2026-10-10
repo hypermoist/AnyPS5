@@ -2518,6 +2518,29 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     }
 }
 
+void ResourceCache::DropUncached(std::vector<std::shared_ptr<ShaderResources>>& dropped) {
+    std::lock_guard lock(mutex);
+    for (auto it = entries.begin(); it != entries.end();) {
+        if (it->second == nullptr || !it->second->ReferencesUncachedStorage()) {
+            ++it;
+            continue;
+        }
+        dropped.push_back(std::move(it->second));
+        index.erase(it->first);
+        it = entries.erase(it);
+    }
+}
+
+bool ShaderResources::ReferencesUncachedStorage() const {
+    for (const auto& image : storageTextures) {
+        if (image != nullptr && !image->Cached()) return true;
+    }
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->SharedStorageSource() != nullptr && !texture->SharedStorageSource()->Cached()) return true;
+    }
+    return false;
+}
+
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
     std::lock_guard lock(mutex);
     if (object != nullptr) {
