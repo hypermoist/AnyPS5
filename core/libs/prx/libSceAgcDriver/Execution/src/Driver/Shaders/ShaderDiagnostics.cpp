@@ -7,6 +7,11 @@
 
 namespace AgcDriver::DriverDetail {
 
+bool Driver::skipFailedWork() {
+    static const bool skip = std::getenv("APS5_SKIP_FAILED_WORK") != nullptr;
+    return skip;
+}
+
 void Driver::reportSkip(const char* kind, const std::string& what) {
     static AgcDriver::Mutex reportedMutex;
     static std::set<std::size_t> reported;
