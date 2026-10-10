@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <string_view>
@@ -16,6 +18,21 @@ void Driver::reportSkip(const char* kind, const std::string& what) {
     static constexpr std::string_view marker = "\nRecompileRequest:\n";
     std::lock_guard lock(reportedMutex);
     std::string line;
+    static const bool profileSkips = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profileSkips) {
+        static std::map<std::string, std::uint64_t> counts;
+        static auto lastReport = std::chrono::steady_clock::now();
+        auto reason = what.substr(0, std::min<std::size_t>(what.size(), 60));
+        for (auto& c : reason) if (c >= '0' && c <= '9') c = '#';
+        ++counts[std::string(kind) + ": " + reason];
+        if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
+            lastReport = std::chrono::steady_clock::now();
+            std::string report = "[skips] (10 s):";
+            for (const auto& [name, count] : counts) report += " " + std::to_string(count) + "x {" + name + "}";
+            AgcDriver::ProfilePrint_nid_no_patch("%s\n", report.c_str());
+            counts.clear();
+        }
+    }
     static bool announced = false;
     if (!announced) {
         announced = true;

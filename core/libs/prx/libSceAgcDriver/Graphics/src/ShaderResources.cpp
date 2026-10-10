@@ -850,6 +850,13 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         evictStorage(cache, it);
         it = cache.entries.end();
     }
+    if (profile) {
+        static auto lastLive = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - lastLive > std::chrono::seconds(10)) {
+            lastLive = std::chrono::steady_clock::now();
+            AgcDriver::ProfilePrint_nid_no_patch("[storage-live] cache %llu MiB of budget %llu MiB; live images: %s\n", static_cast<unsigned long long>(cache.bytes >> 20u), static_cast<unsigned long long>(storageBudget(context) >> 20u), LiveStorageReport().c_str());
+        }
+    }
     if (it != cache.entries.end()) {
         it->texture->Refresh(writeOnly && mip == 0);
         cache.entries.splice(cache.entries.begin(), cache.entries, it);

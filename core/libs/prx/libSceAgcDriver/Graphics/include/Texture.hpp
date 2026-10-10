@@ -22,6 +22,8 @@ namespace AgcDriver::Graphics {
 
 class ResidentColor;
 class CommandBatch;
+std::string LiveStorageReport();
+
 class StorageTexture;
 struct HostImport;
 

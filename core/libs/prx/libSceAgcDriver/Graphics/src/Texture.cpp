@@ -170,6 +170,24 @@ LiveImages& Live() {
     return live;
 }
 
+}
+
+std::string LiveStorageReport() {
+    auto& live = Live();
+    std::lock_guard lock(live.mutex);
+    std::uint64_t cachedCount = 0, cachedBytes = 0, heldCount = 0, heldBytes = 0;
+    for (const auto* texture : live.textures) {
+        const auto bytes = std::max<std::uint64_t>(texture->AllocationBytes(), texture->GuestBytes());
+        if (texture->Cached()) { ++cachedCount; cachedBytes += bytes; }
+        else { ++heldCount; heldBytes += bytes; }
+    }
+    char text[160];
+    std::snprintf(text, sizeof(text), "%llu cached (%llu MiB), %llu alive outside the cache (%llu MiB)", static_cast<unsigned long long>(cachedCount), static_cast<unsigned long long>(cachedBytes >> 20u), static_cast<unsigned long long>(heldCount), static_cast<unsigned long long>(heldBytes >> 20u));
+    return text;
+}
+
+namespace {
+
 // Per-layer validity of array surfaces (see StorageTexture::layerBegin): a fill of one layer clears
 // it on the image and only that layer's guest bytes go stale, so the other layers' fills, uploads
 // and write-backs stay separate. APS5_NO_LAYER_CLEAR=1 tracks every surface as one layer, and a
