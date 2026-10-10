@@ -84,6 +84,7 @@ std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWrit
 // writeBackLayers), and pending units a DCC clear -> uncompressed key flip kept as the texels
 // (Refresh).
 std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0};
+std::atomic<std::uint64_t> writeOnlyRefreshes{0}, writeOnlyDropped{0};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
@@ -128,7 +129,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu, write-only refreshes %llu (pending images dropped %llu)\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), take(writeOnlyRefreshes), take(writeOnlyDropped));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -1335,7 +1336,27 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
-bool StorageTexture::Refresh() {
+bool StorageTexture::writeOnlyRefresh() {
+    static const bool disabled = std::getenv("APS5_NO_WRITE_ONLY_REFRESH") != nullptr;
+    if (disabled || !blockUnits || descriptor.mipCount != 1 || geometry.imageLayers != 1 || geometry.imageDepth != 1 || generation == 0) return false;
+    if (descriptor.dccAddress != 0 && ProvedKeys() != uploadedKeys) return false;
+    static_cast<void>(GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
+    std::vector<std::uint64_t> generations;
+    blockGenerations(generations);
+    std::vector<std::uint8_t> stamped(generations.size()), cpu(generations.size());
+    if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stamped, cpu)) return false;
+    if (std::any_of(cpu.begin(), cpu.end(), [](std::uint8_t value) { return value != 0; })) return false;
+    writeOnlyDropped.fetch_add(DiscardPendingInside(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)), std::memory_order_relaxed);
+    FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), this, "storage refresh", PublishScope::None);
+    const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    layerGeneration.assign(trackedLayers, current);
+    refreshGeneration();
+    originalValid = false;
+    writeOnlyRefreshes.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool StorageTexture::Refresh(bool writeOnly) {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (refreshProved()) {
@@ -1353,6 +1374,10 @@ bool StorageTexture::Refresh() {
     // flush below and the compare through the hook skip it).
     refreshing = this;
     NoteProved();
+    if (writeOnly && writeOnlyRefresh()) {
+        if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
+        return true;
+    }
     // Results of other images pending in this memory must reach it first, except an alias's: its
     // units are taken on the device below (borrowUnits), so it stays pending. The keys read for
     // that decision are read again after the flush, which may store keys itself. The exemption
