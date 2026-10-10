@@ -165,6 +165,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     translateOptions.sharedMemoryBytes = DeviceMemoryLdsBytes(request);
     translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled;
     translateOptions.floatMode = request.context.floatMode;
+    translateOptions.relaxedFloat = request.target.relaxedFloat;
     translateOptions.inputInfo = inputInfo;
 
     constexpr InstructionTranslator translator;
