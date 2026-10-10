@@ -953,6 +953,7 @@ target_include_directories(agc_driver_prepared_shaders_tests PRIVATE
         $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
+target_include_directories(agc_driver_runtime_images_tests PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/SPIRV-Headers/include)
 if(BUILD_TESTING)
     set_target_properties(agc_shader_mode_register_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_shader_mode_register COMMAND agc_shader_mode_register_tests)

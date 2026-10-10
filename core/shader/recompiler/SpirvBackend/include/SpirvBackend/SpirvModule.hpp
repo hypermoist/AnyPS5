@@ -57,6 +57,10 @@ public:
     void AddFunction(std::span<const std::uint32_t> words);
     void BeginHelperFunction();
     void EndHelperFunction();
+    [[nodiscard]] std::size_t AddLoopMerge(std::uint32_t merge, std::uint32_t continuation);
+    void PatchLoopContinue(std::size_t offset, std::uint32_t continuation);
+    [[nodiscard]] std::size_t FunctionInstructionOffset() const { return functionInstructions.size(); }
+    [[nodiscard]] bool FunctionHasTerminationSince(std::size_t offset) const;
     [[nodiscard]] SpirvDeferredPhi AddDeferredPhi(std::uint32_t type, std::uint32_t result, std::size_t incomingCount);
     void PatchDeferredPhi(SpirvDeferredPhi phi, std::size_t incoming, std::uint32_t value, std::uint32_t parent);
 
