@@ -226,6 +226,7 @@ struct SpirvTarget {
     std::uint32_t srgbDecodeFormats = 0;
     bool narrowSubgroupClock = false;
     bool fixedPushSlots = false;
+    bool relaxedFloat = false;
 };
 
 struct BindingLayout {
