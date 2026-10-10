@@ -269,6 +269,7 @@ struct VulkanDevice::State {
     bool geometryShader = false;
     bool sampleRateShading = false;
     bool shaderClipDistance = false;
+    bool shaderCullDistance = false;
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
@@ -1398,7 +1399,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->sampleRateShading = enabled.sampleRateShading == VK_TRUE;
     if (enabled.geometryShader) state->capabilities.push_back(spv::CapabilityGeometry);
     enabled.shaderClipDistance = available.shaderClipDistance;
+    enabled.shaderCullDistance = available.shaderCullDistance;
     state->shaderClipDistance = enabled.shaderClipDistance == VK_TRUE;
+    state->shaderCullDistance = enabled.shaderCullDistance == VK_TRUE;
     if (enabled.shaderClipDistance) state->capabilities.push_back(spv::CapabilityClipDistance);
     if (enabled.shaderStorageImageWriteWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageWriteWithoutFormat);
     if (enabled.shaderStorageImageReadWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageReadWithoutFormat);
@@ -3133,6 +3136,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.nullDescriptors = state->shaderProfile != nullptr && state->shaderProfile->NullDescriptors();
     context.bufferInt64Atomics = state->bufferInt64Atomics;
     context.placeholderImages = state->placeholderImages.get();
+    context.clipDistance = state->shaderClipDistance;
+    context.cullDistance = state->shaderCullDistance;
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
