@@ -11,7 +11,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <atomic>
 #include <map>
+#include <set>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -981,10 +983,84 @@ private:
             }
             badDword = 0;
         }
-        if (!ValidateSource(descriptor, badDword)) {
+        if (!ValidateSource(descriptor, badDword) && !(expected == IrOpcode::GetSamplerResource && FallBackToStaticSampler(descriptor))) {
             fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
         }
         source = InternSource(descriptor);
+    }
+
+    // The first value `start` can take that is a valid runtime value, looking through phis, selects
+    // and lane spills: ReadLane(v, L) continues at the WriteLane that put lane L into v.
+    IrValue* StaticCandidate(IrValue* start) const {
+        constexpr SrtWalker walker;
+        const std::uint32_t waveSize = m_program.WaveSize();
+        std::vector<std::pair<IrValue*, std::int64_t>> pending {{start, -1}};
+        std::set<std::pair<const IrValue*, std::int64_t>> visited;
+        std::uint32_t lane = 0;
+        for (std::size_t next = 0; next < pending.size() && next < 65536u; next++) {
+            IrValue* value = pending[next].first->Resolve();
+            const auto wanted = pending[next].second;
+            if (!visited.insert({value, wanted}).second) {
+                continue;
+            }
+            const auto laneOf = [&](IrValue* selector) {
+                return immediateU32(selector, lane) && waveSize != 0u;
+            };
+            if (wanted < 0) {
+                if (value->Type() == IrType::U32 && walker.ValidateRuntimeValue(m_program.Resources(), value)) {
+                    return value;
+                }
+                if (value->IsPhi()) {
+                    for (std::size_t index = 0; index < value->ArgumentCount(); index++) pending.push_back({value->Argument(index), -1});
+                } else if (value->Opcode() == IrOpcode::SelectU32) {
+                    pending.push_back({value->Argument(1), -1});
+                    pending.push_back({value->Argument(2), -1});
+                } else if (value->Opcode() == IrOpcode::ReadFirstLane) {
+                    pending.push_back({value->Argument(0), -1});
+                } else if (value->Opcode() == IrOpcode::ReadLane) {
+                    // A constant lane reads a spill slot; a computed one (a waterfall loop's first
+                    // active lane) one lane of a per-lane value, whose static values it can take.
+                    pending.push_back(laneOf(value->Argument(1)) ? std::pair {value->Argument(0), static_cast<std::int64_t>(lane % waveSize)} : std::pair {value->Argument(0), std::int64_t {-1}});
+                }
+            } else if (value->Opcode() == IrOpcode::WriteLane && laneOf(value->Argument(1))) {
+                pending.push_back(lane % waveSize == static_cast<std::uint32_t>(wanted) ? std::pair {value->Argument(0), std::int64_t {-1}} : std::pair {value->Argument(2), wanted});
+            } else if (value->IsPhi()) {
+                for (std::size_t index = 0; index < value->ArgumentCount(); index++) pending.push_back({value->Argument(index), wanted});
+            } else if (value->Opcode() == IrOpcode::SelectU32) {
+                // A per-lane merge (a write under the exec mask): either arm can hold the lane.
+                pending.push_back({value->Argument(1), wanted});
+                pending.push_back({value->Argument(2), wanted});
+            }
+        }
+        return nullptr;
+    }
+
+    // Debug aid: APS5_SAMPLER_FALLBACK=1 binds a sampler chosen at run time (loaded from a table, or
+    // carried through lane spills across a loop), which is otherwise refused, as the static value each
+    // dword can also take, so filtering and addressing may differ from the table's.
+    bool FallBackToStaticSampler(DescriptorSource& descriptor) const {
+        static const bool enabled = std::getenv("APS5_SAMPLER_FALLBACK") != nullptr;
+        if (!enabled) {
+            return false;
+        }
+        DescriptorSource replacement = descriptor;
+        for (std::uint32_t i = 0; i < descriptor.dwordCount; i++) {
+            IrValue* candidate = StaticCandidate(descriptor.dwords[i]);
+            if (candidate == nullptr) {
+                return false;
+            }
+            replacement.dwords[i] = candidate;
+        }
+        std::uint32_t badDword = 0;
+        if (!ValidateSource(replacement, badDword)) {
+            return false;
+        }
+        static std::atomic<std::uint32_t> reported {0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8u) {
+            std::fprintf(stderr, "[recompiler] a sampler chosen at run time is bound as its static value; filtering and addressing may differ\n");
+        }
+        descriptor = replacement;
+        return true;
     }
 
     bool TakeGpuDescriptor(IrValue& inst, std::uint32_t memoryIndex) {
