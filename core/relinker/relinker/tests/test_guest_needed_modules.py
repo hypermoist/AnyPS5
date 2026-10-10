@@ -63,6 +63,17 @@ def main():
                 needed = needed_libraries(output.read_bytes())
                 assert needed == ["$ORIGIN/app0/Media/Modules/needed.prx.guest.prx"], needed
 
+            case = work / f"{windows}-system-libraries"
+            modules = case / "Media" / "Modules"
+            modules.mkdir(parents=True)
+            (modules / "needed.prx").write_bytes(module_with_symbol(True))
+            (case / "libs" / "unpatched").mkdir(parents=True)
+            (case / "libs" / "needed.prx").write_bytes(b"\x7fELF host library")
+            (case / "libs" / "unpatched" / "needed.prx").write_bytes(b"\x7fELF host library")
+            result, output = convert(case, windows)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert [path.name for path in (case / "app0").rglob("*.guest.prx")] == ["needed.prx.guest.prx"]
+
             case = work / f"{windows}-ambiguous"
             for name in ("first", "second"):
                 (case / name).mkdir(parents=True)

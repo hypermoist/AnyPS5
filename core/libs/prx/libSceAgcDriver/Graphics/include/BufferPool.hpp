@@ -46,7 +46,8 @@ struct BufferAllocation {
 //
 // Device-local allocations (the detiler's scratch buffers and the staging shadows of written guest
 // buffers, see GuestBufferMemory) are retained in a third tier with a budget of their own, video
-// memory instead of pinned host memory: APS5_STAGING_POOL_MIB (default 512); 0 keeps them in the
+// memory instead of pinned host memory: APS5_STAGING_POOL_MIB (default a sixth of the largest
+// device-local heap, at least 512); 0 keeps them in the
 // two host tiers as before.
 class BufferPool {
 public:
@@ -91,8 +92,8 @@ private:
     // The tier a buffer of `capacity` and `properties` is retained in (the large one for everything
     // when shared; the device tier for device-local memory while it has a budget).
     Tier& tierFor(std::size_t capacity, VkMemoryPropertyFlags properties);
-    // The device tier's budget (APS5_STAGING_POOL_MIB), read once.
-    static VkDeviceSize DeviceBudget();
+    // The device tier's budget: APS5_STAGING_POOL_MIB, else a sixth of the largest device-local heap.
+    static VkDeviceSize DeviceBudget(const VkPhysicalDeviceMemoryProperties& memory);
     static bool DeviceTiered(VkMemoryPropertyFlags properties);
     static std::size_t NextCapacity(std::size_t capacity);
     void destroy(const BufferAllocation& allocation) noexcept;

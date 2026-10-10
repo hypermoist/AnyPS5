@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/DispatchArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1146,6 +1147,8 @@ Recorder::~Recorder() {
         if (labelTableOwner == this) labelTableOwner = nullptr;
     }
     if (meshArgumentPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, meshArgumentPipeline, nullptr);
+    if (dispatchArgumentPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, dispatchArgumentPipeline, nullptr);
+    if (dispatchArgumentLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, dispatchArgumentLayout, nullptr);
     if (meshArgumentLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, meshArgumentLayout, nullptr);
     if (sampleCounterState > 0) {
         samplesPassed.store(SamplesTotal(), std::memory_order_release);
@@ -1838,6 +1841,21 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
     timingClassMs += nanoseconds / 1e6;
 }
 
+void Recorder::NoteWork(std::uint64_t program) {
+    if (open == nullptr) return;
+    if (program == 0) {
+        ++open->draws;
+        return;
+    }
+    ++open->dispatches;
+    if (open->work.size() < 32 && std::find(open->work.begin(), open->work.end(), program) == open->work.end()) open->work.push_back(program);
+}
+
+void Recorder::NoteIndirect(std::uint64_t arguments) {
+    if (open == nullptr || open->indirect.size() >= 32) return;
+    open->indirect.push_back(arguments);
+}
+
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     if (!GpuTimingEnabled()) return NoTiming;
     Commands();
@@ -2047,6 +2065,52 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
     function(cmdDispatch, "vkCmdDispatch")(commands, 1, 1, 1);
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
     CountBarriers(CommandClass::Draw, 2);
+    return true;
+}
+
+bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments) {
+    constexpr std::uint32_t PushBytes = 32;
+    if (dispatchArgumentState == 0) {
+        dispatchArgumentState = -1;
+        VkShaderModule module = VK_NULL_HANDLE;
+        try {
+            const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes};
+            VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layoutInfo.pushConstantRangeCount = 1;
+            layoutInfo.pPushConstantRanges = &push;
+            Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &dispatchArgumentLayout), "vkCreatePipelineLayout dispatch arguments");
+            VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            moduleInfo.codeSize = sizeof(DISPATCH_ARGUMENTS_SPV);
+            moduleInfo.pCode = DISPATCH_ARGUMENTS_SPV;
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule dispatch arguments");
+            VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipelineInfo.stage.module = module;
+            pipelineInfo.stage.pName = "main";
+            pipelineInfo.layout = dispatchArgumentLayout;
+            Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &dispatchArgumentPipeline), "vkCreateComputePipelines dispatch arguments");
+            context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            dispatchArgumentState = 1;
+        } catch (const std::exception& error) {
+            if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            std::fprintf(stderr, "[gpu] indirect dispatches read their group counts unchecked: %s\n", error.what());
+        }
+    }
+    if (dispatchArgumentState < 0) return false;
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, dispatchArgumentPipeline);
+    const auto* limit = context.limits.maxComputeWorkGroupCount;
+    struct {
+        VkDeviceAddress source;
+        VkDeviceAddress arguments;
+        std::array<std::uint32_t, 4> limits;
+    } parameters{source, arguments, {limit[0], limit[1], limit[2], 0u}};
+    static_assert(sizeof(parameters) == PushBytes);
+    function(cmdPushConstants, "vkCmdPushConstants")(commands, dispatchArgumentLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
+    function(cmdDispatch, "vkCmdDispatch")(commands, 1, 1, 1);
+    recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    CountBarriers(CommandClass::DispatchLeading, 2);
     return true;
 }
 
@@ -3250,17 +3314,39 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
                     const auto reads = Recorder::ReadCounts();
-                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.staleIgnored));
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu, draw input %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.hits[6]), static_cast<unsigned long long>(reads.staleIgnored));
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+        const auto describe = [&] {
+            std::string programs;
+            for (const auto program : batch->work) {
+                char text[24];
+                std::snprintf(text, sizeof(text), " 0x%llx", static_cast<unsigned long long>(program));
+                programs += text;
+            }
+            // The group counts the GPU-side indirect dispatches read, as guest memory holds them now
+            // (imported memory: the GPU reads the same words).
+            std::string groups;
+            for (const auto arguments : batch->indirect) {
+                std::array<std::uint32_t, 3> counts{};
+                std::memcpy(counts.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(arguments)), sizeof(counts));
+                char text[80];
+                std::snprintf(text, sizeof(text), " 0x%llx=%ux%ux%u", static_cast<unsigned long long>(arguments), counts[0], counts[1], counts[2]);
+                groups += text;
+            }
+            char text[96];
+            std::snprintf(text, sizeof(text), "batch %llu (%u draws, %u dispatches, programs:", static_cast<unsigned long long>(batch->serial), batch->draws, batch->dispatches);
+            return text + programs + (groups.empty() ? std::string() : "; indirect groups:" + groups) + ")";
+        };
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
-            std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+            std::fprintf(stderr, "[gpu] recorded %s still running on the GPU after %d s\n", describe().c_str(), waited);
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
+        if (result == VK_ERROR_DEVICE_LOST) std::fprintf(stderr, "[gpu] device lost waiting for recorded %s\n", describe().c_str());
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");

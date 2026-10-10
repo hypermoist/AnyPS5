@@ -1,10 +1,20 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include <cstdlib>
+#include <cstring>
+#include <map>
+#include <set>
 #include <functional>
 #include <string_view>
 
 namespace AgcDriver::DriverDetail {
+
+// Debug aid: APS5_SKIP_FAILED_WORK=1 reports shader preparation, draws and dispatches that fail and
+// goes on without them. Their results are then missing, which can break the title further on.
+bool Driver::skipFailedWork() {
+    static const bool skip = std::getenv("APS5_SKIP_FAILED_WORK") != nullptr;
+    return skip;
+}
 
 void Driver::reportSkip(const char* kind, const std::string& what) {
     static std::mutex reportedMutex;
@@ -52,10 +62,21 @@ void Driver::reportSkip(const char* kind, const std::string& what) {
 std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request) {
     static std::mutex dumpMutex;
     static std::set<std::uint64_t> dumped;
+    // APS5_DUMP_SHADERS=all writes every request (shader_<address>_<n>.req), to compare the variants
+    // of one program; otherwise only its first.
+    static const bool every = [] {
+        const char* value = std::getenv("APS5_DUMP_SHADERS");
+        return value != nullptr && std::strcmp(value, "all") == 0;
+    }();
+    static std::map<std::uint64_t, std::uint32_t> counts;
     char name[64];
-    std::snprintf(name, sizeof(name), "shader_%llx.req", static_cast<unsigned long long>(address));
     std::lock_guard lock(dumpMutex);
-    if (!dumped.insert(address).second) return name;
+    if (every) {
+        std::snprintf(name, sizeof(name), "shader_%llx_%u.req", static_cast<unsigned long long>(address), counts[address]++);
+    } else {
+        std::snprintf(name, sizeof(name), "shader_%llx.req", static_cast<unsigned long long>(address));
+        if (!dumped.insert(address).second) return name;
+    }
     try {
         const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(request);
         if (std::FILE* file = std::fopen(name, "wb")) {

@@ -73,9 +73,25 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         if (std::none_of(paths.begin(), paths.end(), [&](const auto& path) { return path.filename().string() == name; })) missingNeeded.insert(name);
     }
     if (!missingNeeded.empty()) {
+        // AnyPS5 system libraries in the run path are host libraries resolved at load time, not guest modules.
+        std::vector<std::filesystem::path> systemLibraries;
+        for (std::size_t start = 0; start <= runPath.size();) {
+            const auto end = std::min(runPath.find(':', start), runPath.size());
+            const auto entry = runPath.substr(start, end - start);
+            start = end + 1;
+            if (entry == "$ORIGIN") systemLibraries.push_back(std::filesystem::absolute(outputPath).parent_path());
+            else if (entry.starts_with("$ORIGIN/")) systemLibraries.push_back(std::filesystem::absolute(outputPath).parent_path() / entry.substr(8));
+            else if (!entry.empty() && std::filesystem::path(entry).is_absolute()) systemLibraries.push_back(entry);
+        }
+        const auto isSystemLibraries = [&](const std::filesystem::path& path) {
+            return std::any_of(systemLibraries.begin(), systemLibraries.end(), [&](const auto& library) {
+                std::error_code error;
+                return path.lexically_normal() == library.lexically_normal() || std::filesystem::equivalent(path, library, error);
+            });
+        };
         std::map<std::string, std::filesystem::path> found;
         for (auto it = std::filesystem::recursive_directory_iterator(root); it != std::filesystem::recursive_directory_iterator(); ++it) {
-            if (it->is_directory() && std::find(directories.begin(), directories.end(), it->path()) != directories.end()) {
+            if (it->is_directory() && (std::find(directories.begin(), directories.end(), it->path()) != directories.end() || isSystemLibraries(it->path()))) {
                 it.disable_recursion_pending();
                 continue;
             }

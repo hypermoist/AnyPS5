@@ -194,7 +194,8 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
 
                 const bool isBaseCapability =
                     capability == spv::CapabilityShader ||
-                    capability == spv::CapabilitySignedZeroInfNanPreserve;
+                    capability == spv::CapabilitySignedZeroInfNanPreserve ||
+                    capability == spv::CapabilityDenormFlushToZero;
 
                 const bool isBdaCapability =
                     shader.bdaAbiVersion == ShaderRecompiler::BdaAbi::Version &&
@@ -307,6 +308,11 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             case spv::OpExecutionMode:
                 if (count == 4 && (instruction[2] == spv::ExecutionModeSignedZeroInfNanPreserve || instruction[2] == spv::ExecutionModeRoundingModeRTE || instruction[2] == spv::ExecutionModeDenormPreserve)) {
                     Require(instruction[3] == 16u || instruction[3] == 32u || instruction[3] == 64u, "float controls execution modes require Float16, Float32 or Float64");
+                    executionModeTargets.insert(instruction[1]);
+                    break;
+                }
+                if (count == 4 && instruction[2] == spv::ExecutionModeDenormFlushToZero) {
+                    Require(instruction[3] == 32u, "DenormFlushToZero is only declared for Float32");
                     executionModeTargets.insert(instruction[1]);
                     break;
                 }

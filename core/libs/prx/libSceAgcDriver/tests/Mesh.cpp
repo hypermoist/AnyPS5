@@ -86,6 +86,8 @@ constexpr std::uint32_t FanRim = 8;
 constexpr float FanStep = 6.28318530718f / FanRim;
 alignas(256) std::array<Vertex, FanRim + 1> Fan{};
 alignas(256) std::array<Vertex, FanRim + 1> FanScrambled{};
+// The fan after three padding vertices, for a non-indexed indirect draw starting at vertex 3.
+alignas(256) std::array<Vertex, FanRim + 4> FanPadded{};
 alignas(256) std::array<std::uint16_t, FanRim + 1> FanIndices{};
 alignas(256) std::array<std::uint16_t, FanRim + 1> FanRestart{};
 
@@ -119,6 +121,7 @@ struct MeshDraw {
     std::array<std::uint32_t, 4> vertexBuffer;
     std::uint32_t geometryPushBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;
     bool restart = false;
+    std::optional<AgcDriver::Graphics::DepthTarget> depth{};
 };
 
 void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
@@ -174,8 +177,46 @@ void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
     state.blendConstants = {};
+    state.depth = setup.depth;
     device.Draw(state, setup.draw, shaders);
     device.WaitIdle();
+}
+
+// A compute shader using the depth plane of a draw's depth target as an R32 float storage image.
+constexpr std::uint32_t DepthThreads = 64;
+alignas(256) std::array<float, Width * Height> DepthPlane{};
+alignas(256) std::array<float, DepthThreads> DepthTexels{};
+// v_lshlrev_b32 v3, 2, v0; v_mov_b32 v1, <row>; image_load v2, v[0:1], s[4:11] dmask:0x1 dim:2D;
+// s_waitcnt vmcnt(0); buffer_store_dword v2, v3, s[0:3], 0 offen; s_endpgm
+alignas(256) constexpr std::array<std::uint32_t, 8> DepthRow0LoadCode{0x34060082, 0x7e020280, 0xf0000108, 0x00010200, 0xbf8c3f70, 0xe0701000, 0x80000203, 0xbf810000};
+alignas(256) constexpr std::array<std::uint32_t, 8> DepthRow1LoadCode{0x34060082, 0x7e020281, 0xf0000108, 0x00010200, 0xbf8c3f70, 0xe0701000, 0x80000203, 0xbf810000};
+// v_mov_b32 v1, 0; v_mov_b32 v2, 0.75; image_store v2, v[0:1], s[4:11] dmask:0x1 dim:2D; s_endpgm
+alignas(256) constexpr std::array<std::uint32_t, 6> DepthRow0StoreCode{0x7e020280, 0x7e0402ff, 0x3f400000, 0xf0200108, 0x00010200, 0xbf810000};
+
+void DispatchOnDepth(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code) {
+    DepthTexels.fill(-1.0f);
+    const auto buffer = reinterpret_cast<std::uintptr_t>(DepthTexels.data());
+    const auto plane = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(DepthPlane.data()));
+    std::vector<std::uint32_t> userData{
+        static_cast<std::uint32_t>(buffer), static_cast<std::uint32_t>((buffer >> 32u) & 0xffffu), static_cast<std::uint32_t>(sizeof(DepthTexels)), 0x31016facu,
+        static_cast<std::uint32_t>(plane >> 8u), static_cast<std::uint32_t>((plane >> 40u) & 0xffu) | (22u << 20u) | (((Width - 1u) & 3u) << 30u),
+        ((Width - 1u) >> 2u) | ((Height - 1u) << 14u), 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{DepthThreads, 1, 1}, 0u, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(),
+        {0, 0, 0, 128}
+    };
+    request.useCache = false;
+    const auto result = ShaderRecompiler::Recompile(request);
+    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+    device.WaitIdle();
+}
+
+void RequireDepthTexels(float expected, const char* what) {
+    for (std::uint32_t x = 0; x < DepthThreads; ++x) Require(DepthTexels[x] == expected, std::string(what) + ": texel " + std::to_string(x) + " is " + std::to_string(DepthTexels[x]) + ", expected " + std::to_string(expected));
 }
 
 constexpr ShaderRecompiler::MeshConfiguration SmallSubgroup{4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u};
@@ -337,6 +378,31 @@ int main() {
         ClearPixels();
         DrawMesh(device, {fan, fanDraw, VertexBufferDescriptor(FanScrambled.data(), static_cast<std::uint32_t>(FanScrambled.size()))});
         CheckFan("indirect indexed triangle fan");
+        // A non-indexed DRAW_INDIRECT read by the GPU: the record's first vertex (3, past the padding)
+        // reaches the mesh shader through the mesh arguments.
+        std::copy(Fan.begin(), Fan.end(), FanPadded.begin() + 3);
+        const std::array<std::uint32_t, 4> paddedWords{static_cast<std::uint32_t>(Fan.size()), 1u, 3u, 0u};
+        std::copy(paddedWords.begin(), paddedWords.end(), record);
+        AgcDriver::Pm4::DrawParameters paddedDraw{0, static_cast<std::uint32_t>(Fan.size()), 0, 1, 0, false};
+        paddedDraw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(record), 0x24u, 16u, 16u, 1u, false, 0u, 0x280u, 0x280u, 0x280u, false, 0u};
+        ClearPixels();
+        DrawMesh(device, {fan, paddedDraw, VertexBufferDescriptor(FanPadded.data(), static_cast<std::uint32_t>(FanPadded.size()))});
+        CheckFan("indirect non-indexed triangle fan from vertex 3");
+
+        // The draw attaches a depth target, which the device creates cleared to 0.25; compute shaders
+        // then read it, write row 0 and read it again through storage images of its depth plane.
+        DepthPlane.fill(0.0f);
+        ClearPixels();
+        MeshDraw depthDraw{SmallSubgroup, {0, static_cast<std::uint32_t>(Ordered.size()), 0, 1, 0, false}, VertexBufferDescriptor(Ordered.data(), static_cast<std::uint32_t>(Ordered.size()))};
+        depthDraw.depth = AgcDriver::Graphics::DepthTarget{reinterpret_cast<std::uintptr_t>(DepthPlane.data()), 0, {Width, Height}, VK_FORMAT_D32_SFLOAT, 0.25f, 0};
+        DrawMesh(device, depthDraw);
+        DispatchOnDepth(device, DepthRow0LoadCode);
+        RequireDepthTexels(0.25f, "storage image load of the depth plane");
+        DispatchOnDepth(device, DepthRow0StoreCode);
+        DispatchOnDepth(device, DepthRow0LoadCode);
+        RequireDepthTexels(0.75f, "storage image load of a depth plane row a dispatch stored");
+        DispatchOnDepth(device, DepthRow1LoadCode);
+        RequireDepthTexels(0.25f, "storage image load of a depth plane row no dispatch stored");
 
         std::puts("Mesh tests passed");
         return 0;

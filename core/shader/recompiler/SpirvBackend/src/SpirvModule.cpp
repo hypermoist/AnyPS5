@@ -87,8 +87,9 @@ std::vector<std::uint32_t> SpirvModule::Finalize() const {
     if (unpatchedPhiIncomings != 0) {
         throw std::runtime_error("SpirvModule::Finalize called with unpatched OpPhi incoming pairs");
     }
+    if (inHelperFunction) throw std::runtime_error("SpirvModule::Finalize called inside a helper function");
     std::vector<std::uint32_t> module;
-    module.reserve(5u + capabilities.size() + extensions.size() + extInstImports.size() + memoryModel.size() + entryPoints.size() + executionModes.size() + debug.size() + annotations.size() + typeDeclarations.size() + declarations.size() + globalVariables.size() + functionInstructions.size());
+    module.reserve(5u + capabilities.size() + extensions.size() + extInstImports.size() + memoryModel.size() + entryPoints.size() + executionModes.size() + debug.size() + annotations.size() + typeDeclarations.size() + declarations.size() + globalVariables.size() + functionInstructions.size() + helperFunctionInstructions.size());
     module.push_back(spv::MagicNumber);
     module.push_back(version);
     module.push_back(0u);
@@ -106,7 +107,20 @@ std::vector<std::uint32_t> SpirvModule::Finalize() const {
     module.insert(module.end(), declarations.begin(), declarations.end());
     module.insert(module.end(), globalVariables.begin(), globalVariables.end());
     module.insert(module.end(), functionInstructions.begin(), functionInstructions.end());
+    module.insert(module.end(), helperFunctionInstructions.begin(), helperFunctionInstructions.end());
     return module;
+}
+
+void SpirvModule::BeginHelperFunction() {
+    if (inHelperFunction) throw std::runtime_error("SpirvModule helper functions cannot nest");
+    std::swap(functionInstructions, helperFunctionInstructions);
+    inHelperFunction = true;
+}
+
+void SpirvModule::EndHelperFunction() {
+    if (!inHelperFunction) throw std::runtime_error("SpirvModule::EndHelperFunction without a helper function");
+    std::swap(functionInstructions, helperFunctionInstructions);
+    inHelperFunction = false;
 }
 
 void SpirvModule::RequireVersion(std::uint32_t version) {
@@ -214,6 +228,39 @@ void SpirvModule::appendString(std::vector<std::uint32_t>& words, const std::str
         }
         words.push_back(word);
     }
+}
+
+std::size_t SpirvModule::AddLoopMerge(std::uint32_t merge, std::uint32_t continuation) {
+    const auto offset = functionInstructions.size();
+    AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
+    return offset;
+}
+
+void SpirvModule::PatchLoopContinue(std::size_t offset, std::uint32_t continuation) {
+    if (offset > functionInstructions.size() || functionInstructions.size() - offset < 4u ||
+        functionInstructions[offset] != ((4u << spv::WordCountShift) | spv::OpLoopMerge) || continuation == 0u) {
+        throw std::runtime_error("SpirvModule::PatchLoopContinue received an invalid loop merge or a zero id");
+    }
+    functionInstructions[offset + 2u] = continuation;
+}
+
+bool SpirvModule::FunctionHasTerminationSince(std::size_t offset) const {
+    if (offset > functionInstructions.size()) throw std::runtime_error("invalid function instruction offset");
+    bool boundary = offset == functionInstructions.size();
+    bool terminates = false;
+    for (std::size_t cursor = 0u; cursor < functionInstructions.size();) {
+        const auto count = functionInstructions[cursor] >> spv::WordCountShift;
+        if (count == 0u || count > functionInstructions.size() - cursor) throw std::runtime_error("invalid function instruction length");
+        boundary |= cursor == offset;
+        const auto opcode = functionInstructions[cursor] & spv::OpCodeMask;
+        if (cursor >= offset) {
+            terminates |= opcode == spv::OpUnreachable || opcode == spv::OpReturn || opcode == spv::OpReturnValue ||
+                opcode == spv::OpKill || opcode == spv::OpTerminateInvocation;
+        }
+        cursor += count;
+    }
+    if (!boundary) throw std::runtime_error("function instruction offset is not an instruction boundary");
+    return terminates;
 }
 
 SpirvDeferredPhi SpirvModule::AddDeferredPhi(std::uint32_t type, std::uint32_t result, std::size_t incomingCount) {

@@ -144,6 +144,39 @@ static void LateFold() {
         Require(Evaluate(&user, row) == BitField(PackedWord(row), 16u, 11u, false));
     }
 }
+// An extract whose offset is chosen at run time (by the facing here) reads the packed word: both
+// choices stay inside the sample and layer fields.
+static void DynamicOffset() {
+    IrProgram program;
+    auto& block = Begin(program);
+    IrBuilder builder(program);
+    builder.SetInsertionPoint(block);
+    IrValue& ancillary = AncillaryBuiltin(builder);
+    IrValue& offset = builder.Emit(IrOpcode::SelectU32, IrType::U32, {&FrontFacingBuiltin(builder), &builder.Constant(8u), &builder.Constant(16u)});
+    IrValue& user = builder.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&ancillary, &offset, &builder.Constant(4u)});
+    End(builder, user);
+    Lower(program);
+    for (const Row& row : Rows) {
+        Require(Evaluate(&user, row) == BitField(PackedWord(row), row.frontFacing ? 8u : 16u, 4u, false));
+    }
+}
+// A VGPR the shader reuses keeps the word in helper lanes only (an exec-mask select on the helper
+// flag): a float test of the merged value reads the packed word there instead of refusing the shader.
+static void HelperLanesOnly() {
+    IrProgram program;
+    auto& block = Begin(program);
+    IrBuilder builder(program);
+    builder.SetInsertionPoint(block);
+    IrValue& ancillary = AncillaryBuiltin(builder);
+    IrValue& helper = builder.Emit(IrOpcode::GetBuiltin, IrType::U32, {&builder.Constant(static_cast<std::uint32_t>(StageInputKind::HelperInvocation)), &builder.Constant(0u)});
+    IrValue& live = builder.Emit(IrOpcode::IEqual32, IrType::U1, {&helper, &builder.Constant(0u)});
+    IrValue& kept = builder.Emit(IrOpcode::SelectU32, IrType::U32, {&live, &builder.Constant(0x3f800000u), &ancillary});
+    IrValue& user = builder.Emit(IrOpcode::BitwiseAnd32, IrType::U32, {&kept, &builder.Constant(0x7f800000u)});
+    End(builder, user);
+    Lower(program);
+    const IrValue* word = kept.Argument(2)->Resolve();
+    Require(word->Opcode() == IrOpcode::BitwiseOr32);
+}
 int main() {
     Extract(IrOpcode::BitFieldUExtract, 8u, 4u, StageInputKind::SampleId, 0u);
     Extract(IrOpcode::BitFieldUExtract, 9u, 2u, StageInputKind::SampleId, 1u);
@@ -156,6 +189,8 @@ int main() {
     Values(IrOpcode::BitFieldSExtract, 20u, 9u, false);
     Values(IrOpcode::BitFieldUExtract, 28u, 1u, false);
     LateFold();
+    DynamicOffset();
+    HelperLanesOnly();
     Values(IrOpcode::BitFieldUExtract, 8u, 4u, true);
     Values(IrOpcode::BitFieldUExtract, 16u, 13u, true);
     Values(IrOpcode::BitFieldSExtract, 20u, 9u, true);

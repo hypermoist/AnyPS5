@@ -312,7 +312,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         const auto word = snapshot.images.at(index).dwords[3];
         const auto first = (word >> 12u) & 0xfu;
         const auto last = (word >> 16u) & 0xfu;
-        if (last < first || last - first >= RuntimeAbi::StorageHeapCapacity) fail("invalid dynamic storage mip range");
+        if (last < first || last - first >= RuntimeAbi::DynamicStorageMipCapacity) fail("invalid dynamic storage mip range");
         plan.specialization.push_back({PipelineSpecialization::MipCountBase + index, last - first + 1u});
     }
     for (std::uint32_t resource = 0; resource < info.images.size(); ++resource) {
@@ -385,6 +385,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 const auto& mode = info.runtimeImageModes.at(resource).at(imageModes[resource]);
                 entry.identityImageSwizzle.push_back(mode.conversionFormat != IrBufferFormat::Invalid || mode.depthBits);
                 physical.imageWritten.push_back(image.written || image.atomic);
+                physical.imageRead.push_back(image.read || image.atomic);
                 physical.imageDepthCompare.push_back(mode.depthCompare);
                 physical.imageAtomic.push_back(image.atomic);
                 physical.imageUnnormalized.push_back(unnormalized.images.at(resource));

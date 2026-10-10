@@ -209,7 +209,7 @@ public:
 
 private:
     bool close(int handle);
-    void presentLoop(std::stop_token token, std::promise<void>& started);
+    void presentLoop(std::stop_token token);
     void vblankLoop(std::stop_token token);
     void vblankEnd();
     void processFlip(FlipRequest& req);

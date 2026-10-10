@@ -224,6 +224,11 @@ void Registration(bool indirect) {
         }));
     }
     for (auto& registration : registrations) registration.get();
+    Shader copy = header.shader;
+    copy.user_data = reinterpret_cast<ShaderUserData*>(&copy);
+    AgcDriverResolveShaderAbi_nid_postfix(&copy, {}, {});
+    copy.target ^= 1u;
+    ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&copy, {}, {}); }, "replaced shader header");
     header.registers[1].value |= 0x100u;
     ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "invalid registered program address");
     header.registers[1].value &= 0xffu;

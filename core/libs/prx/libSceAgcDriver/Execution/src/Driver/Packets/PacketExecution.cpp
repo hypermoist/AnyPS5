@@ -30,6 +30,14 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 }
 
 void Driver::execute(const Submission& submission) {
+    const auto skipFailed = [](const char* kind, const auto& work) {
+        if (!skipFailedWork()) return work();
+        try {
+            work();
+        } catch (const std::exception& error) {
+            reportSkip(kind, error.what());
+        }
+    };
     auto* submissionTiming = includeTimingSubmission(submission, true);
     if (submission.suspend) {
         PerformanceContext timingContext(submissionTiming);
@@ -214,11 +222,11 @@ void Driver::execute(const Submission& submission) {
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15) {
-            timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
+            timed(&WorkerProfile::dispatchMs, [&] { skipFailed("dispatch", [&] { dispatch(queue, packet, submission); }); });
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(false);
         } else if (opcode == 0x16) {
-            timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            timed(&WorkerProfile::dispatchMs, [&] { skipFailed("dispatch", [&] { dispatchIndirect(queue, packet, submission); }); });
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(true);
         } else if (opcode == 0x3c || opcode == 0x93) {
@@ -239,7 +247,7 @@ void Driver::execute(const Submission& submission) {
             }
         } else if (drawPacket) {
             bool drawn = false;
-            timed(&WorkerProfile::drawMs, [&] {
+            timed(&WorkerProfile::drawMs, [&] { skipFailed("draw", [&] {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
                 static const bool profileDraws = std::getenv("APS5_PROFILE_DRAW") != nullptr;
                 const auto color = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
@@ -266,7 +274,7 @@ void Driver::execute(const Submission& submission) {
                     countSkip(Graphics::DrawSkip::Thrown);
                     throw;
                 }
-            });
+            }); });
             finishDrawPacket(drawn);
         } else if (opcode == 0x22) {
             recordQueuedLabelsBeforeRead(submission.queue);

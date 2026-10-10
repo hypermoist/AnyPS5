@@ -9,7 +9,7 @@
 
 namespace ShaderRecompiler::RuntimeAbi {
 
-inline constexpr std::uint32_t Version = 10u;
+inline constexpr std::uint32_t Version = 11u;
 inline constexpr std::uint32_t DescriptorSet = 0u;
 inline constexpr std::uint32_t StageCount = 4u;
 inline constexpr std::uint32_t PushConstantDwords = 32u;
@@ -34,9 +34,16 @@ enum class Stage : std::uint32_t { Main, Fragment, TessellationControl, Tessella
 inline constexpr std::uint32_t UserDataCapacity = 128u;
 inline constexpr std::uint32_t BufferCapacity = 128u;
 inline constexpr std::uint32_t ImageCapacity = 256u;
-inline constexpr std::uint32_t SampledHeapCapacity = 16u;
-inline constexpr std::uint32_t StorageHeapCapacity = 4u;
-inline constexpr std::uint32_t SamplerHeapCapacity = 16u;
+// Unreal Engine material shaders sample up to about 60 textures (PPSA08427); the device limits are
+// checked again when the descriptor layout is built.
+inline constexpr std::uint32_t SampledHeapCapacity = 128u;
+// A bindless table takes this many consecutive sampled heap elements.
+inline constexpr std::uint32_t BindlessTableSlots = 16u;
+inline constexpr std::uint32_t StorageHeapCapacity = 16u;
+// A storage image whose mip is chosen at run time takes one heap element per mip it can address.
+inline constexpr std::uint32_t DynamicStorageMipCapacity = 4u;
+// Each sampler takes two heap elements; Unreal Engine materials use more than eight samplers.
+inline constexpr std::uint32_t SamplerHeapCapacity = 64u;
 
 struct ResourceMetadata {
     std::uint32_t binding;
@@ -74,9 +81,9 @@ inline std::uint32_t HeapCapacity(Binding binding) {
 }
 
 static_assert(std::is_standard_layout_v<ResourceMetadata> && std::is_trivially_copyable_v<ResourceMetadata> && sizeof(ResourceMetadata) == 48u);
-static_assert(std::is_standard_layout_v<ShaderData> && std::is_trivially_copyable_v<ShaderData> && sizeof(ShaderData) == 13760u);
+static_assert(std::is_standard_layout_v<ShaderData> && std::is_trivially_copyable_v<ShaderData> && sizeof(ShaderData) == 16064u);
 static_assert(UserDataDword == 4u && BufferOffsetsDword == 132u && DispatchThreadLimitDword == 164u);
-static_assert(ExportMappingsDword == 3432u);
+static_assert(ExportMappingsDword == 4008u);
 static_assert(offsetof(ResourceMetadata, descriptor) == 16u && offsetof(ShaderData, images) == 672u && offsetof(ShaderData, samplers) == 12960u);
 
 inline void RequireVersion(std::uint32_t version) {

@@ -141,10 +141,16 @@ namespace {
 constexpr int GuestMapFixedFlag = 0x10;
 
 #if defined(__linux__)
-void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment) {
-    constexpr std::uintptr_t UserLimit = 0x7fff00000000ull;
+// The PS5 application area, matching the Windows guest arena; titles check addresses against it.
+constexpr std::uintptr_t ApplicationAreaStart = 0x0000000200000000ull;
+constexpr std::uintptr_t SystemReservedStart = 0x00000007FFFFC000ull;
+constexpr std::uintptr_t SystemReservedEnd = 0x0000001000000000ull;
+constexpr std::uintptr_t ApplicationAreaEnd = 0x000000FC00000000ull;
+
+void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment, std::uintptr_t limit = 0x7fff00000000ull) {
     for (int attempt = 0; attempt < 8; ++attempt) {
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> used;
+        if (limit == ApplicationAreaEnd) used.emplace_back(SystemReservedStart, SystemReservedEnd);
         std::ifstream maps("/proc/self/maps");
         std::string line;
         while (std::getline(maps, line)) {
@@ -160,7 +166,7 @@ void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment)
             if (begin >= candidate + len) break;
             candidate = (end + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
         }
-        if (candidate + len > UserLimit || candidate + len < candidate) throw std::runtime_error("No free range above the mapping address hint");
+        if (candidate + len > limit || candidate + len < candidate) throw std::runtime_error("No free range above the mapping address hint");
         void* result = mmap(reinterpret_cast<void*>(candidate), len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
         if (result != MAP_FAILED) return result;
         if (errno != EEXIST) throw std::system_error(errno, std::generic_category(), "Hinted mmap failed");
@@ -550,6 +556,9 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     }
 #ifdef _WIN32
     return mmap_aligned(len, prot, alignment);
+#endif
+#if defined(__linux__)
+    return MapAtOrAbove(ApplicationAreaStart, len, prot, alignment, ApplicationAreaEnd);
 #endif
     if (len > std::numeric_limits<size_t>::max() - alignment) {
         throw std::overflow_error("Aligned mapping size overflow");

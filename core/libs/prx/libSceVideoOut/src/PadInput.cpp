@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -260,11 +261,19 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
     publish();
 }
 
+// APS5_PAD_AUTO_CROSS (see publish), read once.
+double PadInput::autoCrossPeriod() {
+    static const double period = [] { const char* value = std::getenv("APS5_PAD_AUTO_CROSS"); return value != nullptr ? std::strtod(value, nullptr) : 0.0; }();
+    return period;
+}
+
 void PadInput::Update() {
     if (controller != nullptr) SDL_GameControllerUpdate();
     applyOutput();
     if (controller != nullptr) {
         controllerState = sampleController();
+        publish();
+    } else if (autoCrossPeriod() > 0.0) {
         publish();
     }
     const auto now = std::chrono::steady_clock::now();
@@ -345,5 +354,13 @@ void PadInput::publish() {
     }
     if (state.analogButtonsL2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::L2);
     if (state.analogButtonsR2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::R2);
+    // Debug aid: APS5_PAD_AUTO_CROSS=<seconds> holds Cross for 300 ms every that many seconds, so an
+    // unattended run gets past "press any button" screens and dialogs.
+    const double autoCross = autoCrossPeriod();
+    if (autoCross > 0.0) {
+        static const auto started = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        if (seconds >= autoCross && std::fmod(seconds, autoCross) < 0.3) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::Cross);
+    }
     PadPublishInput_nid_postfix(state);
 }

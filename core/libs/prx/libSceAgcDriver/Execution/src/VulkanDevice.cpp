@@ -27,6 +27,9 @@
 #include "prx/libc/include/General.hpp"
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <execinfo.h>
 #endif
 #include <atomic>
 #include <chrono>
@@ -56,6 +59,106 @@
 
 namespace AgcDriver {
 namespace {
+
+#ifndef _WIN32
+// Debug aid: APS5_TRACK_DEVICE_MEMORY=1 counts the live bytes of every vkAllocateMemory by its two
+// innermost callers, host imports apart, and prints the largest sites every 10 s and at a failed
+// allocation ([vram]; offsets resolve with addr2line -f -C -e <module>).
+struct DeviceMemoryTracker {
+    struct Allocation {
+        VkDeviceSize bytes;
+        std::array<void*, 2> sites;
+        bool imported;
+    };
+    std::mutex mutex;
+    std::unordered_map<VkDeviceMemory, Allocation> live;
+    PFN_vkGetDeviceProcAddr proc = nullptr;
+    PFN_vkAllocateMemory allocate = nullptr;
+    PFN_vkFreeMemory free = nullptr;
+    std::chrono::steady_clock::time_point reported{};
+};
+
+DeviceMemoryTracker& MemoryTracker() {
+    static DeviceMemoryTracker tracker;
+    return tracker;
+}
+
+std::string DescribeSite(void* address) {
+    Dl_info info{};
+    if (address == nullptr || dladdr(address, &info) == 0 || info.dli_fname == nullptr) return "?";
+    const char* name = std::strrchr(info.dli_fname, '/');
+    char text[160];
+    std::snprintf(text, sizeof(text), "%s+0x%llx", name != nullptr ? name + 1 : info.dli_fname, static_cast<unsigned long long>(static_cast<char*>(address) - static_cast<char*>(info.dli_fbase) - 1));
+    return text;
+}
+
+void ReportDeviceMemory(DeviceMemoryTracker& tracker, const char* reason) {
+    std::unordered_map<std::uint64_t, std::pair<VkDeviceSize, std::uint64_t>> bySite;
+    std::unordered_map<std::uint64_t, std::array<void*, 2>> sites;
+    VkDeviceSize device = 0, imported = 0;
+    for (const auto& [memory, allocation] : tracker.live) {
+        (allocation.imported ? imported : device) += allocation.bytes;
+        if (allocation.imported) continue;
+        const auto key = reinterpret_cast<std::uint64_t>(allocation.sites[0]) * 31u ^ reinterpret_cast<std::uint64_t>(allocation.sites[1]);
+        auto& [bytes, count] = bySite[key];
+        bytes += allocation.bytes;
+        ++count;
+        sites[key] = allocation.sites;
+    }
+    std::vector<std::pair<std::uint64_t, std::pair<VkDeviceSize, std::uint64_t>>> sorted(bySite.begin(), bySite.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) { return left.second.first > right.second.first; });
+    std::fprintf(stderr, "[vram] %s: %llu MiB allocated (%zu allocations), %llu MiB host imports\n", reason, static_cast<unsigned long long>(device >> 20u), tracker.live.size(), static_cast<unsigned long long>(imported >> 20u));
+    for (std::size_t index = 0; index < sorted.size() && index < 12; ++index) {
+        const auto& [key, totals] = sorted[index];
+        std::fprintf(stderr, "[vram]   %6llu MiB in %6llu: %s <- %s\n", static_cast<unsigned long long>(totals.first >> 20u), static_cast<unsigned long long>(totals.second), DescribeSite(sites[key][0]).c_str(), DescribeSite(sites[key][1]).c_str());
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL TrackedAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+    auto& tracker = MemoryTracker();
+    void* frames[3]{};
+    const int depth = backtrace(frames, 3);
+    bool imported = false;
+    for (auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next != nullptr; next = next->pNext) imported = imported || next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT || next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+    const auto result = tracker.allocate(device, info, callbacks, memory);
+    std::lock_guard lock(tracker.mutex);
+    if (result == VK_SUCCESS) tracker.live[*memory] = {info->allocationSize, {depth > 1 ? frames[1] : nullptr, depth > 2 ? frames[2] : nullptr}, imported};
+    const auto now = std::chrono::steady_clock::now();
+    if (result != VK_SUCCESS) {
+        char reason[96];
+        std::snprintf(reason, sizeof(reason), "allocation of %llu MiB failed (%d) at %s", static_cast<unsigned long long>(info->allocationSize >> 20u), result, DescribeSite(depth > 1 ? frames[1] : nullptr).c_str());
+        ReportDeviceMemory(tracker, reason);
+    } else if (now - tracker.reported >= std::chrono::seconds(10)) {
+        tracker.reported = now;
+        ReportDeviceMemory(tracker, "live");
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL TrackedFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* callbacks) {
+    auto& tracker = MemoryTracker();
+    {
+        std::lock_guard lock(tracker.mutex);
+        tracker.live.erase(memory);
+    }
+    tracker.free(device, memory, callbacks);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL TrackedDeviceProc(VkDevice device, const char* name) {
+    auto& tracker = MemoryTracker();
+    const auto function = tracker.proc(device, name);
+    if (function == nullptr || device == VK_NULL_HANDLE) return function;
+    if (std::strcmp(name, "vkAllocateMemory") == 0) {
+        tracker.allocate = reinterpret_cast<PFN_vkAllocateMemory>(function);
+        return reinterpret_cast<PFN_vkVoidFunction>(&TrackedAllocateMemory);
+    }
+    if (std::strcmp(name, "vkFreeMemory") == 0) {
+        tracker.free = reinterpret_cast<PFN_vkFreeMemory>(function);
+        return reinterpret_cast<PFN_vkVoidFunction>(&TrackedFreeMemory);
+    }
+    return function;
+}
+#endif
 
 void check(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) {
@@ -198,6 +301,7 @@ struct VulkanDevice::State {
     bool sampleRateShading = false;
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
+    bool denormFlushToZeroF32 = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
@@ -633,6 +737,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         APS5_LOG_OUT("Vulkan surface created surface=%p window=%p", reinterpret_cast<void*>(state->surface), state->window);
     }
     state->deviceProc = state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
+#ifndef _WIN32
+    if (std::getenv("APS5_TRACK_DEVICE_MEMORY") != nullptr) {
+        MemoryTracker().proc = state->deviceProc;
+        state->deviceProc = &TrackedDeviceProc;
+    }
+#endif
     const auto enumerate = state->InstanceFunction<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");
     std::uint32_t count = 0;
     check(enumerate(state->instance, &count, nullptr), "vkEnumeratePhysicalDevices");
@@ -746,6 +856,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     VkPhysicalDeviceProperties2 floatProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &floatControls};
     state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &floatProperties);
     require(floatControls.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE, "shaderSignedZeroInfNanPreserveFloat32 is unavailable");
+    // Shaders whose float mode flushes f32 denormals declare the flush where the device does it
+    // independently of the other widths; APS5_EMULATE_DENORMAL_FLUSH=1 emulates it per operand as before.
+    state->denormFlushToZeroF32 = floatControls.shaderDenormFlushToZeroFloat32 == VK_TRUE && floatControls.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE && std::getenv("APS5_EMULATE_DENORMAL_FLUSH") == nullptr;
     const std::array<const char*, 2> meshExtensions{VK_EXT_MESH_SHADER_EXTENSION_NAME, VK_KHR_SPIRV_1_4_EXTENSION_NAME};
     const bool meshAvailable = std::all_of(meshExtensions.begin(), meshExtensions.end(), hasExtension);
     VkPhysicalDeviceMeshShaderFeaturesEXT meshFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
@@ -829,6 +942,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     deviceExtensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
     state->capabilities.push_back(spv::CapabilitySignedZeroInfNanPreserve);
+    if (state->denormFlushToZeroF32) state->capabilities.push_back(spv::CapabilityDenormFlushToZero);
     state->spirvExtensions.push_back("SPV_KHR_float_controls");
     VkPhysicalDeviceShaderFloat16Int8FeaturesKHR float16Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR};
     if (hasExtension(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)) {
@@ -1410,6 +1524,40 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     if (!recorder.DumpSamples(import->address + (address - import->base))) return false;
     recorder.NotePendingWrite(address, bytes);
     GuestMemory::MarkWritten(address, bytes);
+    return true;
+}
+
+bool VulkanDevice::CopyMemoryOnGpu(std::uint64_t destination, std::uint64_t source, std::size_t bytes) {
+    if (!state->recorder || bytes == 0) return false;
+    auto& recorder = *state->recorder;
+    if (recorder.Idle()) return false;
+    const auto completionStore = [&](std::uint64_t address) { return state->CopiedWriterOverlaps(address, bytes) || (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes)); };
+    if (completionStore(source) || completionStore(destination)) return false;
+    const auto context = graphicsContext();
+    Graphics::StorageTexture::FlushPending(source, bytes, nullptr, "DMA copy source", Graphics::PublishScope::Whole);
+    Graphics::StorageTexture::FlushPending(destination, bytes, nullptr, "DMA copy destination", Graphics::PublishScope::PartialUnits);
+    const auto* destinationImport = Graphics::HostImportFor(context, destination, bytes);
+    const auto* sourceImport = destinationImport != nullptr ? Graphics::HostImportFor(context, source, bytes) : nullptr;
+    if (destinationImport == nullptr || sourceImport == nullptr) return false;
+    if (Graphics::AnyShadowedOverlaps(source, bytes)) Graphics::PublishShadow(source, bytes, Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    if (Graphics::AnyShadowedOverlaps(destination, bytes)) Graphics::PublishShadow(destination, bytes, Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    recorder.FlushKeyStoresOverlapping(source, bytes);
+    recorder.FlushKeyStoresOverlapping(destination, bytes);
+    recorder.FlushStoresOverlapping(source, bytes);
+    recorder.FlushStoresOverlapping(destination, bytes);
+    using CommandClass = Graphics::Recorder::CommandClass;
+    const auto commands = recorder.Commands();
+    constexpr VkAccessFlags transferAccess = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transferAccess);
+    const VkBufferCopy region{source - sourceImport->base, destination - destinationImport->base, bytes};
+    context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, sourceImport->buffer, destinationImport->buffer, 1, &region);
+    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+    Graphics::Recorder::CountBarriers(CommandClass::Copy, 2);
+    recorder.MarkCovered(copiedAccess);
+    recorder.NotePendingRead(source, bytes, Graphics::Recorder::ReadKind::CopySource);
+    recorder.NotePendingWrite(destination, bytes);
+    GuestMemory::MarkWritten(destination, bytes);
     return true;
 }
 
@@ -2484,6 +2632,10 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.fragmentShaderBarycentricEnabled = state->fragmentShaderBarycentric;
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
+    target.denormFlushToZeroF32 = state->denormFlushToZeroF32;
+    // APS5_EXACT_FLOAT=1 keeps the bit-exact NaN and denormal emulation (SpirvTarget::relaxedFloat).
+    static const bool exactFloat = std::getenv("APS5_EXACT_FLOAT") != nullptr;
+    target.relaxedFloat = !exactFloat;
     target.srgbDecodeFormats = state->srgbDecodeFormats;
     if (state->meshShader) {
         const auto& mesh = state->meshLimits;
@@ -2622,8 +2774,17 @@ bool TemplateDataRefresh() {
 // The content key of a compute stage, naming the device: the cache is process-wide and the driver
 // replaces the headless device with the windowed one while workers may still use the old one, so
 // the key names the device that built the entry (its descriptor set and pooled buffers belong to it).
+// Read-only guest buffers leave the key by their address, as for draws (Graphics::MovableBuffers):
+// PPSA08427's dispatches read per-frame ring allocations, so ~87% of them missed on the V# address
+// alone and rebuilt their resources; a hit rebinds the moved buffers (PrepareMovedBindings).
+// APS5_NO_MOVED_DISPATCH_BUFFERS=1 keys every V# word as before.
+bool MovableDispatchBuffers() {
+    static const bool enabled = std::getenv("APS5_NO_MOVED_DISPATCH_BUFFERS") == nullptr;
+    return enabled;
+}
+
 ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device) {
-    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh());
+    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), MovableDispatchBuffers());
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
     key.push_back(static_cast<std::uint32_t>(deviceHandle));
     key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
@@ -2998,6 +3159,8 @@ struct RecordedDispatch {
     // Whether the data refresh recorded anything.
     bool refreshed = false;
     bool resourceKeyMatched = false;
+    // The template's set with its moved buffers rebound (ShaderResources::PrepareMovedBindings).
+    VkDescriptorSet movedSet = VK_NULL_HANDLE;
 };
 
 VkDevice VulkanDevice::Device() const {
@@ -3358,19 +3521,34 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
     }
+    // A GPU-side indirect dispatch reads its group counts through a checked copy (Recorder::RecordDispatchArguments),
+    // recorded before the program is bound since the check binds its own pipeline and push constants.
+    VkBuffer indirectBuffer = argumentImport != nullptr ? argumentImport->buffer : VK_NULL_HANDLE;
+    VkDeviceSize indirectOffset = argumentImport != nullptr ? arguments - argumentImport->base : 0;
+    if (argumentImport != nullptr && argumentImport->address != 0) {
+        auto checked = std::make_shared<Graphics::Buffer>(context, 12, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        if (recorder.RecordDispatchArguments(commands, argumentImport->address + (arguments - argumentImport->base), checked->DeviceAddress())) {
+            indirectBuffer = checked->Handle();
+            indirectOffset = 0;
+            recorder.Keep(std::move(checked));
+        }
+    }
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
-    resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+    resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, record.movedSet);
     if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes, record.pushBytes->data());
     }
+    recorder.NoteWork(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
-    if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
+    if (argumentImport != nullptr) recorder.NoteIndirect(arguments);
+    if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, indirectBuffer, indirectOffset);
     else context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);
     recorder.EndGpuTiming(gpuTiming);
     const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
     Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+    resources.RecordAfterDispatch(commands);
     recorder.EndGpuTiming(trailingTiming);
     recorder.MarkCovered(dispatchedAccess);
     recordStep(PhaseRecordBind);
@@ -3438,6 +3616,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // The object came from the resource cache: a compute template whose data buffers take this
     // dispatch's words at the record (ShaderResources::RefreshData).
     bool fromCache = false;
+    // A template hit's set with its moved read-only buffers rebound (PrepareMovedBindings).
+    std::shared_ptr<Graphics::ShaderResources::DrawBindings> movedBindings;
     double revalidateMs = 0;
     // The batches the pre-sync (PrepareDispatch) waited for are reaped first: their completions
     // (CPU write-backs) land before stage B or a cached object's Revalidate reads, and the flush
@@ -3516,9 +3696,18 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
         if (cached != nullptr) {
             if (cached->Revalidate(shaders[0])) {
-                resources = std::move(cached);
-                fromCache = true;
-                ++d.cacheHits;
+                // A hit serves the dispatch only when its read-only buffers that moved can be rebound;
+                // otherwise (a written buffer moved, pending writes over a moved one) it builds anew.
+                std::optional<std::vector<Graphics::ShaderResources::MovedBuffer>> moved = std::vector<Graphics::ShaderResources::MovedBuffer>{};
+                if (MovableDispatchBuffers()) moved = cached->MovedReadOnlyBuffers(std::span<const Graphics::CompiledShader>(shaders), *state->recorder);
+                if (moved.has_value()) {
+                    movedBindings = cached->PrepareMovedBindings(*state->recorder, *moved);
+                    resources = std::move(cached);
+                    fromCache = true;
+                    ++d.cacheHits;
+                } else {
+                    ++d.cacheMisses;
+                }
             } else {
                 state->resourceCache.Remove(contentKey, cached.get());
                 ++d.cacheInvalidated;
@@ -3610,6 +3799,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     auto& recorder = *state->recorder;
     IndirectOutcome outcome{0, 0};
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer};
+    record.movedSet = movedBindings != nullptr ? movedBindings->allocation.set : VK_NULL_HANDLE;
     record.resourceKeyMatched = fromCache;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
@@ -3664,7 +3854,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // object the resource cache serves under this content key (reusable: no lease, no copied
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's
     // Revalidate and nothing needs completion work.
-    if (recipeOut != nullptr && DispatchRecipes() && cacheable && resources->Reusable() && objects != nullptr && !contentKey.empty()) {
+    // Not after a hit that rebound moved buffers: a recipe binds the template's own set.
+    if (recipeOut != nullptr && DispatchRecipes() && cacheable && movedBindings == nullptr && resources->Reusable() && objects != nullptr && !contentKey.empty()) {
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
         recipe->templateRef = resources;

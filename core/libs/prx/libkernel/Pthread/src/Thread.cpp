@@ -263,6 +263,13 @@ static void RunThread(std::unique_ptr<ThreadArgs> args) {
     TimedWait::BindThreadWaitState(&self->waitCount);
     if (!self->stackAddress) SetStackFromHost(self);
     currentThread = self;
+#ifndef _WIN32
+    {
+        // The host name shows in debuggers and top; Linux keeps at most 15 characters.
+        std::lock_guard lock(self->nameLock);
+        if (!self->name.empty()) pthread_setname_np(pthread_self(), self->name.substr(0, 15).c_str());
+    }
+#endif
     RegisterStack(self);
     args.reset();
     finishThread(self, entry(arg));
@@ -567,6 +574,8 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
     const std::wstring description(thread->name.begin(), thread->name.end());
     SetThreadDescription(static_cast<HANDLE>(thread->nativeHandle), description.c_str());
     ApplyJobAffinity(*thread, thread->nativeHandle);
+#else
+    if (thread == currentThread) pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
 #endif
     return SCE_OK;
 }

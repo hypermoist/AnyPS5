@@ -174,11 +174,21 @@ std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& i
     const auto kind = info.terminator.condition;
     const bool zero = kind == BranchCondition::ExecZero || kind == BranchCondition::VccZero || kind == BranchCondition::SccZero;
     const auto combined = EmitBinaryU32(state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
-    state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, ConstantU32(state, zero ? ~0u : 0u));
+    // A zero condition holds when it holds in every active invocation: invocations that are not
+    // active here (lanes EXEC left out of an enclosing construct, a partial workgroup) contribute no
+    // ballot bit, so comparing with all ones never matched and a loop exiting on SCC0 never left.
+    std::uint32_t expected = ConstantU32(state, 0u);
+    if (zero) {
+        const auto active = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), active, ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+        expected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), expected, active, 0u);
+    }
+    state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, expected);
     return result;
 }
 
-void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& program, const BlockInfo& info) {
+void EmitStructuredTerminator(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrProgram& program, const BlockInfo& info) {
     auto& state = ctx.state;
     const Terminator& term = info.terminator;
     const auto emitMerge = [&]() {
@@ -186,7 +196,7 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
             const IrBlock* merge = TargetBlock(program, term.mergeBlock);
             const IrBlock* cont = TargetBlock(program, term.continueBlock);
             if (merge != nullptr && cont != nullptr) {
-                state.module.AddFunction(spv::OpLoopMerge, ctx.Label(merge), ctx.Label(cont), spv::LoopControlMaskNone);
+                functionState.loopMergeOffsets[cont].push_back(state.module.AddLoopMerge(ctx.Label(merge), ctx.Label(cont)));
             }
         } else if (term.kind == TerminatorKind::ConditionalBranch && term.mergeBlock != InvalidControlFlowId) {
             if (const IrBlock* merge = TargetBlock(program, term.mergeBlock); merge != nullptr) {
@@ -813,9 +823,17 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         }
         const bool stops = state.bdaStopsInvocations;
         state.bdaStopsInvocations = stops && !IsContinueTarget(program, info->id);
+        const auto instructionOffset = state.module.FunctionInstructionOffset();
         EmitStructuredBlock(context, functionState, block);
+        if (const auto merges = functionState.loopMergeOffsets.find(block);
+            merges != functionState.loopMergeOffsets.end() && state.module.FunctionHasTerminationSince(instructionOffset)) {
+            const auto continuation = state.module.AllocateId();
+            for (const auto offset : merges->second) state.module.PatchLoopContinue(offset, continuation);
+            state.module.AddFunction(spv::OpBranch, continuation);
+            EmitLabel(state, continuation);
+        }
         functionState.blockExitLabels.emplace(block, state.currentLabel);
-        EmitStructuredTerminator(context, program, *info);
+        EmitStructuredTerminator(context, functionState, program, *info);
         state.bdaStopsInvocations = stops;
     }
     PatchStructuredPhis(context, functionState);

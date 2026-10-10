@@ -481,6 +481,26 @@ void testShaderHeaderAlignment() {
     refused(expectFailure([&] { AgcDriverRegisterShader_nid_postfix(at(4, truncated)); }), "smaller than its fixed fields");
 }
 
+void testGeometryHeaderWithoutProgramAddress() {
+    // PPSA08427 registers geometry shaders whose headers carry no program address registers.
+    alignas(256) static const std::array<std::uint32_t, 64> code{0xbf810000};
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 3> registers{};
+    };
+    alignas(8) static Header header{};
+    header.shader.file_header = 0x34333231;
+    header.shader.version = 0x18;
+    header.shader.header_size = sizeof(Header);
+    header.shader.shader_size = sizeof(code);
+    header.shader.code = code.data();
+    header.shader.type = 4;
+    header.registers = {{{0x8a, 0x60000003}, {0x8b, 0x00030010}, {0xca, 0x03000003}}};
+    header.shader.sh_registers = header.registers.data();
+    header.shader.num_sh_registers = header.registers.size();
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+}
+
 void testRegisteredFloatMode() {
     using AgcDriver::DriverDetail::RegisteredFloatMode;
     using AgcDriver::DriverDetail::ShaderSnapshot;
@@ -616,6 +636,7 @@ int main() {
         testWaitFreeSubmissionTheCpuWaitsFor();
         testMultiSubmissions();
         testShaderHeaderAlignment();
+        testGeometryHeaderWithoutProgramAddress();
         testRegisteredFloatMode();
         testWorkerFailure();
         check(expectFailure([] { LibcRunShutdown_nid_postfix(); }).find("required shader register") != std::string::npos, "shutdown lost worker failure");

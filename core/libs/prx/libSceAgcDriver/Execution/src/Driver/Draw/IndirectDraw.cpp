@@ -21,7 +21,9 @@ std::optional<Graphics::IndirectDrawPath> Driver::classifyIndirectDraw(const Sha
     const auto fail = [&](Path reason) { if (!indirectCpu) indirectCpu = reason; };
     constexpr std::uint32_t NoLocation = 0x280u;
     const bool meshPath = graphics.stages.mesh.has_value() && !graphics.stages.tessellation && !graphics.rectList;
-    const bool meshGpuSide = meshPath && drawParameters.indexed && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
+    // Non-indexed mesh draws too: the mesh shader adds the record's first vertex (MeshArguments) to the
+    // pushed one. PPSA08427's DRAW_INDIRECT draws were read on the CPU, each a wait for the GPU.
+    const bool meshGpuSide = meshPath && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
     if ((graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList) && !meshGpuSide) fail(Path::NonVertexPath);
     if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) fail(Path::DrawIndex);
     if (indirect.countIndirect && !support.count) fail(Path::FeatureGap);

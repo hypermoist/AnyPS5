@@ -1,4 +1,6 @@
 #include <cstdint>
+#include <exception>
+#include <cstdio>
 #include <cstddef>
 #include <array>
 #include <memory>
@@ -188,11 +190,21 @@ int32_t APS5_VABI sceAudiodecCreateDecoder(AudiodecCtrl* ctrl, uint32_t codec_ty
             instance.decoder = Audiodec::CreateAt9(param->i_bw_pcm, param->ui_config_data, instance.at9);
             if (!instance.decoder) return ERROR_AT9_INVALID_CONFIG_DATA;
             fillAt9Info(static_cast<AudiodecAt9Info*>(ctrl->pBsiInfo), instance.at9);
-        } else if (codec_type == TYPE_MP3) {
-            instance.decoder = Audiodec::CreateMp3(static_cast<const AudiodecParamMp3*>(ctrl->pParam)->i_bw_pcm);
-        } else if (const std::int32_t result = createAac(static_cast<const AudiodecParamM4aac*>(ctrl->pParam), static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo), instance); result != 0) {
-            instance = {};
-            return result;
+        } else {
+            // A host exception must not unwind into the game: a decoder FFmpeg cannot open is the
+            // library's API failure.
+            try {
+                if (codec_type == TYPE_MP3) {
+                    instance.decoder = Audiodec::CreateMp3(static_cast<const AudiodecParamMp3*>(ctrl->pParam)->i_bw_pcm);
+                } else if (const std::int32_t result = createAac(static_cast<const AudiodecParamM4aac*>(ctrl->pParam), static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo), instance); result != 0) {
+                    instance = {};
+                    return result;
+                }
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[audiodec] create (type %u): %s\n", codec_type, error.what());
+                instance = {};
+                return ERROR_API_FAIL;
+            }
         }
         return static_cast<int32_t>(i + 1);
     }
@@ -222,8 +234,15 @@ int32_t APS5_VABI sceAudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) {
     if (const std::int32_t result = validateCtrl(ctrl, instance->codecType); result != 0) return result;
     if (const std::int32_t result = validateBuffers(ctrl); result != 0) return result;
 
-    const Audiodec::DecodeResult decoded = instance->decoder->Decode(static_cast<const std::uint8_t*>(ctrl->pAuInfo->p_au_addr), ctrl->pAuInfo->ui_au_size,
-                                                                     static_cast<std::uint8_t*>(ctrl->pPcmItem->p_pcm_addr), ctrl->pPcmItem->ui_pcm_size);
+    Audiodec::DecodeResult decoded{};
+    try {
+        decoded = instance->decoder->Decode(static_cast<const std::uint8_t*>(ctrl->pAuInfo->p_au_addr), ctrl->pAuInfo->ui_au_size,
+                                            static_cast<std::uint8_t*>(ctrl->pPcmItem->p_pcm_addr), ctrl->pPcmItem->ui_pcm_size);
+    } catch (const std::exception& error) {
+        static std::uint32_t reported = 0;
+        if (reported++ < 16) std::fprintf(stderr, "[audiodec] decode (type %u, %u bytes): %s\n", instance->codecType, ctrl->pAuInfo->ui_au_size, error.what());
+        decoded = {Audiodec::DecodeStatus::InvalidData};
+    }
     if (instance->codecType == TYPE_M4AAC) {
         auto* info = static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo);
         info->i_result = decoded.status == Audiodec::DecodeStatus::InvalidData ? M4AAC_RESULT_DECODE_ERROR

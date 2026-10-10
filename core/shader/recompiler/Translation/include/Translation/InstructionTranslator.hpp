@@ -33,6 +33,9 @@ struct TranslateOptions {
     std::uint64_t shaderHash = 0;
     bool fragmentShaderBarycentricEnabled = false;
     std::optional<ShaderFloatMode> floatMode;
+    bool nativeF32DenormalFlush = false;
+    // SpirvTarget::relaxedFloat.
+    bool relaxedFloat = false;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;
 };

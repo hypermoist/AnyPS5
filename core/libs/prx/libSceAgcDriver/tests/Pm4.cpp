@@ -337,6 +337,9 @@ void testCopies() {
     check(sceKernelAvailableFlexibleMemorySize(&flexibleBefore) == 0, "cannot query flexible memory");
     const auto toGds = makePacket(0x50, {0x60100000 | cachePolicies, low(source.data()), high(source.data()), 0x100, 0, 16});
     check(!AgcDriver::Pm4::ResolveStore(toGds, state, 64).has_value(), "DMA_DATA to GDS resolved as a memory store");
+    const auto gdsFill = AgcDriver::Pm4::ResolveStore(makePacket(0x50, {0x40100000, 0x5eed5eed, 0, 0x100, 0, 8}), state, 64);
+    check(gdsFill.has_value() && gdsFill->address == AgcDriver::Pm4::GdsAddress() + 0x100 && gdsFill->Bytes().size() == 8, "an immediate DMA_DATA fill of the GDS did not resolve as a store into the GDS memory");
+    check(!AgcDriver::Pm4::ResolveStore(makePacket(0x50, {0x40100000, 0x5eed5eed, 0, 0xfffc, 0, 8}), state, 64).has_value(), "an immediate GDS fill past the end of the GDS resolved");
     execute(state, toGds);
     std::size_t flexibleAfter = 0;
     check(sceKernelAvailableFlexibleMemorySize(&flexibleAfter) == 0 && flexibleAfter == flexibleBefore, "the GDS was charged to the flexible memory budget");
@@ -352,7 +355,12 @@ void testCopies() {
     check(source == destination, "DMA_DATA GDS round trip failed");
     expectFailure([&] { execute(state, makePacket(0x50, {0x60100000, low(source.data()), high(source.data()), 0xfffc, 0, 8})); }, "exceeds the GDS");
     expectFailure([&] { execute(state, makePacket(0x50, {0x20000000, 0, 1, low(destination.data()), high(destination.data()), 4})); }, "exceeds the GDS");
-    expectFailure([&] { execute(state, makePacket(0x50, {0x60200000, low(source.data()), high(source.data()), 0, 0, 4})); }, "destination is not implemented");
+    destination.fill(0xa5a5a5a5u);
+    const auto prefetch = makePacket(0x50, {0x60200000, low(source.data()), high(source.data()), 0, 0, 0x80000010u});
+    check(!AgcDriver::Pm4::ResolveStore(prefetch, state, 64).has_value(), "DMA_DATA prefetch resolved as a memory store");
+    execute(state, prefetch);
+    check(destination[0] == 0xa5a5a5a5u, "DMA_DATA prefetch stored data");
+    expectFailure([&] { execute(state, makePacket(0x50, {0x60000000, low(source.data()), high(source.data()), 0, 0, (1u << 27u) | 4u})); }, "destination 4 is not implemented");
     expectFailure([&] { execute(state, makePacket(0x50, {0x60000000 | (1u << 15u), low(source.data()), high(source.data()), low(destination.data()), high(destination.data()), 4})); }, "reserved fields");
     expectFailure([&] { execute(state, makePacket(0x37, {0x100, 0x1000, 0, 1})); }, "guest");
 #ifdef _WIN32
@@ -388,6 +396,36 @@ void testMemoryCopyDecode() {
     check(!DecodeMemoryCopy(packet(0x60000000, source + 32, source, 64)).has_value(), "overlapping ranges below the source decoded as a copy");
     check(DecodeMemoryCopy(packet(0x60000000, source, source + 64, 64)).has_value(), "adjacent ranges did not decode as a copy");
     check(!DecodeMemoryCopy(makePacket(0x40, {0x10101, 0, 0, 0, 0})).has_value(), "a COPY_DATA decoded as a DMA_DATA copy");
+    using AgcDriver::Pm4::DmaPrefetch;
+    check(DmaPrefetch(packet(0x60200000, source, 0, 0x10000)), "a DMA_DATA to DST_SEL NOWHERE is not a prefetch");
+    check(!DecodeMemoryCopy(packet(0x60200000, source, 0, 0x10000)).has_value(), "a DMA_DATA prefetch decoded as a copy");
+    check(!DmaPrefetch(packet(0x60000000, source, destination, 64)), "a memory-to-memory DMA_DATA is a prefetch");
+    check(!DmaPrefetch(packet(0x60100000, source, 0x100, 64)), "a DMA_DATA to the GDS is a prefetch");
+    check(!DmaPrefetch(makePacket(0x40, {0x10101, 0, 0, 0, 0})), "a COPY_DATA is a prefetch");
+}
+
+void testGdsCopyDecode() {
+    using AgcDriver::Pm4::DecodeGdsCopy;
+    using AgcDriver::Pm4::GdsAddress;
+    constexpr std::uint64_t memory = 0x403d7b400ull;
+    const auto packet = [&](std::uint32_t control, std::uint64_t from, std::uint64_t to, std::uint32_t command) {
+        return makePacket(0x50, {control, static_cast<std::uint32_t>(from), static_cast<std::uint32_t>(from >> 32u), static_cast<std::uint32_t>(to), static_cast<std::uint32_t>(to >> 32u), command});
+    };
+    const auto fromGds = DecodeGdsCopy(packet(0x20000000, 0x100, memory, 16));
+    check(fromGds.has_value() && fromGds->source == GdsAddress() + 0x100 && fromGds->destination == memory && fromGds->bytes == 16, "a GDS-to-memory DMA_DATA did not decode as a copy from the GDS memory");
+    const auto toGds = DecodeGdsCopy(packet(0x00100000, memory, 0x24, 4));
+    check(toGds.has_value() && toGds->source == memory && toGds->destination == GdsAddress() + 0x24 && toGds->bytes == 4, "a memory-to-GDS DMA_DATA did not decode as a copy into the GDS memory");
+    const auto withinGds = DecodeGdsCopy(packet(0x20100000, 0x100, 0x200, 64));
+    check(withinGds.has_value() && withinGds->source == GdsAddress() + 0x100 && withinGds->destination == GdsAddress() + 0x200, "a GDS-to-GDS DMA_DATA did not decode as a copy");
+    check(DecodeGdsCopy(packet(0x60100000, memory, 0x100, 64)).has_value(), "a GDS destination with an L2 memory source did not decode");
+    check(!DecodeGdsCopy(packet(0x40100000, 0x44332211, 0x100, 4)).has_value(), "an immediate fill of the GDS decoded as a copy");
+    check(!DecodeGdsCopy(packet(0x60000000, memory, memory + 64, 64)).has_value(), "a memory-to-memory DMA_DATA decoded as a GDS copy");
+    check(!DecodeGdsCopy(packet(0x20000000, 0xfff0, memory, 32)).has_value(), "a copy past the end of the GDS decoded");
+    check(!DecodeGdsCopy(packet(0x20000000, 0x100ull | (1ull << 32u), memory, 16)).has_value(), "a GDS source with high address bits decoded");
+    check(!DecodeGdsCopy(packet(0x00100000, memory, 0x100, 16 | (1u << 26u))).has_value(), "a register source decoded as a GDS copy");
+    check(!DecodeGdsCopy(packet(0x20000000, 0x100, memory, 16 | (1u << 29u))).has_value(), "a non-incrementing destination decoded as a GDS copy");
+    check(!DecodeGdsCopy(packet(0x20100000, 0x100, 0x120, 64)).has_value(), "overlapping GDS ranges decoded as a copy");
+    check(!DecodeGdsCopy(packet(0x20000000, 0x100, memory, 0)).has_value(), "an empty DMA_DATA decoded as a GDS copy");
 }
 
 void testMemorySynchronization() {
@@ -976,6 +1014,7 @@ int main(int argc, char** argv) {
         testMemory();
         testCopies();
         testMemoryCopyDecode();
+        testGdsCopyDecode();
         testMemorySynchronization();
         testConditionalValidation();
         testConditionReadSynchronization();

@@ -29,7 +29,7 @@ constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
 BufferPool::BufferPool(const Context& context) : device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))) {
     smallTier.budget = smallBudget;
     largeTier.budget = budget;
-    deviceTier.budget = DeviceBudget();
+    deviceTier.budget = DeviceBudget(context.memory);
 }
 
 BufferPool::~BufferPool() {
@@ -40,12 +40,16 @@ BufferPool::~BufferPool() {
     }
 }
 
-VkDeviceSize BufferPool::DeviceBudget() {
-    static const VkDeviceSize deviceBudget = [] {
-        const char* value = std::getenv("APS5_STAGING_POOL_MIB");
-        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 512ull) << 20u;
-    }();
-    return deviceBudget;
+VkDeviceSize BufferPool::DeviceBudget(const VkPhysicalDeviceMemoryProperties& memory) {
+    if (const char* value = std::getenv("APS5_STAGING_POOL_MIB")) return std::strtoull(value, nullptr, 10) << 20u;
+    // A sixth of the largest device-local heap, at least the 512 MiB it was: PPSA08427's staging
+    // shadows of written buffers missed ~6000 times per 10 s under 512 MiB on a 12 GiB card (each a
+    // vkAllocateMemory), and ~300 times under 3 GiB.
+    VkDeviceSize largest = 0;
+    for (std::uint32_t i = 0; i < memory.memoryHeapCount; ++i) {
+        if ((memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) largest = std::max(largest, memory.memoryHeaps[i].size);
+    }
+    return std::max<VkDeviceSize>(512ull << 20u, largest / 6u);
 }
 
 void BufferPool::destroy(const BufferAllocation& allocation) noexcept {
@@ -56,7 +60,12 @@ void BufferPool::destroy(const BufferAllocation& allocation) noexcept {
 }
 
 bool BufferPool::DeviceTiered(VkMemoryPropertyFlags properties) {
-    return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 && DeviceBudget() != 0;
+    // APS5_STAGING_POOL_MIB=0 keeps device-local allocations in the host tiers.
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_STAGING_POOL_MIB");
+        return value == nullptr || std::strtoull(value, nullptr, 10) != 0;
+    }();
+    return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 && enabled;
 }
 
 std::size_t BufferPool::Capacity(std::size_t bytes, VkMemoryPropertyFlags properties) {

@@ -205,7 +205,7 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
     info.size = entry.bytes;
     // INDIRECT_BUFFER: DISPATCH_INDIRECT group counts are read in place (VulkanDevice::DispatchIndirect).
-    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &entry.buffer); result != VK_SUCCESS) return failed("vkCreateBuffer", result);
     VkMemoryRequirements requirements{};
@@ -347,22 +347,40 @@ std::shared_ptr<const GuestAllocations::Range> leasedRangeOwner(const GuestAlloc
 
 bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
     const auto current = leasedRangeOwner(lease, entry.base);
-    return current != nullptr && !entry.range.owner_before(current) && !current.owner_before(entry.range);
+    if (current == nullptr || entry.range.owner_before(current) || current.owner_before(entry.range)) return false;
+    auto end = entry.base + current->bytes;
+    for (const auto& next : entry.continuations) {
+        const auto following = leasedRangeOwner(lease, end);
+        if (following == nullptr || next.owner_before(following) || following.owner_before(next)) return false;
+        end += following->bytes;
+    }
+    return end == entry.base + entry.bytes;
 }
 
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Lease& lease) {
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
-        if (found->second.bytes == bytes && sameRange(found->second, lease)) return &found->second;
+        if (found->second.bytes >= bytes && sameRange(found->second, lease)) return &found->second;
         retireImport(context, state, found, lease);
     }
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
     // Pinned imports count against the driver's system memory budget; past it ordinary host
-    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
-    // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
-    static const std::uint64_t budget = [] {
-        const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
-        return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
+    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 3/8 of physical memory and
+    // at least 6 GiB: PPSA08427 imports more than 6 GiB, and past the budget address-based shaders
+    // copy hundreds of MiB per dispatch).
+    static const std::uint64_t budget = []() -> std::uint64_t {
+        if (const char* value = std::getenv("APS5_HOST_IMPORT_MIB")) return std::strtoull(value, nullptr, 10) << 20u;
+        std::uint64_t physical = 0;
+#ifdef _WIN32
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (GlobalMemoryStatusEx(&status)) physical = status.ullTotalPhys;
+#else
+        const long pages = sysconf(_SC_PHYS_PAGES);
+        const long pageBytes = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && pageBytes > 0) physical = static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(pageBytes);
+#endif
+        return std::max<std::uint64_t>(physical / 8u * 3u, 6144ull << 20u);
     }();
     std::uint64_t live = 0;
     for (const auto& [address, existing] : state.imports) live += existing.bytes;
@@ -380,6 +398,13 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
     entry.range = leasedRangeOwner(lease, base);
+    if (entry.range.expired()) return nullptr;
+    for (auto end = base + entry.range.lock()->bytes; end < base + bytes;) {
+        const auto following = leasedRangeOwner(lease, end);
+        if (following == nullptr) return nullptr;
+        entry.continuations.push_back(following);
+        end += following->bytes;
+    }
 #ifdef _WIN32
     // Drivers pin imported pages, so every page must be committed and accessible.
     bool writable = true;
@@ -482,6 +507,23 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
     return range->readable && begin >= range->address && end <= range->address + range->bytes ? range.get() : nullptr;
 }
 
+// The readable registered ranges covering [begin, end) without a gap, as one span: the containing
+// range, or the run of adjacent ranges a buffer crosses (direct memory mapped in pieces registers a
+// range per piece); bytes 0 when there is none.
+std::pair<std::uint64_t, std::uint64_t> containingRun(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    auto found = std::upper_bound(lease.begin(), lease.end(), begin, [](std::uint64_t value, const auto& range) { return value < range->address; });
+    if (found == lease.begin()) return {0, 0};
+    --found;
+    if (!(*found)->readable || begin >= (*found)->address + (*found)->bytes) return {0, 0};
+    const auto base = (*found)->address;
+    auto covered = base + (*found)->bytes;
+    while (covered < end) {
+        if (++found == lease.end() || (*found)->address != covered || !(*found)->readable) return {0, 0};
+        covered += (*found)->bytes;
+    }
+    return {base, covered - base};
+}
+
 // Drops imports whose registered range changed or disappeared: their pages may no longer back the
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
@@ -508,7 +550,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     state.refreshedGeneration = generation;
     for (auto it = state.imports.begin(); it != state.imports.end();) {
         const auto* range = leasedRangeAt(lease, it->first);
-        if (range != nullptr && range->bytes == it->second.bytes && sameRange(it->second, lease)) {
+        if (range != nullptr && sameRange(it->second, lease)) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
@@ -1426,7 +1468,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    if (const auto* range = containingRange(lease, address, address + bytes)) return importAllocation(context, state, range->address, range->bytes, lease);
+    if (const auto [base, span] = containingRun(lease, address, address + bytes); span != 0) return importAllocation(context, state, base, span, lease);
     return nullptr;
 }
 
@@ -2288,7 +2330,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
-                if (const auto* range = containingRange(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, range->address, range->bytes, importRanges());
+                if (const auto [base, span] = containingRun(importRanges(), region.begin, region.end); span != 0) entry = importAllocation(context, state, base, span, importRanges());
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
@@ -2396,6 +2438,20 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         else {
             ++noImport;
             noImportBytes += bytes;
+            // APS5_TRACE_BIGBUF also names the registered ranges under each region of 64 MiB or more
+            // copied outside the imports (once per region start), to show why none spans it.
+            static const bool traceBig = std::getenv("APS5_TRACE_BIGBUF") != nullptr;
+            static std::set<std::uint64_t> traced;
+            if (traceBig && bytes >= (64ull << 20u) && traced.insert(region.begin).second) {
+                std::string ranges;
+                for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
+                    if (range->address + range->bytes <= region.begin || range->address >= region.end) continue;
+                    char text[96];
+                    std::snprintf(text, sizeof(text), " 0x%llx+0x%llx%s%s", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), range->readable ? " r" : "", range->writable ? "w" : "");
+                    ranges += text;
+                }
+                std::fprintf(stderr, "[bigbuf] 0x%llx+0x%llx is outside the imports; registered:%s\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(bytes), ranges.empty() ? " none" : ranges.c_str());
+            }
             auto& bucket = outside[region.begin >> 28u];
             ++bucket.first;
             bucket.second += bytes;
@@ -2607,17 +2663,42 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     const auto* found = owner(address);
     Require(found != nullptr, "guest buffer has no GPU owner");
     const auto& region = *found;
-    Require(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr), "guest buffer view exceeds its GPU owner");
-    const auto base = region.direct != nullptr ? region.direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
+    if (!(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr))) {
+        char what[224];
+        std::snprintf(what, sizeof(what), "guest buffer view exceeds its GPU owner: view 0x%llx+0x%zx, owner [0x%llx, 0x%llx)%s", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end), region.buffer == nullptr && region.direct == nullptr && region.mirror == nullptr ? " not uploaded" : "");
+        throw std::runtime_error(what);
+    }
+    // A region merged from several allocations keeps the first one's import; a view in a later
+    // allocation is served by that allocation's own import (retired imports outlive the batch).
+    const HostImport* direct = region.direct;
+    if (direct != nullptr && address >= direct->base + direct->bytes) {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        direct = findImport(state, address, address + 1);
+        Require(direct != nullptr, "guest buffer view lies past its GPU owner's import");
+    }
+    const auto base = direct != nullptr ? direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
     const auto offset = address - base;
     Require(context.limits.minStorageBufferOffsetAlignment != 0, "no storage buffer offset alignment");
     Require(base % 4 == 0, "a guest buffer view in a GPU owner that does not start at a DWORD boundary is not implemented");
     adjustment = static_cast<std::uint32_t>(offset % std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4));
-    const auto range = ViewBytes(bytes, adjustment);
-    const auto end = region.direct != nullptr ? region.direct->base + region.direct->bytes : region.end;
-    Require(address - adjustment + range <= end, "guest buffer view exceeds its GPU owner");
+    auto range = ViewBytes(bytes, adjustment);
+    const auto end = direct != nullptr ? direct->base + direct->bytes : region.end;
+    if (address - adjustment + range > end && direct != nullptr && address < end) {
+        // A descriptor may declare more bytes than its allocation holds (titles size views
+        // generously): the import ends with the allocation, so the view is clamped there and reads
+        // past it return zero (robust buffer access), as an unmapped tail would not hold data.
+        static std::atomic<std::uint32_t> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[gpu] guest buffer view 0x%llx+0x%zx clamped to its allocation's end 0x%llx\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(end));
+        range = end - (address - adjustment);
+    }
+    if (address - adjustment + range > end) {
+        char what[256];
+        std::snprintf(what, sizeof(what), "guest buffer view exceeds its GPU owner: view 0x%llx+0x%zx widened to 0x%llx+0x%llx for alignment, owner [0x%llx, 0x%llx)%s", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(address - adjustment), static_cast<unsigned long long>(range), static_cast<unsigned long long>(direct != nullptr ? direct->base : region.begin), static_cast<unsigned long long>(end), direct != nullptr ? " (direct)" : region.mirror != nullptr ? " (mirror)" : "");
+        throw std::runtime_error(what);
+    }
     Require(range <= context.limits.maxStorageBufferRange, "guest buffer view exceeds descriptor range limit");
-    const auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.buffer->Handle();
+    const auto handle = direct != nullptr ? direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.buffer->Handle();
     return {handle, offset - adjustment, range};
 }
 

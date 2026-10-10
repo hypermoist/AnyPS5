@@ -17,6 +17,9 @@ public:
     void TranslateInstruction(const RdnaInstruction& instruction);
     void SetPixelInput(const ShaderPixelInputInfo* info, bool barycentricEnabled) { pixelInput = info; fragmentShaderBarycentricEnabled = barycentricEnabled; }
     void SetFloatMode(const std::optional<ShaderFloatMode>& mode) { floatMode = mode; ieeeMode = mode.has_value() && mode->ieeeMode; }
+    // The f32 flush float mode is the module's DenormFlushToZero execution mode, not emulated.
+    void SetNativeF32DenormalFlush(bool native) { nativeF32DenormalFlush = native; }
+    void SetRelaxedFloat(bool relaxed) { relaxedFloat = relaxed; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
 
@@ -330,6 +333,8 @@ private:
     IrU1 instructionBranchCondition;
     RdnaOpcode currentOpcode = RdnaOpcode::Unknown;
     std::uint32_t f32DenormalFlush = 0u;
+    bool nativeF32DenormalFlush = false;
+    bool relaxedFloat = false;
     std::uint32_t currentProgramCounter = 0;
     std::uint32_t currentVectorLimit = 1;
 };

@@ -24,6 +24,7 @@
 #include "Optimization/include/Optimization/BindingAllocator.hpp"
 #include "Optimization/include/Optimization/ConstantFolder.hpp"
 #include "Optimization/include/Optimization/DeadCodeEliminator.hpp"
+#include "Optimization/include/Optimization/DenormalFlushEliminator.hpp"
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
@@ -76,17 +77,9 @@ ShaderStageKind toShaderStageKind(ShaderStage stage) {
 
 namespace {
 
-// The host subgroup width wave64 programs are laid out for. Debug aid: APS5_SINGLE_LANE=<hex code
-// addresses, comma separated, or "all"> keeps the listed programs at one guest lane per invocation.
+// The host subgroup width wave64 programs are laid out for (APS5_SINGLE_LANE, see RecompileCacheKey).
 std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
-    static const std::string list = [] { const char* text = std::getenv("APS5_SINGLE_LANE"); return text ? std::string(text) : std::string(); }();
-    if (!list.empty()) {
-        if (list == "all") return 64u;
-        char address[32];
-        std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
-        if (list.find(address) != std::string::npos) return 64u;
-    }
-    return request.target.subgroupSize;
+    return RecompileCacheKey::LaidOutSubgroupSize(request);
 }
 
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
@@ -123,6 +116,8 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     translateOptions.scratchDwords = request.context.compute.has_value() ? request.context.compute->scratchDwords : 0u;
     translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled;
     translateOptions.floatMode = request.context.floatMode;
+    translateOptions.nativeF32DenormalFlush = request.target.denormFlushToZeroF32;
+    translateOptions.relaxedFloat = request.target.relaxedFloat;
     translateOptions.inputInfo = inputInfo;
 
     constexpr InstructionTranslator translator;
@@ -168,6 +163,13 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
 
     constexpr MaskedSelectEliminator maskedSelectEliminator;
     if (maskedSelectEliminator.Eliminate(program).removedSelects != 0u) {
+        deadCodeEliminator.Eliminate(program);
+        constantFolder.LowerPackedAncillary(program);
+        deadCodeEliminator.Eliminate(program);
+    }
+
+    constexpr DenormalFlushEliminator denormalFlushEliminator;
+    if (denormalFlushEliminator.Eliminate(program).removedFlushes != 0u) {
         deadCodeEliminator.Eliminate(program);
     }
 
@@ -382,7 +384,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     const bool embedded = !result.vertexInputs.empty() && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded;
     if (embedded) PrepareVertexInputSpecialization(result);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded);
+    result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded && program.Info().buffers.empty());
     if (embedded) {
         std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> classes{};
         for (std::uint32_t kind = 1u; kind < 3u; ++kind) {
@@ -983,6 +985,18 @@ std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& reques
 }
 
 std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request) {
+    // Debug aid: APS5_DUMP_PREPARED=1 writes prepared_<address>_<stage>.req for agc_shader_replay
+    // before each preparation, so a preparation that never finishes can be replayed.
+    static const bool dumpPrepared = std::getenv("APS5_DUMP_PREPARED") != nullptr;
+    if (dumpPrepared) {
+        char name[80];
+        std::snprintf(name, sizeof(name), "prepared_%llx_%u.req", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage));
+        if (std::FILE* file = std::fopen(name, "wb")) {
+            const auto text = RequestSerializer{}.Serialize(request);
+            std::fwrite(text.data(), 1, text.size(), file);
+            std::fclose(file);
+        }
+    }
     return recompileReporting(request, [&]() -> std::shared_ptr<const SourceHandle> {
         static_cast<void>(RequestInputInfo(request));
         auto handle = std::make_shared<SourceHandle>();

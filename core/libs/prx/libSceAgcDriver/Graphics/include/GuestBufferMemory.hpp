@@ -28,6 +28,8 @@ struct HostImport {
     VkDeviceAddress address;
     void* alias = nullptr;
     std::weak_ptr<const GuestAllocations::Range> range {};
+    // The adjacent registered ranges after `range` that the import also spans, in address order.
+    std::vector<std::weak_ptr<const GuestAllocations::Range>> continuations {};
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;

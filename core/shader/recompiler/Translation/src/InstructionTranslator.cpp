@@ -282,7 +282,8 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         for (std::uint32_t reg = 4u; reg < 8u; reg++) {
             entryIr.SetScalarReg(static_cast<ScalarReg>(reg), u32(0u));
         }
-        entryIr.SetVectorReg(static_cast<VectorReg>(5), entryIr.IAdd(draw(1u), entryIr.Select(indexed, index, inputVertex)));
+        // A non-indexed GPU-side indirect draw's first vertex is the record's (MeshArguments, 0 otherwise).
+        entryIr.SetVectorReg(static_cast<VectorReg>(5), entryIr.IAdd(draw(1u), entryIr.Select(indexed, index, entryIr.IAdd(inputVertex, firstIndex))));
         entryIr.SetVectorReg(static_cast<VectorReg>(6), u32(0u));
         entryIr.SetVectorReg(static_cast<VectorReg>(7), u32(0u));
         entryIr.SetVectorReg(static_cast<VectorReg>(8), entryIr.IAdd(draw(2u), builtin(StageInputKind::WorkgroupId, 1u)));
@@ -434,6 +435,8 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         TranslationContext context(program, *blocks[typedIndex], vectorLimit);
         context.SetPixelInput(options.inputInfo.pixel, options.fragmentShaderBarycentricEnabled);
         context.SetFloatMode(options.floatMode);
+        context.SetNativeF32DenormalFlush(options.nativeF32DenormalFlush);
+        context.SetRelaxedFloat(options.relaxedFloat);
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];
             if (isCodeTableLoad(cfg, instruction.programCounter)) {
@@ -464,6 +467,9 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
 
     program.Metadata().blockInfo = std::move(blockInfos);
     program.BlockOrder() = blocks;
+    // FLOAT_MODE f32 denormals 0 flushes them; the translation left the flush to the module.
+    const std::uint32_t denormals = options.floatMode.has_value() ? (options.floatMode->floatMode >> 4u) & 3u : 0u;
+    program.Resources().f32DenormFlushToZero = options.nativeF32DenormalFlush && denormals == 0u;
 
     ValidateProgram(program, false);
     return program;

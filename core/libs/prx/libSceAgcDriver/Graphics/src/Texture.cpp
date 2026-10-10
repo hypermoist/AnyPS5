@@ -83,6 +83,9 @@ std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWrit
 // writeBackLayers), and pending units a DCC clear -> uncompressed key flip kept as the texels
 // (Refresh).
 std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0};
+// Refreshes for a write-only use that uploaded nothing, and the images whose pending units they
+// dropped (writeOnlyRefresh), on the [storage] line.
+std::atomic<std::uint64_t> writeOnlyRefreshes{0}, writeOnlyDropped{0};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
@@ -126,7 +129,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu, write-only refreshes %llu (pending images dropped %llu)\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), take(writeOnlyRefreshes), take(writeOnlyDropped));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -234,7 +237,7 @@ std::uint64_t SampledTextureMemory() {
     return SampledMemoryCounter().load(std::memory_order_relaxed);
 }
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, const HostImport* import) : context(context) {
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -257,7 +260,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         for (const auto& mip : mips) APS5_LOG_OUT("  mip %ux%u tiled=0x%llx+0x%llx linear=0x%llx+0x%llx blocksPerRow=%u pitch=%u tail=%d", mip.width, mip.height, static_cast<unsigned long long>(mip.tiledOffset), static_cast<unsigned long long>(mip.tiledSize), static_cast<unsigned long long>(mip.linearOffset), static_cast<unsigned long long>(mip.linearSize), mip.blocksPerRow, mip.pitchBytes, mip.tail ? 1 : 0);
 
         const auto guestBytes = geometry.guestBytes;
-        Require(snapshot.size() == guestBytes, "texture snapshot size mismatch");
+        Require(import != nullptr ? snapshot.empty() && descriptor.baseAddress >= import->base && descriptor.baseAddress - import->base + guestBytes <= import->bytes : snapshot.size() == guestBytes, "texture snapshot size mismatch");
 
         const auto sliceLinearBytes = geometry.sliceLinearBytes;
         Require(arrayLayers == 0 || sliceLinearBytes <= UINT64_MAX / arrayLayers, "detiled texture buffer size overflows");
@@ -301,8 +304,11 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 // Entries may also be extents ("3840x2160"), since heap addresses change between runs.
                 dumpWanted = dumpList.find(address) != std::string::npos || dumpList.find(extent) != std::string::npos;
             }
-            auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
+            std::shared_ptr<Buffer> staging;
+            if (import == nullptr) {
+                staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
+            }
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (profile) Profile().allocate += timer.lap();
@@ -321,7 +327,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             VkCommandBuffer commands = VK_NULL_HANDLE;
             if (recorder != nullptr) {
                 commands = recorder->Commands();
-                recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
+                if (staging != nullptr) recorder->Keep(staging, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(tiled, static_cast<std::size_t>(guestBytes));
                 recorder->Keep(linear, static_cast<std::size_t>(linearBytes));
                 recorder->Keep(owned);
@@ -330,8 +336,15 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 commands = batch->Handle();
             }
 
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, guestBytes);
+            if (import != nullptr) {
+                // Recorded GPU work may have written the surface (a copy, a storage image's results
+                // flushed into the import): the copy waits for every earlier write.
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                CopyBuffer(context, commands, import->buffer, descriptor.baseAddress - import->base, tiled->Handle(), 0, guestBytes);
+            } else {
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, guestBytes);
+            }
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
@@ -1202,7 +1215,42 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
-bool StorageTexture::Refresh() {
+// Unreal's transient allocator places differently shaped targets in the same memory, one after the
+// other within a frame: each refresh wrote the previous target's results back (retiled into the unit
+// shadow) and detiled them into the next image, ~700 MiB each way per frame at PPSA08427's title,
+// for an image the next dispatch overwrites without reading. For such a use (the shader only
+// stores to the image, which has one level and one layer), the other images' pending units wholly
+// inside its memory are dropped as dead (their results never reach memory: the next owner's
+// write-back replaces them), units straddling its edges are stored as usual, and the image keeps
+// its texels: the dispatch replaces those it writes, and the whole image is stored at its
+// write-back (MarkDirty marks every unit pending). Refused, and the regular refresh runs, when a
+// CPU store stamped the memory since the image's generation (its bytes must not be lost to texels
+// the dispatch may leave unwritten), when the DCC keys changed, or without block units.
+// APS5_NO_WRITE_ONLY_REFRESH=1 always runs the regular refresh.
+bool StorageTexture::writeOnlyRefresh() {
+    static const bool disabled = std::getenv("APS5_NO_WRITE_ONLY_REFRESH") != nullptr;
+    if (disabled || !blockUnits || descriptor.mipCount != 1 || geometry.imageLayers != 1 || geometry.imageDepth != 1 || generation == 0) return false;
+    if (descriptor.dccAddress != 0 && ProvedKeys() != uploadedKeys) return false;
+    // A CPU store stamps its page only when a collect walks it.
+    static_cast<void>(GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
+    std::vector<std::uint64_t> generations;
+    blockGenerations(generations);
+    std::vector<std::uint8_t> stamped(generations.size()), cpu(generations.size());
+    if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stamped, cpu)) return false;
+    if (std::any_of(cpu.begin(), cpu.end(), [](std::uint8_t value) { return value != 0; })) return false;
+    writeOnlyDropped.fetch_add(DiscardPendingInside(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)), std::memory_order_relaxed);
+    FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), this, "storage refresh", PublishScope::None);
+    // Stores over the memory since (the straddling units' just now) are taken as this image's
+    // content: its write-back replaces them.
+    const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    layerGeneration.assign(trackedLayers, current);
+    refreshGeneration();
+    originalValid = false;
+    writeOnlyRefreshes.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool StorageTexture::Refresh(bool writeOnly) {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     struct Exempt {
@@ -1213,6 +1261,10 @@ bool StorageTexture::Refresh() {
     // flush below and the compare through the hook skip it).
     refreshing = this;
     NoteProved();
+    if (writeOnly && writeOnlyRefresh()) {
+        if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
+        return true;
+    }
     // Results of other images pending in this memory must reach it first, except an alias's: its
     // units are taken on the device below (borrowUnits), so it stays pending. The keys read for
     // that decision are read again after the flush, which may store keys itself. The exemption
@@ -1576,7 +1628,11 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
         // under the GPU mutex at the movie stage. APS5_NO_RECORDED_CLEAR=1 waits as before.
-        captureGuestBytes(nullptr);
+        // Watched memory needs no snapshot to compare against (the watch tracks the CPU's writes), as
+        // for a direct upload below: reading it waited for recorded work over the surface and copied
+        // the whole surface for every clear (PPSA08427 clears ~50 full-screen images per 10 s).
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
+        else captureGuestBytes(nullptr);
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;

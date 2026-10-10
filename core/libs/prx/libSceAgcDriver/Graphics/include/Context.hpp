@@ -9,6 +9,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -74,6 +76,34 @@ struct DeviceFunctions {
 inline std::uint64_t& DeviceProcLookups() {
     thread_local std::uint64_t count = 0;
     return count;
+}
+
+// vkGetDeviceProcAddr answers by name: NVIDIA's resolver took ~28% of the submission thread at
+// PPSA08427's title, ~10 lookups per dispatch through Context::Function. Each thread keeps the
+// answers per device, resolver and name (the name's characters: a caller's buffer may be reused);
+// only misses reach the driver and count as lookups.
+struct DeviceProcKey {
+    VkDevice device;
+    PFN_vkGetDeviceProcAddr resolver;
+    std::string name;
+    bool operator==(const DeviceProcKey&) const = default;
+};
+struct DeviceProcKeyHash {
+    std::size_t operator()(const DeviceProcKey& key) const {
+        return std::hash<std::string>{}(key.name) ^ (std::hash<const void*>{}(key.device) * 31u) ^ std::hash<const void*>{}(reinterpret_cast<const void*>(key.resolver));
+    }
+};
+inline PFN_vkVoidFunction CachedDeviceProc(VkDevice device, PFN_vkGetDeviceProcAddr resolver, const char* name) {
+    thread_local std::unordered_map<DeviceProcKey, PFN_vkVoidFunction, DeviceProcKeyHash> cache;
+    thread_local DeviceProcKey probe;
+    probe.device = device;
+    probe.resolver = resolver;
+    probe.name.assign(name);
+    if (const auto found = cache.find(probe); found != cache.end()) return found->second;
+    ++DeviceProcLookups();
+    const auto function = resolver(device, name);
+    if (function != nullptr) cache.emplace(probe, function);
+    return function;
 }
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
@@ -151,8 +181,7 @@ struct Context {
     template<typename TFunction>
     TFunction Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
-        ++DeviceProcLookups();
-        const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
+        const auto function = reinterpret_cast<TFunction>(CachedDeviceProc(device, deviceProc, name));
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
         return function;
     }

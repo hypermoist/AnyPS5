@@ -124,7 +124,7 @@ public:
     // on the open batch, no snapshot: the only reader holds the mutex. `kind` names the reader for
     // the [recorder] hit counters. APS5_COPY_READ_TRACKING=0 notes nothing (ReadTracking() is then
     // false and the CPU copy falls back to Idle()).
-    enum class ReadKind : std::uint8_t { DispatchElement = 0, GpuCopy, AddressBased, Indirect, StorageUpload, CopySource, Count };
+    enum class ReadKind : std::uint8_t { DispatchElement = 0, GpuCopy, AddressBased, Indirect, StorageUpload, CopySource, DrawInput, Count };
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
@@ -183,6 +183,11 @@ public:
     void Sync();
     void CountSamples();
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
+    // Copies a GPU-side indirect dispatch's group counts from `source` to `arguments`, all three 0
+    // when one exceeds the device's maxComputeWorkGroupCount (the CPU path refuses such a dispatch;
+    // an unclamped count, such as the 0xffffffff of a count buffer a skipped dispatch never wrote,
+    // keeps the GPU busy indefinitely). False when the pipeline could not be made.
+    bool RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments);
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target);
     void NoteSampledDraw();
@@ -418,6 +423,11 @@ public:
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
+    // Notes a dispatch's program address (or a draw, with 0) in the open batch, so a batch still
+    // running after 5 s names the work it holds.
+    void NoteWork(std::uint64_t program);
+    // Records the group count address of a GPU-side indirect dispatch for the stuck-batch report.
+    void NoteIndirect(std::uint64_t arguments);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;
@@ -507,6 +517,12 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        // The first dispatch programs recorded (see NoteWork), and the draws and dispatches counted.
+        std::vector<std::uint64_t> work;
+        // The guest addresses of the group counts of its GPU-side indirect dispatches (NoteIndirect).
+        std::vector<std::uint64_t> indirect;
+        std::uint32_t draws = 0;
+        std::uint32_t dispatches = 0;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         bool submitted = false;
@@ -629,6 +645,9 @@ private:
     std::vector<SampleSegment> pendingSamples;
     bool countingSamples = false;
     int meshArgumentState = 0;
+    int dispatchArgumentState = 0;
+    VkPipelineLayout dispatchArgumentLayout = VK_NULL_HANDLE;
+    VkPipeline dispatchArgumentPipeline = VK_NULL_HANDLE;
     VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
     VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;
     int sampleCounterState = 0;

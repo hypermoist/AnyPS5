@@ -116,7 +116,11 @@ public:
     ShaderResources(const ShaderResources&) = delete;
     ShaderResources& operator=(const ShaderResources&) = delete;
     VkDescriptorSetLayout Layout() const;
-    void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+    // `set`: another set of this object's layout to bind instead of its own (PrepareMovedBindings).
+    void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set = VK_NULL_HANDLE) const;
+    // Recorded after a dispatch's trailing barrier: stores depth planes the dispatch wrote as storage
+    // images back into their depth images.
+    void RecordAfterDispatch(VkCommandBuffer commands) const;
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -138,6 +142,10 @@ public:
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    // A copy of the set with only the moved buffers rebound, for a dispatch template hit: a moved
+    // guest buffer is bound in place from its host import when the offset allows, else from a
+    // snapshot; moved data words from a buffer holding them. Null when nothing moved.
+    std::shared_ptr<DrawBindings> PrepareMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
@@ -427,6 +435,18 @@ private:
     std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;
     std::vector<bool> storageWritten;
+    // Elements the shader only stores to (StorageTexture::Refresh's write-only use).
+    std::vector<bool> storageWriteOnly;
+    // Depth planes used as storage images: copied into their images at each Bind, and the written ones
+    // back by RecordAfterDispatch.
+    struct DepthAccess {
+        std::uint64_t address;
+        std::shared_ptr<StorageTexture> image;
+        VkExtent2D extent;
+        bool written;
+    };
+    std::vector<DepthAccess> depthAccesses;
+    bool accessesDepthSurface = false;
     std::vector<bool> storageAtomic;
     std::vector<bool> storageAtomic64;
     std::vector<std::shared_ptr<Sampler>> samplers;

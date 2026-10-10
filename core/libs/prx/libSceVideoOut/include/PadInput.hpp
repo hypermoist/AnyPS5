@@ -20,6 +20,7 @@ public:
 
 private:
     void publish();
+    static double autoCrossPeriod();
     void setMouseMode(bool enabled);
     void openFirstAvailableController();
     void openController(int deviceIndex);

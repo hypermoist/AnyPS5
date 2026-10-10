@@ -1,5 +1,6 @@
 // agc_shader_replay <shader_*.req>...: replays compute recompile requests the driver saved with
 // APS5_DUMP_SHADERS=1, running the same resource analysis and recompile steps without the game.
+#include "CacheKey.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "ControlFlow/Structurizer.hpp"
@@ -38,16 +39,19 @@ std::string FirstLine(const std::string& text) {
 }
 
 bool g_disassemble = false;
+bool g_prepare = false;
 bool g_assembly = false;
 bool g_memory = false;
 bool g_spirv = false;
 bool g_graph = false;
 bool g_maintenance8 = false;
+bool g_denormFlush = false;
+bool g_relaxedFloat = false;
 bool g_code = false;
 
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
-    std::printf("%s: %zu code words, %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
+    std::printf("%s: %zu code words (hash c%llx), %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), static_cast<unsigned long long>(ShaderRecompiler::RecompileCacheKey::HashCode(request.request.shader.code)), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
     if (request.request.context.compute.has_value()) {
         const auto& compute = *request.request.context.compute;
         std::printf("  compute: threads %ux%ux%u, lds %u dwords, group ids %d%d%d, tg size %d, thread id components %u\n", compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], compute.ldsSizeDwords, compute.groupIdEnable[0], compute.groupIdEnable[1], compute.groupIdEnable[2], compute.tgSizeEnable, compute.threadIdComponentCount);
@@ -113,8 +117,33 @@ bool Replay(const char* path) {
         std::printf("  resource analysis failed: %s\n", FirstLine(error.what()).c_str());
         return false;
     }
+    if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
+    if (g_denormFlush) request.request.target.denormFlushToZeroF32 = true;
+    if (g_relaxedFloat) request.request.target.relaxedFloat = true;
+    if (g_prepare) {
+        // What shader registration runs: compile the artifact without resolving runtime resources.
+        try {
+            const auto handle = ShaderRecompiler::PrepareShader(request.request);
+            std::printf("  prepared: %zu SPIR-V words\n", ShaderRecompiler::GetPreparedArtifact(*handle).spirv.size());
+            if (g_spirv) {
+                const auto& spirv = ShaderRecompiler::GetPreparedArtifact(*handle).spirv;
+                std::string name(path);
+                name = name.substr(name.find_last_of("/\\") + 1) + ".prepared.spv";
+                std::ofstream(name, std::ios::binary).write(reinterpret_cast<const char*>(spirv.data()), static_cast<std::streamsize>(spirv.size() * sizeof(spirv[0])));
+            }
+            if (request.request.context.compute) {
+                // Registration also prepares compute shaders for a partial group of one thread.
+                request.request.context.compute->partialThreads = {1, 1, 1};
+                const auto partial = ShaderRecompiler::PrepareShader(request.request);
+                std::printf("  prepared partial group: %zu SPIR-V words\n", ShaderRecompiler::GetPreparedArtifact(*partial).spirv.size());
+            }
+            return true;
+        } catch (const std::exception& error) {
+            std::printf("  preparation failed: %s\n", FirstLine(error.what()).c_str());
+            return false;
+        }
+    }
     try {
-        if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
         if (g_spirv) {
@@ -152,7 +181,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--denorm-ftz] [--relaxed-float] [--prepare] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set, and\n  prepared_<address>_<stage>.req files for --prepare when APS5_DUMP_PREPARED is set\n");
         return 2;
     }
     int failures = 0;
@@ -173,12 +202,24 @@ int main(int argc, char** argv) {
             g_maintenance8 = true;
             continue;
         }
+        if (std::string(argv[i]) == "--denorm-ftz") {
+            g_denormFlush = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--relaxed-float") {
+            g_relaxedFloat = true;
+            continue;
+        }
         if (std::string(argv[i]) == "--mem") {
             g_memory = true;
             continue;
         }
         if (std::string(argv[i]) == "--code") {
             g_code = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--prepare") {
+            g_prepare = true;
             continue;
         }
         if (std::string(argv[i]) == "--spv") {

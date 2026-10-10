@@ -53,7 +53,9 @@ struct OwnedImage {
 
 class Texture {
 public:
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false);
+    // `import`, when given, holds the surface's guest memory: the GPU copies the bytes from it, ordered
+    // after the recorded work that wrote them, and `snapshot` is empty.
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, const HostImport* import = nullptr);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
@@ -291,7 +293,10 @@ public:
     // Brings the image up to date with guest memory before another use; returns whether its content
     // was still current (nothing uploaded).
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
-    bool Refresh();
+    // `writeOnly`: the next use only stores to the whole image (one level, one layer), so what other
+    // images left pending inside its memory is dead and its own previous texels are never read:
+    // nothing is written back or uploaded for them (see writeOnlyRefresh).
+    bool Refresh(bool writeOnly = false);
     std::uint64_t GuestBytes() const;
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
@@ -391,6 +396,7 @@ private:
     // Per 64 KiB tracker block of the surface (block 0 holds the base address): the generation of
     // the tracked layer it belongs to, for GuestMemory::ChangedBlocks.
     void blockGenerations(std::vector<std::uint64_t>& generations) const;
+    bool writeOnlyRefresh();
     // Another image of exactly this surface under another storage format with results pending
     // (block units, uncompressed, still cached), if any: Refresh takes its pending units from its
     // image on the device (borrowUnits) instead of having them stored and re-read, and the alias

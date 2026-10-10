@@ -8,6 +8,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -38,10 +39,14 @@ public:
 
     ~FfmpegDecoder() override { avcodec_free_context(&context); }
 
-    void Reset() override { avcodec_flush_buffers(context); }
+    void Reset() override {
+        if (context) avcodec_flush_buffers(context);
+    }
 
 protected:
     DecodeResult decodePacket(const std::uint8_t* data, std::size_t size, std::uint8_t* pcm, std::size_t pcmSize) {
+        // A failed reopen leaves no context: every packet is refused until the next successful one.
+        if (!context) return {DecodeStatus::InvalidData};
         AVPacket* packet = av_packet_alloc();
         AVFrame* frame = av_frame_alloc();
         if (!packet || !frame) {
@@ -56,7 +61,12 @@ protected:
         if (avcodec_send_packet(context, packet) < 0) result.status = DecodeStatus::InvalidData;
         while (result.status == DecodeStatus::Ok && avcodec_receive_frame(context, frame) == 0) {
             const auto format = static_cast<AVSampleFormat>(frame->format);
-            if (format != AV_SAMPLE_FMT_FLTP && format != AV_SAMPLE_FMT_S16P) throw std::runtime_error("libSceAudiodec: FFmpeg sample format " + std::to_string(frame->format) + " is not converted");
+            if (format != AV_SAMPLE_FMT_FLTP && format != AV_SAMPLE_FMT_S16P) {
+                const int unconverted = frame->format;
+                av_packet_free(&packet);
+                av_frame_free(&frame);
+                throw std::runtime_error("libSceAudiodec: FFmpeg sample format " + std::to_string(unconverted) + " is not converted");
+            }
             const auto channels = static_cast<std::size_t>(frame->ch_layout.nb_channels);
             const auto samples = static_cast<std::size_t>(frame->nb_samples);
             const std::size_t sampleBytes = wordSize == WORD_SIZE_FLOAT ? 4 : 2;
@@ -99,7 +109,18 @@ private:
             std::memcpy(context->extradata, extradata.data(), extradata.size());
             context->extradata_size = static_cast<int>(extradata.size());
         }
-        if (avcodec_open2(context, codec, nullptr) < 0) throw std::runtime_error("libSceAudiodec: cannot open an FFmpeg decoder");
+        if (const int status = avcodec_open2(context, codec, nullptr); status < 0) {
+            avcodec_free_context(&context);
+            char reason[AV_ERROR_MAX_STRING_SIZE]{};
+            av_strerror(status, reason, sizeof(reason));
+            std::string config;
+            for (const auto byte : extradata) {
+                char hex[4];
+                std::snprintf(hex, sizeof(hex), "%02x", byte);
+                config += hex;
+            }
+            throw std::runtime_error("libSceAudiodec: cannot open the FFmpeg " + std::string(avcodec_get_name(id)) + " decoder" + (config.empty() ? "" : " (config " + config + ")") + ": " + reason);
+        }
     }
 
     std::int32_t wordSize;
@@ -137,18 +158,29 @@ public:
         }
         if (configs.size() <= 1) return decodePacket(data, frameBytes, pcm, pcmSize);
         for (std::size_t index = 0; index < configs.size(); ++index) {
-            if (index != 0) reopen(configs[index]);
+            if (index != 0 && !tryReopen(configs[index])) continue;
             const DecodeResult result = decodePacket(data, frameBytes, pcm, pcmSize);
             if (result.status != DecodeStatus::InvalidData) {
                 configs = {configs[index]};
                 return result;
             }
         }
-        reopen(configs.front());
+        tryReopen(configs.front());
         return {DecodeStatus::InvalidData};
     }
 
 private:
+    // A configuration FFmpeg refuses is a candidate that does not match, not a failed decode.
+    bool tryReopen(const std::vector<std::uint8_t>& config) {
+        try {
+            reopen(config);
+            return true;
+        } catch (const std::runtime_error& error) {
+            std::fprintf(stderr, "[audiodec] %s\n", error.what());
+            return false;
+        }
+    }
+
     bool adts;
     std::vector<std::vector<std::uint8_t>> configs;
 };

@@ -97,10 +97,38 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     }
 
     static const bool cpuStores = std::getenv("APS5_CPU_STORES") != nullptr;
-    if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
+    // A DMA_DATA prefetch (DST_SEL NOWHERE) stores nothing: PPSA08427 issues thousands per minute,
+    // and each drained the device when it took the store path below.
+    if (!drainAll && Pm4::DmaPrefetch(packet)) {
+        orderedAlready = true;
+    } else if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
-        if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+        bool copied = false;
+        // A memory-to-memory copy up to the store limit is recorded on the GPU as well: the store
+        // path below reads its source on the CPU, which waits for the recorded work writing it
+        // (PPSA08427: ~65 waits, ~390 ms per 10 s on queue 0). APS5_NO_GPU_DMA_COPIES=1 keeps the store.
+        static const bool gpuDmaCopies = std::getenv("APS5_NO_GPU_DMA_COPIES") == nullptr;
+        const auto smallCopy = [&]() -> std::optional<Pm4::MemoryCopy> {
+            if (opcode != 0x50) return std::nullopt;
+            if (auto gds = Pm4::DecodeGdsCopy(packet)) return gds;
+            auto memory = gpuDmaCopies ? Pm4::DecodeMemoryCopy(packet) : std::nullopt;
+            if (memory && memory->bytes <= gpuStoreLimit) return memory;
+            return std::nullopt;
+        };
+        if (const auto copy = smallCopy(); copy && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (const auto localDevice = device.Load()) {
+                recordDeferredLabels(localDevice.get(), submission.queue);
+                if (localDevice->CopyMemoryOnGpu(copy->destination, copy->source, copy->bytes)) {
+                    copied = true;
+                    wroteOnGpu = true;
+                    drained = false;
+                }
+            }
+        }
+        if (const auto store = copied ? std::optional<Pm4::StoreWrite>{} : Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 

@@ -217,6 +217,15 @@ struct SpirvTarget {
     bool nonConstantImageOffsets = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool narrowSubgroupClock = false;
+    // The device flushes f32 denormals natively (shaderDenormFlushToZeroFloat32): a shader whose float
+    // mode flushes them declares DenormFlushToZero instead of emulating the flush per operand.
+    bool denormFlushToZeroF32 = false;
+    // Skips the bit-exact f32 emulations a host GPU does not need to draw the same picture: the NaN
+    // each op returns (RDNA's first NaN source, quieted, against the host's canonical NaN) and the
+    // f32 denormal flush when the device cannot flush natively (denormals are kept instead). Both
+    // only change a result's bits for NaN or denormal values; they wrapped every f32 add, multiply
+    // and fma in ~9 more operations (PPSA08427's largest kernels: 1.9M SPIR-V words, 1.1M without).
+    bool relaxedFloat = false;
 };
 
 struct BindingLayout {
@@ -337,6 +346,10 @@ struct DescriptorBinding {
     std::vector<bool> samplerDepthCompare;
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
     std::vector<bool> imageWritten;
+    // Guest image elements the shader loads, samples or updates atomically; a false entry is
+    // proved: the shader only stores to it, so a driver need not bring the image's previous
+    // contents in before the dispatch. An element beyond the vector must be treated as read.
+    std::vector<bool> imageRead;
     std::vector<bool> imageDepthCompare;
     std::vector<bool> imageAtomic;
     std::vector<bool> imageAtomic64;

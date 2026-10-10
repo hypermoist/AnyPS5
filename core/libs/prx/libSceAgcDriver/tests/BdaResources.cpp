@@ -66,15 +66,18 @@ void importCrossingTests(const Context& context, const BdaTestAccess& access) {
         const auto crossing = leased.Descriptor(second - 16, 32, adjustment);
         const auto crossingBytes = access.bytes(crossing.buffer);
         Require(crossing.offset + crossing.range <= crossingBytes.size(), "a view crossing into the next registered range is bound past its host import");
-        Require(crossingBytes[crossing.offset + adjustment + 15] == std::byte{0x11} && crossingBytes[crossing.offset + adjustment + 16] == std::byte{0x22}, "a view crossing into the next registered range misses its bytes");
+        const auto* spanning = HostImportFor(importing, second - 16, 32);
+        Require(spanning == nullptr || (spanning->base == first && spanning->bytes == 2 * half), "the import over both registered ranges does not span them");
+        const bool spanned = spanning != nullptr && crossing.buffer == spanning->buffer;
+        Require(spanned ? crossing.offset + adjustment == second - 16 - first : crossingBytes[crossing.offset + adjustment + 15] == std::byte{0x11} && crossingBytes[crossing.offset + adjustment + 16] == std::byte{0x22}, "a view crossing into the next registered range misses its bytes");
         const auto inside = leased.Descriptor(second + 64, 16, adjustment);
         const auto insideBytes = access.bytes(inside.buffer);
-        Require(inside.offset + inside.range <= insideBytes.size() && (inside.buffer == secondImport.buffer ? inside.offset + adjustment == 64 : insideBytes[inside.offset + adjustment] == std::byte{0x22}), "a view in the second registered range is bound past its buffer or misses its bytes");
+        Require(inside.offset + inside.range <= insideBytes.size() && (inside.buffer == secondImport.buffer ? inside.offset + adjustment == 64 : spanning != nullptr && inside.buffer == spanning->buffer ? inside.offset + adjustment == second + 64 - first : insideBytes[inside.offset + adjustment] == std::byte{0x22}), "a view in the second registered range is bound past its buffer or misses its bytes");
         for (const auto& range : leased.AddressRanges()) {
             if (range.end <= first || range.begin >= second + half) continue;
             const auto mapped = access.addressBytes(range.deviceAddress);
             Require(mapped.size() >= range.end - range.begin, "a BDA range runs past the end of its host import");
-            if (range.begin <= second && second < range.end && range.deviceAddress != secondImport.address) Require(mapped[second - range.begin] == std::byte{0x22}, "the BDA range over the second registered range misses its bytes");
+            if (range.begin <= second && second < range.end && range.deviceAddress != secondImport.address && (spanning == nullptr || range.deviceAddress != spanning->address + (range.begin - first))) Require(mapped[second - range.begin] == std::byte{0x22}, "the BDA range over the second registered range misses its bytes");
         }
         leased.WriteBack();
     }

@@ -17,6 +17,8 @@ public:
     PreparedShaderState& Edit(const ShaderSnapshot& snapshot);
     const PreparedShaderState& Read(const ShaderSnapshot& snapshot) const;
     void Commit();
+    // Lets the enclosing transaction commit after a nested one failed and its failure was skipped.
+    static void ForgiveFailure();
 
 private:
     struct State;

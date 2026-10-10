@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -14,6 +15,19 @@ namespace AgcDriver::DriverDetail {
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
+    // Debug aid: APS5_SKIP_PROGRAMS=<hex>,<hex>... refuses the dispatches of those programs, to find
+    // the one that hangs the GPU (with APS5_SKIP_FAILED_WORK=1 the title goes on without them).
+    static const std::vector<std::uint64_t> skippedPrograms = [] {
+        std::vector<std::uint64_t> parsed;
+        for (const char* text = std::getenv("APS5_SKIP_PROGRAMS"); text != nullptr && *text != '\0';) {
+            char* end = nullptr;
+            parsed.push_back(std::strtoull(text, &end, 16));
+            text = *end == ',' ? end + 1 : end;
+            if (end == text && *end != '\0') break;
+        }
+        return parsed;
+    }();
+    if (std::find(skippedPrograms.begin(), skippedPrograms.end(), address) != skippedPrograms.end()) throw std::runtime_error("AGC driver: program skipped by APS5_SKIP_PROGRAMS");
     auto it = submission.shaders->upper_bound(address);
     std::shared_ptr<const ShaderSnapshot> registeredShader;
     if (it != submission.shaders->begin()) {

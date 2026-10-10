@@ -394,6 +394,32 @@ done:
   buffer_store_dword v1, off, s[0:3], 0
   s_endpgm)",
          Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860005u, 0x7d880088u, 0xbf870002u, 0x7d880084u, 0xbf870004u, 0x4a020281u, 0x4a020282u, 0xbf09c008u, 0xbf850002u, 0x80089008u, 0xbf82fff4u}), Split::None},
+        {"continue through a block beside the inner merge of a nested selection in a loop", R"(
+  s_mov_b32 s8, 0
+  v_mov_b32 v1, 0
+loop:
+  v_cmp_gt_u32 vcc, s8, v0
+  s_cbranch_vccz join
+  v_cmp_gt_u32 vcc, 8, v0
+  s_cbranch_vccnz inner
+  v_cmp_gt_u32 vcc, 4, v0
+  s_cbranch_vccnz skip
+inner:
+  v_add_nc_u32 v1, 1, v1
+join:
+  v_add_nc_u32 v1, 2, v1
+  s_cmp_ge_u32 s8, 64
+  s_cbranch_scc1 done
+latch:
+  s_add_u32 s8, s8, 16
+  s_branch loop
+skip:
+  v_add_nc_u32 v1, 3, v1
+  s_branch latch
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860005u, 0x7d880088u, 0xbf870002u, 0x7d880084u, 0xbf870006u, 0x4a020281u, 0x4a020282u, 0xbf09c008u, 0xbf850004u, 0x80089008u, 0xbf82fff4u, 0x4a020283u, 0xbf82fffcu}), Split::None},
         {"loop exit to the end of the program beside a kill exit", R"(
   v_mov_b32 v1, 0
   s_mov_b64 s[20:21], exec

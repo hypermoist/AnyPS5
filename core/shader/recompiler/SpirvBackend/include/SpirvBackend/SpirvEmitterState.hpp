@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -102,6 +103,7 @@ struct SpirvEmitterState {
     std::uint32_t storageBufferVariable = 0;
     std::uint32_t storageBufferU64Variable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
+    std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaPointerFunction = 0;
@@ -196,6 +198,7 @@ struct SpirvDeferredPhiPatch {
 
 struct StructuredFunctionState {
     std::unordered_map<const IrBlock*, std::uint32_t> blockExitLabels;
+    std::unordered_map<const IrBlock*, std::vector<std::size_t>> loopMergeOffsets;
     std::vector<SpirvDeferredPhiPatch> deferredPhis;
 };
 

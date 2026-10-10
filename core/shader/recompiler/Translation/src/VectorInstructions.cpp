@@ -94,7 +94,7 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     if (denormals == 1u || denormals == 2u) {
         throw std::runtime_error("f32 denormal mode " + std::to_string(denormals) + " at pc " + std::to_string(inst.programCounter) + " is not implemented");
     }
-    return denormals == 0u ? flush : 0u;
+    return denormals == 0u && !nativeF32DenormalFlush && !relaxedFloat ? flush : 0u;
 }
 
 bool TranslationContext::emitVector(const RdnaInstruction& inst) {

@@ -4,7 +4,9 @@
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <stdexcept>
 #include <type_traits>
 
@@ -62,6 +64,23 @@ public:
         return hash;
     }
 
+    // The host subgroup width a program is laid out for: the target's, or 64 (one guest lane per
+    // invocation) for a wave64 program APS5_SINGLE_LANE names. Debug aid: APS5_SINGLE_LANE takes
+    // "all" or comma-separated hex code addresses or c<hex code hash> (HashCode, which agc_shader_replay
+    // prints; stable across runs where the address is not).
+    static std::uint32_t LaidOutSubgroupSize(const RecompileRequest& request) {
+        static const std::string list = [] { const char* text = std::getenv("APS5_SINGLE_LANE"); return text ? std::string(text) : std::string(); }();
+        if (!list.empty()) {
+            if (list == "all") return 64u;
+            char name[40];
+            std::snprintf(name, sizeof(name), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
+            if (list.find(name) != std::string::npos) return 64u;
+            std::snprintf(name, sizeof(name), "c%llx", static_cast<unsigned long long>(HashCode(request.shader.code)));
+            if (list.find(name) != std::string::npos) return 64u;
+        }
+        return request.target.subgroupSize;
+    }
+
     // A 64-bit hash of the code, two dwords per step; collisions are resolved by comparing the code.
     static std::uint64_t HashCode(std::span<const std::uint32_t> code) {
         std::uint64_t hash = 0x9e3779b97f4a7c15ull ^ (static_cast<std::uint64_t>(code.size()) * 0x100000001b3ull);
@@ -87,6 +106,7 @@ private:
         appendMesh(key, request);
         appendTessellation(key, request);
         append(key, request.target);
+        append(key, LaidOutSubgroupSize(request));
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
         append(key, RayTracingMiss());
@@ -238,6 +258,8 @@ private:
         append(key, value.nonConstantImageOffsets);
         append(key, value.srgbDecodeFormats);
         append(key, value.narrowSubgroupClock);
+        append(key, value.denormFlushToZeroF32);
+        append(key, value.relaxedFloat);
     }
 };
 

@@ -73,6 +73,9 @@ struct IrResourcePlan {
     bool requiresSpecializationMemory = false;
     bool srtPlanComplete = false;
     bool resourceTrackingComplete = false;
+    // The module declares DenormFlushToZero for f32 (the shader's float mode flushes f32 denormals and
+    // the device does so natively).
+    bool f32DenormFlushToZero = false;
     ShaderInfo info;
     UniformFillPlan uniformFill;
 };
