@@ -2817,7 +2817,7 @@ bool MovableDispatchBuffers() {
 }
 
 ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device) {
-    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), MovableDispatchBuffers());
+    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), MovableDispatchBuffers(), MovableDispatchBuffers());
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
     key.push_back(static_cast<std::uint32_t>(deviceHandle));
     key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
@@ -3194,6 +3194,7 @@ struct RecordedDispatch {
     bool refreshed = false;
     bool resourceKeyMatched = false;
     VkDescriptorSet movedSet = VK_NULL_HANDLE;
+    std::span<const Graphics::ShaderResources::MovedBuffer> moved;
 };
 
 VkDevice VulkanDevice::Device() const {
@@ -3593,7 +3594,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.EndGpuTiming(trailingTiming);
     recorder.MarkCovered(dispatchedAccess);
     recordStep(PhaseRecordBind);
-    resources.MarkGpuWrites(recorder);
+    resources.MarkGpuWrites(recorder, record.moved);
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
@@ -3658,6 +3659,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // dispatch's words at the record (ShaderResources::RefreshData).
     bool fromCache = false;
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> movedBindings;
+    std::vector<Graphics::ShaderResources::MovedBuffer> movedWrites;
     double revalidateMs = 0;
     // The batches the pre-sync (PrepareDispatch) waited for are reaped first: their completions
     // (CPU write-backs) land before stage B or a cached object's Revalidate reads, and the flush
@@ -3737,8 +3739,19 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         if (cached != nullptr) {
             if (cached->Revalidate(shaders[0])) {
                 std::optional<std::vector<Graphics::ShaderResources::MovedBuffer>> moved = std::vector<Graphics::ShaderResources::MovedBuffer>{};
-                if (MovableDispatchBuffers()) moved = cached->MovedReadOnlyBuffers(std::span<const Graphics::CompiledShader>(shaders), *state->recorder);
+                if (MovableDispatchBuffers()) moved = cached->MovedReadOnlyBuffers(std::span<const Graphics::CompiledShader>(shaders), *state->recorder, true);
                 if (moved.has_value()) {
+                    for (const auto& entry : *moved) {
+                        if (!entry.written) continue;
+                        const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(entry.address, entry.size); };
+                        if (std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), overlaps) || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), overlaps)) {
+                            moved.reset();
+                            break;
+                        }
+                    }
+                }
+                if (moved.has_value()) {
+                    movedWrites = *moved;
                     movedBindings = cached->PrepareMovedBindings(*state->recorder, *moved);
                     resources = std::move(cached);
                     fromCache = true;
@@ -3840,6 +3853,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     IndirectOutcome outcome{0, 0};
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer};
     record.movedSet = movedBindings != nullptr ? movedBindings->allocation.set : VK_NULL_HANDLE;
+    record.moved = movedWrites;
     record.resourceKeyMatched = fromCache;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.

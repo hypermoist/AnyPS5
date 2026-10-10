@@ -1292,7 +1292,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
     }
     try {
         Require(!shaders.empty() && context.limits.maxBoundDescriptorSets >= 1, "shader descriptor set exceeds device limits");
-        if (shaders.size() == 1u) refreshResourceKey = ContentKey(shaders.front(), false, true);
+        if (shaders.size() == 1u) refreshResourceKey = ContentKey(shaders.front(), false, true, true);
         std::set<std::uint32_t> occupied;
         for (const auto& shader : shaders) {
             Require(shader.program != nullptr, "missing compiled shader");
@@ -1624,7 +1624,7 @@ void ShaderResources::reportDescriptorCaches() const {
 }
 
 template<typename TVisitor>
-void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit) {
+void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, bool movableWritten, const TVisitor& visit) {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
     visit(dataWords ? 1u : 0u);
@@ -1650,7 +1650,8 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                 const bool empty = words[2] == 0 || (words[0] == 0 && (words[1] & 0xffffu) == 0);
-                if (written || empty) { for (std::uint32_t index = 0; index < 4u; ++index) visit(words[index]); }
+                if (empty || (written && !movableWritten)) { for (std::uint32_t index = 0; index < 4u; ++index) visit(words[index]); }
+                else if (written) { for (const auto word : {0u, words[1] & 0xffff0000u, words[2], words[3], 1u}) visit(word); }
                 else { for (const auto word : {0u, words[1] & 0xffff0000u, 0u, words[3]}) visit(word); }
             }
         } else if ((dataWords && !movableBuffers) || !DataRole(binding.role)) {
@@ -1671,18 +1672,18 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
     }
 }
 
-std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
+std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, bool movableWritten) {
     Require(shader.program != nullptr, "missing compiled shader");
     std::vector<std::uint32_t> key;
     key.reserve(8u + shader.program->bindings.size() * 12u);
-    VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); });
+    VisitContentKey(shader, dataWords, movableBuffers, movableWritten, [&](std::uint32_t word) { key.push_back(word); });
     return key;
 }
 
 bool MatchesContentKey(const CompiledShader& shader, std::span<const std::uint32_t> key) {
     std::size_t cursor = 0;
     bool equal = true;
-    VisitContentKey(shader, false, true, [&](std::uint32_t word) {
+    VisitContentKey(shader, false, true, true, [&](std::uint32_t word) {
         equal &= cursor < key.size() && key[cursor] == word;
         ++cursor;
     });
@@ -3272,7 +3273,7 @@ ShaderResources::DrawBindings::~DrawBindings() {
     if (cache != nullptr && allocation.set != VK_NULL_HANDLE) cache->Free(allocation);
 }
 
-std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, bool written) const {
     std::vector<MovedBuffer> moved;
     if (_set == VK_NULL_HANDLE || usesBda) return moved;
     for (const auto& shader : shaders) {
@@ -3307,11 +3308,21 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                     return std::nullopt;
                 }
                 if (item.address == address && item.size == size) continue;
-                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
-                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
+                const bool elementWritten = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                if (empty || size > context.limits.maxStorageBufferRange) return std::nullopt;
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
+                if (elementWritten || item.written) {
+                    if (!written || !elementWritten || !item.written || size != item.size || !guestMemory.BoundInPlace(item.address)) return std::nullopt;
+                    const auto* import = HostImportFor(context, begin, bytes);
+                    if (import == nullptr || (begin - import->base) % context.limits.minStorageBufferOffsetAlignment != 0) return std::nullopt;
+                    if (guestMemory.WritesOverlap(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+                    MovedBuffer entry{index, address, static_cast<std::size_t>(size)};
+                    entry.written = true;
+                    moved.push_back(std::move(entry));
+                    continue;
+                }
                 if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
             }
@@ -3449,6 +3460,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareMovedBind
                 infos.push_back({import->buffer, begin - import->base, bytes});
                 recorder.NotePendingRead(begin, bytes, Recorder::ReadKind::DispatchElement);
             } else {
+                Require(!entry.written, "a moved written buffer is not bound in place");
                 const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
                 auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
@@ -3525,7 +3537,7 @@ void ShaderResources::WriteBack() {
     }
 }
 
-void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+void ShaderResources::MarkGpuWrites(Recorder& recorder, std::span<const MovedBuffer> moved) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
@@ -3540,8 +3552,25 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     guestMemory.RecordCopyBacks(recorder);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
-    recorder.NotePendingWrites(guestMemory.Writes());
-    guestMemory.MarkDirectWrites();
+    if (std::none_of(moved.begin(), moved.end(), [](const MovedBuffer& entry) { return entry.written; })) {
+        recorder.NotePendingWrites(guestMemory.Writes());
+        guestMemory.MarkDirectWrites();
+    } else {
+        auto writes = guestMemory.Writes();
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> movedWrites;
+        for (const auto& entry : moved) {
+            if (!entry.written) continue;
+            const auto& item = allocations[entry.allocation];
+            std::erase(writes, std::make_pair(item.address, item.address + item.size));
+            movedWrites.emplace_back(entry.address, entry.address + entry.size);
+        }
+        writes.insert(writes.end(), movedWrites.begin(), movedWrites.end());
+        recorder.NotePendingWrites(writes);
+        for (const auto& [begin, end] : writes) {
+            const bool movedRange = std::find(movedWrites.begin(), movedWrites.end(), std::make_pair(begin, end)) != movedWrites.end();
+            if (movedRange || guestMemory.DirectWriteAt(begin)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+        }
+    }
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

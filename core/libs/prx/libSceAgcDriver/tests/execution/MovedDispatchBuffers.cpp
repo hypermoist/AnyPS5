@@ -29,11 +29,12 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t co
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), count * 4u, 0x31016facu};
 }
 
-void Copy(AgcDriver::VulkanDevice& device, const std::uint32_t* input) {
-    std::fill(Output, Output + Threads, 0xdeadbeefu);
+void Copy(AgcDriver::VulkanDevice& device, const std::uint32_t* input, std::uint32_t* output = nullptr) {
+    if (output == nullptr) output = Output;
+    std::fill(output, output + Threads, 0xdeadbeefu);
     std::vector<std::uint32_t> userData(8, 0u);
     const auto in = BufferDescriptor(input, Threads);
-    const auto out = BufferDescriptor(Output, Threads);
+    const auto out = BufferDescriptor(output, Threads);
     std::copy(in.begin(), in.end(), userData.begin());
     std::copy(out.begin(), out.end(), userData.begin() + 4);
     const std::span<const std::uint32_t> code(CopyCode.data(), 7);
@@ -50,8 +51,9 @@ void Copy(AgcDriver::VulkanDevice& device, const std::uint32_t* input) {
     device.WaitIdle();
 }
 
-void Check(const std::uint32_t* input, const std::string& what) {
-    for (std::uint32_t tid = 0; tid < Threads; ++tid) Require(Output[tid] == input[tid], what + ": thread " + std::to_string(tid) + " stored " + std::to_string(Output[tid]) + ", expected " + std::to_string(input[tid]));
+void Check(const std::uint32_t* input, const std::string& what, const std::uint32_t* output = nullptr) {
+    if (output == nullptr) output = Output;
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) Require(output[tid] == input[tid], what + ": thread " + std::to_string(tid) + " stored " + std::to_string(output[tid]) + ", expected " + std::to_string(input[tid]));
 }
 
 }
@@ -79,6 +81,13 @@ int main() {
             Check(offset, "an input moved to an unaligned offset");
             Copy(*device, first);
             Check(first, "the first input again");
+            auto* movedOutput = block + 13312;
+            Copy(*device, aligned, movedOutput);
+            Check(aligned, "an output moved to an aligned offset", movedOutput);
+            Check(first, "the template's output after a moved output");
+            auto* unalignedOutput = block + 14337;
+            Copy(*device, offset, unalignedOutput);
+            Check(offset, "an output moved to an unaligned offset", unalignedOutput);
         } catch (const std::exception& error) {
             std::cerr << error.what() << '\n';
             failures = 1;
