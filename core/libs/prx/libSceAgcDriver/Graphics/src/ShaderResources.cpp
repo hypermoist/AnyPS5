@@ -731,6 +731,7 @@ struct CachedStorageTexture {
     std::uint32_t mip;
     std::shared_ptr<StorageTexture> texture;
     std::uint64_t accounted = 0;
+    std::uint64_t usedFrame = 0;
 };
 
 // As TextureCache: use order with a hash index by key, plus one by image for StorageImageCached.
@@ -775,6 +776,18 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 std::array<std::atomic<std::uint64_t>, 4> storageEvictions{};
+std::atomic<std::uint64_t> storageFrame{1};
+
+std::list<CachedStorageTexture>::iterator storageVictim(StorageTextureCache& cache) {
+    static const bool lru = std::getenv("APS5_STORAGE_LRU") != nullptr;
+    const auto frame = storageFrame.load(std::memory_order_relaxed);
+    if (!lru) {
+        for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
+            if (it->usedFrame != frame) return it;
+        }
+    }
+    return std::prev(cache.entries.end());
+}
 
 void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it, std::size_t reason = 0) {
     storageEvictions[reason].fetch_add(1, std::memory_order_relaxed);
@@ -867,6 +880,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     }
     if (it != cache.entries.end()) {
         it->texture->Refresh(writeOnly && mip == 0);
+        it->usedFrame = storageFrame.load(std::memory_order_relaxed);
         cache.entries.splice(cache.entries.begin(), cache.entries, it);
         counters.storageHits.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
@@ -885,8 +899,9 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
     if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
     entry.accounted = heldBytes(*entry.texture);
+    entry.usedFrame = storageFrame.load(std::memory_order_relaxed);
     const auto budget = storageBudget(context);
-    while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evictStorage(cache, std::prev(cache.entries.end()), 3);
+    while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evictStorage(cache, storageVictim(cache), 3);
     cache.bytes += entry.accounted;
     auto texture = entry.texture;
     cache.entries.push_front(std::move(entry));
@@ -898,6 +913,10 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     return texture;
 }
 
+}
+
+void NoteStorageCacheFrame() {
+    storageFrame.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory) {

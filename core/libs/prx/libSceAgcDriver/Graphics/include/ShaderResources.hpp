@@ -35,6 +35,7 @@ struct TextureCacheUse {
     std::uint64_t storageBytes = 0;
 };
 TextureCacheUse TextureCacheUsage();
+void NoteStorageCacheFrame();
 std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);

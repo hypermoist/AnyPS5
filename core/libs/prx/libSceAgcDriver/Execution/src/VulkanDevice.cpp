@@ -2215,6 +2215,7 @@ FrameDumps& Dumps() {
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
+    Graphics::NoteStorageCacheFrame();
     static const bool sweep = std::getenv("APS5_NO_TEMPLATE_SWEEP") == nullptr;
     static auto lastSweep = std::chrono::steady_clock::now();
     if (sweep && state->recorder && std::chrono::steady_clock::now() - lastSweep > std::chrono::seconds(1)) {
