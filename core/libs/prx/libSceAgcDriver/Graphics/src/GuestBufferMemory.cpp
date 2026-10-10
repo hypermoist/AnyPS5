@@ -520,12 +520,19 @@ std::shared_ptr<const GuestAllocations::Range> leasedRangeOwner(const GuestAlloc
 
 bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
     const auto current = leasedRangeOwner(lease, entry.base);
-    return current != nullptr && !entry.range.owner_before(current) && !current.owner_before(entry.range);
+    if (current == nullptr || entry.range.owner_before(current) || current.owner_before(entry.range)) return false;
+    auto end = entry.base + current->bytes;
+    for (const auto& next : entry.continuations) {
+        const auto following = leasedRangeOwner(lease, end);
+        if (following == nullptr || next.owner_before(following) || following.owner_before(next)) return false;
+        end += following->bytes;
+    }
+    return end == entry.base + entry.bytes;
 }
 
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Lease& lease) {
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
-        if (found->second.bytes == bytes && sameRange(found->second, lease)) return &found->second;
+        if (found->second.bytes >= bytes && sameRange(found->second, lease)) return &found->second;
         retireImport(context.device, state, found, lease);
     }
     const auto alignment = context.hostImportAlignment;
@@ -553,6 +560,13 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
     entry.range = leasedRangeOwner(lease, base);
+    if (entry.range == nullptr) return nullptr;
+    for (auto end = base + entry.range->bytes; end < base + bytes;) {
+        const auto following = leasedRangeOwner(lease, end);
+        if (following == nullptr) return nullptr;
+        entry.continuations.push_back(following);
+        end += following->bytes;
+    }
 #ifdef _WIN32
     // Drivers pin imported pages, so every page must be committed and accessible.
     bool writable = true;
@@ -655,6 +669,20 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
     return range->readable && begin >= range->address && end <= range->address + range->bytes ? range.get() : nullptr;
 }
 
+std::pair<std::uint64_t, std::uint64_t> containingRun(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    auto found = std::upper_bound(lease.begin(), lease.end(), begin, [](std::uint64_t value, const auto& range) { return value < range->address; });
+    if (found == lease.begin()) return {0, 0};
+    --found;
+    if (!(*found)->readable || begin >= (*found)->address + (*found)->bytes) return {0, 0};
+    const auto base = (*found)->address;
+    auto covered = base + (*found)->bytes;
+    while (covered < end) {
+        if (++found == lease.end() || (*found)->address != covered || !(*found)->readable) return {0, 0};
+        covered += (*found)->bytes;
+    }
+    return {base, covered - base};
+}
+
 // Drops imports whose registered range changed or disappeared: their pages may no longer back the
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
@@ -683,7 +711,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     state.refreshedGeneration = generation;
     for (auto it = state.imports.begin(); it != state.imports.end();) {
         const auto* range = leasedRangeAt(lease, it->first);
-        if (range != nullptr && range->bytes == it->second.bytes && sameRange(it->second, lease)) {
+        if (range != nullptr && sameRange(it->second, lease)) {
             if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
@@ -1678,7 +1706,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    if (const auto* range = containingRange(lease, address, address + bytes)) return importAllocation(context, state, range->address, range->bytes, lease);
+    if (const auto [base, span] = containingRun(lease, address, address + bytes); span != 0) return importAllocation(context, state, base, span, lease);
     return nullptr;
 }
 
@@ -2540,7 +2568,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
-                if (const auto* range = containingRange(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, range->address, range->bytes, importRanges());
+                if (const auto [base, span] = containingRun(importRanges(), region.begin, region.end); span != 0) entry = importAllocation(context, state, base, span, importRanges());
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
