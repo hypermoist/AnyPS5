@@ -106,6 +106,7 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
+    bool fromImport = false;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -601,6 +602,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         keys.reset();
     }
     if (!keys.has_value()) keys = scanKeys();
+    static const bool importedSnapshots = std::getenv("APS5_NO_IMPORTED_SNAPSHOTS") == nullptr;
+    const bool importRead = importedSnapshots && source == nullptr && !clearThroughKeys && !depthCompare && *keys == DccKeys::Uncompressed && HostImportCovers(context, address, bytes);
     if (disabled) {
         if (source != nullptr) return std::make_shared<Texture>(context, source, resource, components);
         std::vector<std::byte> snapshot(bytes);
@@ -625,6 +628,15 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
+        } else if (it->fromImport) {
+            if (source == nullptr && importRead && GuestMemory::UnchangedSince(address, bytes, it->generation)) {
+                it->generation = generation;
+                touchTexture(cache, it);
+                logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
+                reportTextureCounters();
+                if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
+                return it->texture;
+            }
         } else if (source == nullptr && it->bytes.size() == guestBytes && it->keys == *keys) {
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
@@ -646,13 +658,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
+    const HostImport* import = source == nullptr && importRead ? HostImportFor(context, address, bytes) : nullptr;
+    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr || import != nullptr ? 0u : bytes), nullptr, *keys, generation};
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
         entry.texture = std::make_shared<Texture>(context, source, resource, components);
         entry.accounted = source->Cached() ? 0u : heldBytes(*source);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
+    } else if (import != nullptr) {
+        entry.fromImport = true;
+        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, std::span<const std::byte>{}, depthCompare, import);
+        entry.accounted = entry.texture->AllocationBytes();
+        counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         if (*keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
