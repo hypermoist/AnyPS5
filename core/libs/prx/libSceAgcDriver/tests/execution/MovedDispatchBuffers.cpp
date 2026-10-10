@@ -65,7 +65,7 @@ int main() {
         auto* block = static_cast<std::uint32_t*>(::operator new(BlockBytes, std::align_val_t{BlockBytes}));
         for (std::size_t index = 0; index < BlockBytes / 4; ++index) block[index] = static_cast<std::uint32_t>(index * 2654435761u);
         auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
-        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, BlockBytes, true, true);
+        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, BlockBytes, true, true, true);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
         Output = block + 12288;
         int failures = 0;

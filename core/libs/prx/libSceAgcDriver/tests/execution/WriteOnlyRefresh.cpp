@@ -68,7 +68,7 @@ public:
         block = reinterpret_cast<std::uint8_t*>((reinterpret_cast<std::uintptr_t>(raw) + BlockBytes - 1) & ~(BlockBytes - 1));
         GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
 #endif
-        GuestAllocations::Mutation().Add(block, BlockBytes, true, true);
+        GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
     }
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);

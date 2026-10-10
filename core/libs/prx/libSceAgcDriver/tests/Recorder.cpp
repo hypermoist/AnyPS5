@@ -1137,7 +1137,7 @@ void largeDrawInputTests(const Device& device) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
+        mutation.Add(block, bytes, true, true, true);
     }
     if (HostImportFor(context, address, bytes) == nullptr) {
         std::cout << "host import of the large input block refused: large draw inputs not tested\n";
