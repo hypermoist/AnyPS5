@@ -22,6 +22,7 @@ public:
 private:
     explicit PadInput(Pad::InputConfiguration configuration);
     void publish(std::uint64_t frame);
+    static double autoCrossPeriod();
     void setMouseMode(bool enabled);
     void openFirstAvailableController();
     void openController(int deviceIndex);
