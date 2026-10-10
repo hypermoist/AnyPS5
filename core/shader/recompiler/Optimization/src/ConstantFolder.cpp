@@ -296,8 +296,19 @@ void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
         return isImmediate(offset, IrType::U32) && isImmediate(count, IrType::U32) && count.ImmediateU32() != 0u &&
                packedField(offset.ImmediateU32(), count.ImmediateU32()).has_value();
     };
+    const auto extractsChosenField = [&](const IrUse& use) {
+        const IrValue& user = *use.user;
+        if ((user.Opcode() != IrOpcode::BitFieldUExtract && user.Opcode() != IrOpcode::BitFieldSExtract) || use.operand != 0u) {
+            return false;
+        }
+        return !isImmediate(resolveArg(user, 1), IrType::U32) || !isImmediate(resolveArg(user, 2), IrType::U32);
+    };
     const bool whole = std::ranges::all_of(readers, extractsField);
-    if (!whole) {
+    if (!whole && std::ranges::any_of(readers, extractsChosenField) && std::ranges::all_of(readers, [&](const IrUse& use) { return extractsField(use) || extractsChosenField(use); })) {
+        forwarded = uses;
+        direct.clear();
+        helperOnly.clear();
+    } else if (!whole) {
         std::vector<IrUse> extracts;
         const auto collectExtracts = [&](const auto& self, IrValue& value) -> void {
             for (const IrUse& use : value.OperandUses()) {
