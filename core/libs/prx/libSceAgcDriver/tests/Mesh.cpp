@@ -93,6 +93,7 @@ constexpr std::uint32_t FanRim = 8;
 constexpr float FanStep = 6.28318530718f / FanRim;
 alignas(256) std::array<Vertex, FanRim + 1> Fan{};
 alignas(256) std::array<Vertex, FanRim + 1> FanScrambled{};
+alignas(256) std::array<Vertex, FanRim + 4> FanPadded{};
 alignas(256) std::array<std::uint16_t, FanRim + 1> FanIndices{};
 alignas(256) std::array<std::uint16_t, FanRim + 1> FanRestart{};
 alignas(256) std::array<Vertex, 4 * Columns> Quads{};
@@ -410,6 +411,14 @@ int main() {
         ClearPixels();
         DrawMesh(device, {fan, fanDraw, VertexBufferDescriptor(FanScrambled.data(), static_cast<std::uint32_t>(FanScrambled.size()))});
         CheckFan("indirect indexed triangle fan");
+        std::copy(Fan.begin(), Fan.end(), FanPadded.begin() + 3);
+        const std::array<std::uint32_t, 4> paddedWords{static_cast<std::uint32_t>(Fan.size()), 1u, 3u, 0u};
+        std::copy(paddedWords.begin(), paddedWords.end(), record);
+        AgcDriver::Pm4::DrawParameters paddedDraw{0, static_cast<std::uint32_t>(Fan.size()), 0, 1, 0, false};
+        paddedDraw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(record), 0x24u, 16u, 16u, 1u, false, 0u, 0x280u, 0x280u, 0x280u, false, 0u};
+        ClearPixels();
+        DrawMesh(device, {fan, paddedDraw, VertexBufferDescriptor(FanPadded.data(), static_cast<std::uint32_t>(FanPadded.size()))});
+        CheckFan("indirect non-indexed triangle fan from vertex 3");
 
         std::puts("Mesh tests passed");
         return 0;
