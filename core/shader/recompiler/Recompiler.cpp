@@ -211,6 +211,10 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
 
         if (maskedSelectEliminator.Eliminate(program).removedSelects != 0u) {
             deadCodeEliminator.Eliminate(program);
+            constantFolder.Fold(program);
+            ResolveControlFlowIdentities(program);
+            deadCodeEliminator.RemoveIdentities(program);
+            deadCodeEliminator.Eliminate(program);
         }
     };
     simplify();
