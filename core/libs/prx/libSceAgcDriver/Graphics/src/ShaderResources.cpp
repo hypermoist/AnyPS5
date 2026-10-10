@@ -889,6 +889,11 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     // Results other images hold over this memory reach it before the new image reads it: a hit's
     // Refresh flushes them, the constructor's upload does not, and a GPU-direct upload reads the
     // import buffer without the flush hook. The flush is recorded ahead of the upload in the batch.
+    static const bool traceKeys = std::getenv("APS5_TRACE_STORAGE_KEYS") != nullptr;
+    if (traceKeys) {
+        const auto& words = key.words;
+        std::fprintf(stderr, "[storage-key] miss %08x %08x %08x %08x %08x %08x %08x %08x dcc=0x%llx\n", words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], static_cast<unsigned long long>(resource.dccAddress));
+    }
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip)};
