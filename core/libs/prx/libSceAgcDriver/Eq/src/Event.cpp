@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <mutex>
 #include <stdexcept>
@@ -31,6 +33,12 @@ void AgcDriverDeliverEopInterrupt(std::uint32_t queue) {
         std::lock_guard lock(g_mutex);
         registrations = g_registrations;
     }
+    static const bool trace = std::getenv("APS5_TRACE_EOP") != nullptr;
+    if (trace) {
+        std::size_t matched = 0;
+        for (const auto& registration : registrations) matched += registration.id == static_cast<int>(queue);
+        std::fprintf(stderr, "[eop] interrupt queue 0x%x: %zu of %zu registrations matched\n", queue, matched, registrations.size());
+    }
     for (const auto& registration : registrations) {
         if (registration.id == static_cast<int>(queue)) {
             EqueueTriggerEvent_nid_postfix(registration.eq, static_cast<uintptr_t>(registration.id), EvfiltGraphicsCore, nullptr);
@@ -41,6 +49,8 @@ void AgcDriverDeliverEopInterrupt(std::uint32_t queue) {
 extern "C" {
 
 int APS5_VABI sceAgcDriverAddEqEvent(KernelEqueue eq, int id, void* udata) {
+    static const bool trace = std::getenv("APS5_TRACE_EOP") != nullptr;
+    if (trace) std::fprintf(stderr, "[eop] sceAgcDriverAddEqEvent eq %p id %d\n", reinterpret_cast<void*>(eq), id);
     if (eq == 0 || !EqueuePin_nid_postfix(eq)) {
         throw std::runtime_error(std::string(__func__) + ": invalid event queue");
     }
