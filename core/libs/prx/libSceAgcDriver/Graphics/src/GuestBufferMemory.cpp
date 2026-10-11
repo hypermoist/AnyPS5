@@ -548,13 +548,17 @@ std::size_t leasedIndexContaining(const GuestAllocations::Lease& lease, std::uin
     return range.readable && address < range.address + range.bytes ? index : lease.size();
 }
 
-ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address) {
+// The ranges from the one containing `address` up to `end`, joined while they continue a run: an
+// import spans only what a request needs. Whole runs reached ranges a title had just registered
+// piece by piece (a heap growing 1 MiB at a time), so each piece retired and re-pinned the run, and
+// pinning a piece not yet backed failed inside the NVIDIA driver (PPSA08427).
+ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address, std::uint64_t end) {
     const auto index = leasedIndexContaining(lease, address);
     if (index == lease.size()) return {};
-    auto first = index;
-    while (first > 0 && continuesRun(*lease[first - 1], *lease[first])) --first;
+    const auto first = index;
     auto last = index;
-    while (last + 1 < lease.size() && continuesRun(*lease[last], *lease[last + 1])) ++last;
+    while (lease[last]->address + lease[last]->bytes < end && last + 1 < lease.size() && continuesRun(*lease[last], *lease[last + 1])) ++last;
+    if (lease[last]->address + lease[last]->bytes < end) return {};
     if (first != last && Imports().unaliasedSpans.contains(lease[first]->address)) return {lease[index]->address, lease[index]->bytes, {lease[index]}};
     ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
     run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(first), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
@@ -562,7 +566,7 @@ ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address)
 }
 
 bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
-    const auto run = importRun(lease, begin);
+    const auto run = importRun(lease, begin, end);
     return !run.ranges.empty() && end <= run.base + run.bytes;
 }
 
@@ -575,17 +579,20 @@ bool sameRun(const HostImport& entry, const ImportRun& run) {
 }
 
 bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
-    return sameRun(entry, importRun(lease, entry.base));
+    return sameRun(entry, importRun(lease, entry.base, entry.base + entry.bytes));
 }
 
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 bool importsStale(const Context& context, const HostImports& state);
 
-const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease) {
+const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, std::uint64_t end, const GuestAllocations::Lease& lease) {
+    // A request inside an import grows that import from its base instead of starting one beside it.
+    auto start = address;
     if (!importsStale(context, state)) {
-        if (const auto* current = findImport(state, address, address + 1)) return current;
+        if (const auto* current = findImport(state, address, end)) return current;
+        if (const auto* inside = findImport(state, address, address + 1); inside != nullptr && sameRange(*inside, lease)) start = inside->base;
     }
-    auto run = importRun(lease, address);
+    auto run = importRun(lease, start, std::max(end, address + 1));
     if (run.ranges.empty()) return nullptr;
     const auto base = run.base;
     const auto bytes = run.bytes;
@@ -658,7 +665,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         } catch (const std::runtime_error&) {
             if (entry.ranges.size() == 1) throw;
             state.unaliasedSpans.insert(base);
-            return importAllocation(context, state, address, lease);
+            return importAllocation(context, state, address, end, lease);
         }
     }
 #else
@@ -1912,7 +1919,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
     if (!runCovers(lease, address, address + bytes)) return nullptr;
-    const auto* entry = importAllocation(context, state, address, lease);
+    const auto* entry = importAllocation(context, state, address, address + bytes, lease);
     return entry != nullptr && findImport(state, address, address + bytes) == entry ? entry : nullptr;
 }
 
@@ -1935,7 +1942,7 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
         const auto range = mapped.lock();
         if (range == nullptr || leasedRangeOwner(current, range->address) != range) continue;
         try {
-            if (importAllocation(context, state, range->address, current) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(importRun(current, range->address).base);
+            if (importAllocation(context, state, range->address, range->address + range->bytes, current) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(range->address);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] import of GPU memory mapped at 0x%llx+0x%zx failed: %s\n", static_cast<unsigned long long>(range->address), range->bytes, error.what());
         }
@@ -2094,7 +2101,7 @@ void GuestBufferMemory::AcquireRegistered() {
             if (importable) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
-                entry = importAllocation(context, state, range->address, lease);
+                entry = importAllocation(context, state, range->address, range->address + range->bytes, lease);
             }
             lap(timing.importsUs, at);
             if (entry != nullptr) {
@@ -2894,7 +2901,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             region.direct = nullptr;
             if (entry == nullptr) entry = findImport(state, region.begin, region.end);
             if (entry == nullptr) {
-                if (runCovers(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, region.begin, importRanges());
+                if (runCovers(importRanges(), region.begin, region.end)) entry = importAllocation(context, state, region.begin, region.end, importRanges());
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
