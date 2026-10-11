@@ -714,6 +714,19 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
     if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    static const bool trace = std::getenv("APS5_TRACE_KEY_WRITERS") != nullptr;
+    static int traced = 0;
+    if (trace && traced < 40) {
+        ++traced;
+        std::string writes;
+        for (const auto& write : recorder->PendingWritesOver(metaAddress, count)) {
+            char text[96];
+            std::snprintf(text, sizeof(text), " [0x%llx,+0x%llx) note %llu value %d", static_cast<unsigned long long>(write.begin), static_cast<unsigned long long>(write.end - write.begin), static_cast<unsigned long long>(write.note), write.value);
+            writes += text;
+        }
+        const auto info = recorder->DescribePendingWrite(metaAddress, count);
+        std::fprintf(stderr, "[key-writers] image 0x%llx keys 0x%llx+0x%zx: open %d signaled %d batches %zu; writes:%s\n", static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(metaAddress), count, info ? info->open : -1, info ? info->signaled : -1, info ? info->batchesToFinish : 0, writes.c_str());
+    }
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
     return std::nullopt;
