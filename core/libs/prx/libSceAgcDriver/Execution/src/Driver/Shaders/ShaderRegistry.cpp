@@ -110,6 +110,12 @@ void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std:
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
 }
 
+bool CommittedAbi(const ShaderSnapshot& snapshot, std::span<const std::uint64_t> key) {
+    std::unique_lock lock(snapshot.prepared->mutex);
+    AwaitRegisteredPreparation(*snapshot.prepared, lock);
+    return std::ranges::any_of(snapshot.prepared->registeredAbis, [&](const auto& abi) { return std::ranges::equal(abi, key); });
+}
+
 }
 
 struct ShaderPreparationTransaction::State {
@@ -128,6 +134,12 @@ struct ShaderPreparationTransaction::State {
 
     void Lock() {
         if (!lock.owns_lock()) lock.lock();
+    }
+
+    bool Unlock() {
+        if (!changes.empty()) return false;
+        if (lock.owns_lock()) lock.unlock();
+        return true;
     }
 };
 
@@ -149,6 +161,11 @@ ShaderPreparationTransaction::ShaderPreparationTransaction(std::defer_lock_t) {
 void ShaderPreparationTransaction::Lock() {
     require(!committed, "shader preparation transaction is already committed");
     root->Lock();
+}
+
+bool ShaderPreparationTransaction::Unlock() {
+    require(!committed, "shader preparation transaction is already committed");
+    return root->Unlock();
 }
 
 ShaderPreparationTransaction::~ShaderPreparationTransaction() {
@@ -828,12 +845,15 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     struct RegisteredAbiKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, RegisteredAbiKeyStorage>();
     BuildRegisteredAbiKey(state, *localDevice, key);
+    // Recompiling under the preparation lock stalls every other thread creating shaders; Commit merges entries and ABIs published meanwhile.
+    const bool early = transaction.Unlock() && !CommittedAbi(*snapshot, key);
+    auto entries = early ? PrepareRegistered(*snapshot, *localDevice, state, false) : std::vector<PreparedShaders::Entry>{};
     const auto& registeredAbis = transaction.Read(*snapshot).registeredAbis;
     if (std::ranges::find(registeredAbis, key) != registeredAbis.end()) {
         transaction.Commit();
         return;
     }
-    auto entries = PrepareRegistered(*snapshot, *localDevice, state, false);
+    if (!early) entries = PrepareRegistered(*snapshot, *localDevice, state, false);
     auto& prepared = transaction.Edit(*snapshot);
     for (auto& entry : entries) {
         const auto duplicate = std::ranges::any_of(prepared.entries, [&](const auto& existing) { return existing.handle->artifact == entry.handle->artifact; });
@@ -1065,7 +1085,7 @@ void Driver::RegisterShader(const Shader* shader) {
 }
 
 extern "C" AgcDriver::DriverDetail::ShaderPreparationTransaction* AgcDriverBeginShaderPreparation_nid_postfix() {
-    return new AgcDriver::DriverDetail::ShaderPreparationTransaction();
+    return new AgcDriver::DriverDetail::ShaderPreparationTransaction(std::defer_lock);
 }
 
 extern "C" void AgcDriverCommitShaderPreparation_nid_postfix(AgcDriver::DriverDetail::ShaderPreparationTransaction* transaction) {
