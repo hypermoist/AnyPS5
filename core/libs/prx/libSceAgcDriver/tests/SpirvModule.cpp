@@ -220,6 +220,9 @@ void testStructExtractsAreNotShuffled() {
             if ((specialized[cursor] & 0xffffu) == spv::OpVectorShuffle) shuffled = true;
         }
         check(shuffled == vectorSource, vectorSource ? "extracts of one vector were not folded into a shuffle" : "extracts of a struct were folded into a vector shuffle");
+    }
+}
+
 void testLoopContinuePatchingAndEmissionRanges() {
     SpirvModule module;
     check(!module.FunctionHasTerminationSince(0u), "an empty emission range contains a termination");
