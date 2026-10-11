@@ -39,8 +39,10 @@ void AgcDriverDeliverEopInterrupt(std::uint32_t queue) {
         for (const auto& registration : registrations) matched += registration.id == static_cast<int>(queue);
         std::fprintf(stderr, "[eop] interrupt queue 0x%x: %zu of %zu registrations matched\n", queue, matched, registrations.size());
     }
+    const auto compute = [](int id) { return id >= 0x20 && id < 0x58; };
+    const bool exact = std::any_of(registrations.begin(), registrations.end(), [&](const Registration& registration) { return registration.id == static_cast<int>(queue); });
     for (const auto& registration : registrations) {
-        if (registration.id == static_cast<int>(queue)) {
+        if (registration.id == static_cast<int>(queue) || (!exact && compute(static_cast<int>(queue)) && compute(registration.id))) {
             EqueueTriggerEvent_nid_postfix(registration.eq, static_cast<uintptr_t>(registration.id), EvfiltGraphicsCore, nullptr);
         }
     }
