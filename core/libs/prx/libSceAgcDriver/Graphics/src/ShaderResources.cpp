@@ -453,6 +453,7 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
         }
     }
     try {
+        const StorageUploadSite site("sampled");
         return cachedStorageTexture(context, {}, resource, 0, guestBytes);
     } catch (const std::exception& error) {
         counters.storageFallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -2220,6 +2221,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         if (image == nullptr || !image->Cached()) return OwnRefreshFallback::Uncached;
         if (i >= storageKeys.size() || !StorageImageServesKeys(*image, storageKeys[i])) return OwnRefreshFallback::Keys;
         countOwnRefresh(true);
+        const StorageUploadSite site(i < storageWriteOnly.size() && storageWriteOnly[i] ? "reval-w" : "reval-rw");
         image->Refresh(i < storageWriteOnly.size() && storageWriteOnly[i]);
         return OwnRefreshFallback::Count;
     };
@@ -3309,7 +3311,10 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         const bool writeOnly = written && element < binding.imageRead.size() && !binding.imageRead[element] && !sameAsPrevious;
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
-        else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, writeOnly));
+        else {
+            const StorageUploadSite site(writeOnly ? "storage-w" : "storage-rw");
+            storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, writeOnly));
+        }
         storageMips.push_back(mip);
         storageKeys.push_back(resource.dccAddress);
         storageFirstLayer.push_back(firstLayer);

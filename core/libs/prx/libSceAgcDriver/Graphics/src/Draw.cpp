@@ -171,6 +171,7 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
         return;
     }
     storeClearTexels(context, color, texel);
+    const StorageUploadSite site("clear");
     resident.Refresh();
 }
 
@@ -1882,6 +1883,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
             binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+                const StorageUploadSite site("target");
                 auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
@@ -2471,6 +2473,7 @@ namespace {
 
 std::shared_ptr<StorageTexture> metadataPassResident(const Context& context, const ColorTarget& color) {
     if (color.tileMode == ColorTileMode::Linear || context.detiler == nullptr) return nullptr;
+    const StorageUploadSite site("target");
     const auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
     return resident != nullptr && resident->GuestBytes() == color.bytes ? resident : nullptr;
 }

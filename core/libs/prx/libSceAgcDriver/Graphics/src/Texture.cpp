@@ -72,6 +72,7 @@ thread_local const char* flushReason = nullptr;
 // (units taken from an alias image on the device); set by the constructor and Refresh around
 // upload() and borrowUnits().
 thread_local const char* uploadReason = "first";
+thread_local const char* uploadSite = "other";
 // Block-unit traffic, per 10 s like the rest of the [storage] line: partial uploads and write-backs
 // (count and bytes), write-backs that stored nothing (every selected block CPU-written), partial
 // selections widened to every pending unit (the hysteresis in writeBack), units dropped as dead
@@ -142,7 +143,7 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
     std::lock_guard lock(traffic.mutex);
     ++traffic.uploads[path].first;
     traffic.uploads[path].second += bytes;
-    auto& reason = traffic.uploadReasons[uploadReason != nullptr ? uploadReason : "other"];
+    auto& reason = traffic.uploadReasons[std::string(uploadReason != nullptr ? uploadReason : "other") + "@" + uploadSite];
     ++reason.first;
     reason.second += bytes;
     reportStorageTraffic(traffic);
@@ -1516,6 +1517,9 @@ LookupOutcomes& ThreadLookupOutcomes() {
     thread_local LookupOutcomes outcomes;
     return outcomes;
 }
+
+StorageUploadSite::StorageUploadSite(const char* site) : previous(uploadSite) { uploadSite = site; }
+StorageUploadSite::~StorageUploadSite() { uploadSite = previous; }
 
 bool StorageTexture::writeOnlyRefresh() {
     static const bool disabled = std::getenv("APS5_NO_WRITE_ONLY_REFRESH") != nullptr;

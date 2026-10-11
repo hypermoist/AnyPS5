@@ -586,6 +586,15 @@ private:
 // (VulkanDevice's [indirect] line resets and reads it around stage B). The sampled rows are per
 // element (a fast miss is followed by a full lookup); the refresh, upload, DCC scan and pending
 // flush rows lie inside the storage and sampled rows.
+// Debug aid (APS5_PROFILE_DRAW): the [storage] upload reasons are split by the lookup that refreshed the image.
+struct StorageUploadSite {
+    explicit StorageUploadSite(const char* site);
+    ~StorageUploadSite();
+    StorageUploadSite(const StorageUploadSite&) = delete;
+    StorageUploadSite& operator=(const StorageUploadSite&) = delete;
+    const char* previous;
+};
+
 struct LookupOutcomes {
     enum Kind : std::size_t { SampledFast, SampledFastMiss, SampledHitView, SampledHitClearedView, SampledHitSnapshot, SampledMadeView, SampledMadeSnapshot, StorageHit, StorageMade, RefreshUnchanged, RefreshCompared, RefreshProved, UploadDirect, UploadCpu, UploadClear, DccScan, PendingFlush, Count };
     static const char* Name(Kind kind);
