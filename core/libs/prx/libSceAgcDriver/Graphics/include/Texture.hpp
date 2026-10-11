@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstddef>
 #include <map>
+#include <cstdlib>
 #include <memory>
 #include <span>
 #include <tuple>
@@ -455,7 +456,30 @@ private:
     std::uint64_t guestBytes = 0;
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
-    std::vector<std::byte> original;
+    // Zeroed by calloc rather than by resize: a fresh large block comes from the kernel already
+    // zero, while resize memset the whole surface (tens of MiB for a new render target), about
+    // half the graphics queue thread at the intro.
+    template <typename T>
+    struct ZeroedAllocator {
+        using value_type = T;
+        ZeroedAllocator() = default;
+        template <typename U>
+        ZeroedAllocator(const ZeroedAllocator<U>&) noexcept {}
+        T* allocate(std::size_t count) {
+            if (auto* pointer = static_cast<T*>(std::calloc(count, sizeof(T)))) return pointer;
+            throw std::bad_alloc();
+        }
+        void deallocate(T* pointer, std::size_t) noexcept { std::free(pointer); }
+        template <typename U>
+        void construct(U* pointer) noexcept {}
+        template <typename U, typename... Args>
+        void construct(U* pointer, Args&&... args) {
+            ::new (static_cast<void*>(pointer)) U(std::forward<Args>(args)...);
+        }
+        template <typename U>
+        bool operator==(const ZeroedAllocator<U>&) const noexcept { return true; }
+    };
+    std::vector<std::byte, ZeroedAllocator<std::byte>> original;
     mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
     std::vector<std::byte> generationBaseline;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
