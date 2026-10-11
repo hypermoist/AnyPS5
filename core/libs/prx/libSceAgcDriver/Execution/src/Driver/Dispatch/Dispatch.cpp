@@ -331,7 +331,19 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 words += text;
             }
         }
-        std::fprintf(stderr, "[dispatch-io] shader 0x%llx%s\n", static_cast<unsigned long long>(address), words.c_str());
+        std::string buffers;
+        for (const auto& binding : compiled.bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            for (std::size_t element = 0; element + 4 <= binding.guestDescriptor.size(); element += 4) {
+                const auto& v = binding.guestDescriptor;
+                const std::uint64_t base = v[element] | (static_cast<std::uint64_t>(v[element + 1] & 0xffffu) << 32u);
+                const std::uint32_t stride = (v[element + 1] >> 16u) & 0x3fffu;
+                char text[96];
+                std::snprintf(text, sizeof(text), " buf[0x%llx records %u stride %u%s]", static_cast<unsigned long long>(base), v[element + 2], stride, binding.bufferWritten.size() > element / 4 && binding.bufferWritten[element / 4] ? " w" : "");
+                buffers += text;
+            }
+        }
+        std::fprintf(stderr, "[dispatch-io] shader 0x%llx groups %u %u %u%s%s%s\n", static_cast<unsigned long long>(address), groups[0], groups[1], groups[2], indirectArguments != 0 ? " indirect" : "", buffers.c_str(), words.c_str());
     }
 
     const auto rethrow = [&](const std::exception& error) {
