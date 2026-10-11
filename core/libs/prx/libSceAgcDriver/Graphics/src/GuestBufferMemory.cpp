@@ -196,8 +196,10 @@ struct RetiredImport {
 };
 
 // Drops an import. Recorded batches (dispatches, recorded draws, GPU label writes) may still read it,
-// so the objects live until the batch open now completed; with no batches in flight all GPU work that
-// used it was synchronous and it is destroyed at once.
+// so the objects live until the batch open now completed. An idle recorder keeps it too: a draw or
+// dispatch being built may hold its buffer from an earlier lookup (a later lookup's run grew over the
+// import) and records into the batch that opens for it. Without a recorder all GPU work that used it
+// was synchronous and it is destroyed at once.
 const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
@@ -207,7 +209,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end); });
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, it->second);
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->Keep(std::move(holder));
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
     state.imports.erase(it);
