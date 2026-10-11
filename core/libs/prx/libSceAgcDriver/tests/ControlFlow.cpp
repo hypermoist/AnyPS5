@@ -1,3 +1,4 @@
+#include <chrono>
 #include "ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "ControlFlow/Structurizer.hpp"
@@ -267,6 +268,19 @@ void verifyRequest(const char* path) {
     const auto request = RequestSerializer{}.Deserialize(text.str());
     const auto result = verifyGraph(path, request.request.shader.code);
     std::printf("%s: structured with %zu added blocks, %zu cloned instructions, %zu route variables\n", path, result.addedBlocks, result.clonedInstructions, result.routeVariables);
+    if (std::getenv("APS5_REQ_RECOMPILE") != nullptr) {
+        auto copy = request.request;
+        copy.useCache = false;
+        const auto started = std::chrono::steady_clock::now();
+        const auto compiled = Recompile(copy);
+        if (const char* out = std::getenv("APS5_REQ_SPV")) {
+            if (std::FILE* file = std::fopen(out, "wb")) {
+                std::fwrite(compiled.spirv.data(), sizeof(std::uint32_t), compiled.spirv.size(), file);
+                std::fclose(file);
+            }
+        }
+        std::printf("%s: %zu guest words, %zu SPIR-V words (%.1f per guest word), wave %u subgroup %u, %.0f ms\n", path, request.request.shader.code.size(), compiled.spirv.size(), static_cast<double>(compiled.spirv.size()) / static_cast<double>(std::max<std::size_t>(request.request.shader.code.size(), 1)), request.request.context.waveSize, request.request.target.subgroupSize, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+    }
 }
 
 std::size_t recompile(const std::string& name, std::span<const std::uint32_t> code, std::uint32_t subgroupSize) {
