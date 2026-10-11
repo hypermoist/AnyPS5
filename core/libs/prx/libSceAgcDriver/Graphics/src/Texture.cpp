@@ -3682,6 +3682,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     }
     // The source image must hold the surface: a stale one uploads first (and other images'
     // results pending over its memory land first, as the transfer's flush would have them).
+    const StorageUploadSite site("copy");
     source.Refresh();
     // Results pending over the destination range from before the copy are dead inside it and land
     // first around it; other images over the range hold content the copy supersedes (they

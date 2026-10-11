@@ -1795,6 +1795,7 @@ bool AliasCopy(const Graphics::Context& context, std::uint64_t destination, std:
         resource.baseAddress = destination;
         resource.dccAddress = 0;
         try {
+            const Graphics::StorageUploadSite site("copy-dest");
             to = Graphics::CachedStorageSurface(context, resource);
         } catch (const std::exception& error) {
             static std::atomic<int> reported{0};
@@ -2284,6 +2285,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
             // miss a CPU write that landed after a worker's walk of the same range.
             GuestMemory::CollectWritesUncached(buffer.address, bytes);
             if (!GuestMemory::UnchangedSince(buffer.address, bytes, resident->Generation()) || (buffer.dccAddress != 0 && ResidentKeysMoved(*resident))) {
+                const Graphics::StorageUploadSite site("present");
                 resident->Refresh();
                 ++refreshedPresents;
             }

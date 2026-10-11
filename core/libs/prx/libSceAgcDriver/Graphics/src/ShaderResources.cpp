@@ -608,6 +608,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto generation = GuestMemory::CollectWrites(address, bytes);
     if (source != nullptr && !GuestMemory::UnchangedSince(address, bytes, source->Generation())) {
         // The CPU wrote the memory while results were pending: Refresh merges them the usual way.
+        const StorageUploadSite site("sampled-src");
         source->Refresh();
     }
     // Results stored to guest memory just now are stamped newer than `generation`; a snapshot read
@@ -643,7 +644,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
             if ((source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*it->source, resource.dccAddress)) {
-                if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) it->source->Refresh();
+                if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) {
+                    const StorageUploadSite site("sampled-hit");
+                    it->source->Refresh();
+                }
                 if (it->texture->IsDepthCopy()) it->texture->RefreshDepthCopy();
                 it->keys = *keys;
                 touchTexture(cache, it);
@@ -2202,6 +2206,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
             if (found != source) return OwnRefreshFallback::ForeignView;
             if (!GuestMemory::UnchangedSince(address, bytes, source->Generation())) {
                 countOwnRefresh(false);
+                const StorageUploadSite site("sampled-own");
                 source->Refresh();
             }
             return OwnRefreshFallback::Count;
@@ -2211,6 +2216,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         countOwnRefresh(false);
         // The cache's image of the key is this source while it is cached (an entry is replaced
         // only after its image left the cache), so the lookup would refresh and return it.
+        const StorageUploadSite site("sampled-own");
         source->Refresh();
         return OwnRefreshFallback::Count;
     };
@@ -2300,7 +2306,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         if (storageIndex >= storageTextures.size()) return false;
                         std::shared_ptr<StorageTexture> expected;
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
-                        else expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex], 0, storageIndex < storageWriteOnly.size() && storageWriteOnly[storageIndex]);
+                        else {
+                            const StorageUploadSite site("reval-walk");
+                            expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex], 0, storageIndex < storageWriteOnly.size() && storageWriteOnly[storageIndex]);
+                        }
                         if (expected != storageTextures[storageIndex]) return false;
                         ++storageIndex;
                     }
