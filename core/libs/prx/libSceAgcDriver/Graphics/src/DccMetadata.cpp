@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -729,6 +730,19 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     }
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
+    if (trace) {
+        static std::array<std::uint64_t, 8> outcomes{};
+        static auto last = std::chrono::steady_clock::now();
+        ++outcomes[static_cast<std::size_t>(CurrentDccKeys(metaAddress, guestBytes, count))];
+        if (std::chrono::steady_clock::now() - last > std::chrono::seconds(10)) {
+            last = std::chrono::steady_clock::now();
+            std::string text;
+            for (std::size_t k = 0; k < outcomes.size(); ++k) {
+                if (outcomes[k] != 0) text += std::string(" ") + DccKeysName(static_cast<DccKeys>(k)) + "=" + std::to_string(outcomes[k]);
+            }
+            std::fprintf(stderr, "[key-writers] keys after the wait (cumulative):%s\n", text.c_str());
+        }
+    }
     return std::nullopt;
 }
 
