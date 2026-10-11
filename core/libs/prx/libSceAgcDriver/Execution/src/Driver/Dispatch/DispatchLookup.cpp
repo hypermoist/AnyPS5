@@ -1,10 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& addressHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
@@ -114,6 +115,23 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 case EntryOutcome::PendingMoved: ++counters.pendingMoved; break;
                 case EntryOutcome::ForgetMoved: ++counters.forgetMoved; break;
             }
+            if (current && dataHit && !variant->addressSlots.empty()) {
+                for (const auto& [position, value] : liveData) {
+                    const auto slot = std::find_if(variant->addressSlots.begin(), variant->addressSlots.end(), [&](const DispatchVariant::AddressSlot& entry) { return entry.position == position; });
+                    if (slot == variant->addressSlots.end()) continue;
+                    const std::uint32_t fixed = slot->slot % 4u == 0u ? 0xfu : 0xffff0000u;
+                    if (((variant->words[position] ^ value) & fixed) != 0u) {
+                        current = false;
+                        break;
+                    }
+                    addressHit = true;
+                }
+                if (!current) {
+                    dataHit = false;
+                    addressHit = false;
+                    ++counters.addressRefused;
+                }
+            }
             if (current) {
                 ++counters.variantHitsByRank[rank];
                 compiledResult = variant->compiled;
@@ -124,10 +142,18 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     regions.clear();
                     appendEntryRegions(*variant, regions, &liveWords);
                     auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant->compiled);
-                    auto& descriptor = patched->bindings[variant->flatBinding].guestDescriptor;
-                    for (std::size_t k = 0; k < variant->dataPositions.size(); ++k) {
-                        if (variant->dataSlots[k] < descriptor.size()) descriptor[variant->dataSlots[k]] = liveWords[variant->dataPositions[k]];
+                    if (variant->flatBinding < patched->bindings.size()) {
+                        auto& descriptor = patched->bindings[variant->flatBinding].guestDescriptor;
+                        for (std::size_t k = 0; k < variant->dataPositions.size(); ++k) {
+                            if (variant->dataSlots[k] < descriptor.size()) descriptor[variant->dataSlots[k]] = liveWords[variant->dataPositions[k]];
+                        }
                     }
+                    for (const auto& slot : variant->addressSlots) {
+                        if (slot.binding >= patched->bindings.size()) continue;
+                        auto& buffer = patched->bindings[slot.binding].guestDescriptor;
+                        if (slot.slot < buffer.size()) buffer[slot.slot] = liveWords[slot.position];
+                    }
+                    if (addressHit) ++counters.addressHits;
                     compiledResult = std::move(patched);
                     ++counters.dataHits;
                     counters.dataWordsRefreshed += liveData.size();

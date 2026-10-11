@@ -37,6 +37,13 @@ struct DispatchVariant {
     std::vector<std::uint32_t> dataPositions;
     std::vector<std::uint32_t> dataSlots;
     std::uint32_t flatBinding = NoFlatBinding;
+    struct AddressSlot {
+        std::uint32_t position;
+        std::uint32_t binding;
+        std::uint32_t slot;
+    };
+    std::vector<AddressSlot> addressSlots;
+    std::vector<std::uint32_t> maskPositions;
 
     std::uint32_t pushOffset = 0;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
@@ -67,7 +74,7 @@ struct EntryCounters {
     std::array<std::uint64_t, MaxDispatchVariants> variantHitsByRank{};
     std::uint64_t variantsCompared = 0, variantsInserted = 0, variantsEvicted = 0;
 
-    std::uint64_t dataHits = 0, dataWordsRefreshed = 0, dataVerified = 0, dataInserts = 0, dataPositionsInserted = 0, dataLeavesUnmapped = 0, dataLeavesMismatched = 0, dataLeavesAliased = 0;
+    std::uint64_t addressHits = 0, addressRefused = 0, addressInserts = 0, dataHits = 0, dataWordsRefreshed = 0, dataVerified = 0, dataInserts = 0, dataPositionsInserted = 0, dataLeavesUnmapped = 0, dataLeavesMismatched = 0, dataLeavesAliased = 0;
     std::array<std::uint64_t, MaxDispatchVariants> dataHitsByRank{};
     std::set<std::size_t> differingPositions;
     std::size_t differingFirstPosition = std::numeric_limits<std::size_t>::max(), differingLastPosition = 0;

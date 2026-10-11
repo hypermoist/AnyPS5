@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -38,6 +39,47 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 break;
             }
         }
+        static const bool addressHits = std::getenv("APS5_NO_ADDRESS_HITS") == nullptr;
+        const bool addressBased = std::any_of(compiledResult->bindings.begin(), compiledResult->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
+        if (addressHits && dataHits() && !stampValidate() && !addressBased) {
+            std::vector<std::pair<std::size_t, std::size_t>> runWords;
+            std::size_t offset = 0;
+            for (const auto& [begin, end] : fresh->runs) {
+                const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+                runWords.emplace_back(offset, offset + count);
+                offset += count;
+            }
+            const auto& words = fresh->words;
+            for (std::uint32_t b = 0; b < compiledResult->bindings.size(); ++b) {
+                const auto& binding = compiledResult->bindings[b];
+                if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) continue;
+                for (std::uint32_t element = 0; element < binding.count; ++element) {
+                    const auto* v = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+                    if (v[0] == 0u && (v[1] & 0xffffu) == 0u) continue;
+                    const auto base = static_cast<std::uint64_t>(v[0]) | (static_cast<std::uint64_t>(v[1] & 0xffffu) << 32u);
+                    const auto stride = (v[1] >> 16u) & 0x3fffu;
+                    const auto bytes = stride != 0u ? static_cast<std::uint64_t>(v[2]) * stride : static_cast<std::uint64_t>(v[2]);
+                    if (std::any_of(fresh->runs.begin(), fresh->runs.end(), [&](const auto& run) { return base < run.second && run.first < base + std::max<std::uint64_t>(bytes, 1u); })) continue;
+                    std::size_t found = words.size();
+                    std::size_t matches = 0;
+                    for (const auto& [first, last] : runWords) {
+                        for (std::size_t q = first; q + 4 <= last; ++q) {
+                            if (words[q] == v[0] && words[q + 1] == v[1] && words[q + 2] == v[2] && words[q + 3] == v[3]) {
+                                found = q;
+                                ++matches;
+                            }
+                        }
+                    }
+                    if (matches != 1) continue;
+                    fresh->addressSlots.push_back({static_cast<std::uint32_t>(found), b, element * 4u});
+                    fresh->addressSlots.push_back({static_cast<std::uint32_t>(found + 1), b, element * 4u + 1u});
+                }
+            }
+        }
+        fresh->maskPositions = fresh->dataPositions;
+        for (const auto& slot : fresh->addressSlots) fresh->maskPositions.push_back(slot.position);
+        std::sort(fresh->maskPositions.begin(), fresh->maskPositions.end());
+        fresh->maskPositions.erase(std::unique(fresh->maskPositions.begin(), fresh->maskPositions.end()), fresh->maskPositions.end());
         bool stable = true;
         if (stampValidate()) {
 
@@ -70,6 +112,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         if (stable) {
             ++entryCounters.inserts;
             entryCounters.runsInserted += fresh->runs.size();
+            if (!fresh->addressSlots.empty()) ++entryCounters.addressInserts;
             if (!fresh->dataPositions.empty()) {
                 ++entryCounters.dataInserts;
                 entryCounters.dataPositionsInserted += fresh->dataPositions.size();

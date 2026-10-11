@@ -160,6 +160,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     std::vector<std::uint32_t> liveWords;
     bool dataHit = false;
+    bool addressHit = false;
     bool cached = false;
     bool validated = false;
 
@@ -215,6 +216,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         liveWords = std::move(ahead.liveWords);
         capture = std::move(ahead.capture);
         dataHit = ahead.dataHit;
+        addressHit = ahead.addressHit;
         cached = ahead.cached;
         validated = ahead.validated;
         ++groupStats.adopted;
@@ -223,7 +225,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, addressHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
     if (cached) {
@@ -291,6 +293,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         parked.liveWords = liveWords;
         parked.capture = capture;
         parked.dataHit = dataHit;
+        parked.addressHit = addressHit;
         parked.cached = cached;
         parked.validated = validated;
         parked.resolvedAt = std::chrono::steady_clock::now();
@@ -344,13 +347,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     phaseTiming.Phase(PhaseSnapshots);
 
     std::shared_ptr<RecipeHit> recipeHit;
-    if (cached && keepVariant != nullptr && !stampValidate()) {
+    if (cached && keepVariant != nullptr && !stampValidate() && !addressHit) {
         recipeHit = localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
         phaseTiming.Phase(PhaseRecipePrecheck);
     }
 
     std::shared_ptr<const Recipe> builtRecipe;
-    auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+    auto* const attachTo = stampValidate() || addressHit ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
