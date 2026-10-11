@@ -3538,6 +3538,16 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if (_set == VK_NULL_HANDLE || usesBda || moved.empty()) return {};
+    // An import lookup can retire, and free at once, an import a previous lookup returned (a run
+    // that grows over it): every import is made first, and the descriptors are written only while
+    // the table keeps the identity it had when their buffers were taken.
+    for (const auto& entry : moved) {
+        if (!entry.words.empty()) continue;
+        const auto& item = allocations[entry.allocation];
+        static_cast<void>(HostImportFor(context, entry.address - item.adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment))));
+    }
+    const auto importsProof = HostImportsIdentity(context);
+    if (importsProof.device == VK_NULL_HANDLE) return {};
     auto result = std::make_shared<DrawBindings>();
     std::vector<VkDescriptorBufferInfo> infos;
     std::vector<std::size_t> selected;
@@ -3593,6 +3603,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareMovedBind
         copy.descriptorCount = binding.layout.descriptorCount;
         copies.push_back(copy);
     }
+    if (!HostImportsUnchanged(context, importsProof)) return {};
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
     update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
     std::vector<VkWriteDescriptorSet> writes;
