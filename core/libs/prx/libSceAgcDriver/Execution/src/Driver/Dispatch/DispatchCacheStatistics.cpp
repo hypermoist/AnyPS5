@@ -1,3 +1,7 @@
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -30,6 +34,21 @@ void Driver::classifyDiffering(std::uint64_t program, std::uint64_t key, const D
         const auto value = fresh.words[i];
         if (capture != nullptr && (baseWord(capture->snapshot.buffers, value) || baseWord(capture->snapshot.images, value))) ++addressWords;
         else if (capture != nullptr && std::find(capture->snapshot.flattenedSrt.begin(), capture->snapshot.flattenedSrt.end(), value) != capture->snapshot.flattenedSrt.end()) ++dataWords;
+    }
+    static const std::uint64_t traceProgram = [] { const char* value = std::getenv("APS5_TRACE_DIFFERING"); return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull; }();
+    static int traced = 0;
+    if ((traceProgram == program || traceProgram == 1) && traced < 40) {
+        ++traced;
+        std::string text;
+        for (std::size_t i = 0; i < fresh.words.size(); ++i) {
+            if (old.words[i] == fresh.words[i]) continue;
+            const auto value = fresh.words[i];
+            const char* kind = capture == nullptr ? "?" : baseWord(capture->snapshot.buffers, value) ? "buffer" : baseWord(capture->snapshot.images, value) ? "image" : std::find(capture->snapshot.flattenedSrt.begin(), capture->snapshot.flattenedSrt.end(), value) != capture->snapshot.flattenedSrt.end() ? "data" : "other";
+            char item[80];
+            std::snprintf(item, sizeof(item), " [%zu] %08x->%08x %s", i, old.words[i], value, kind);
+            text += item;
+        }
+        std::fprintf(stderr, "[differing] 0x%llx (%zu words, %zu runs):%s\n", static_cast<unsigned long long>(program), fresh.words.size(), fresh.runs.size(), text.c_str());
     }
     counters.differingWords += words;
     ++counters.differingWordBuckets[words <= 1 ? 0 : words <= 4 ? 1 : words <= 16 ? 2 : 3];
