@@ -29,13 +29,17 @@ void APS5_VABI GuestDeallocate_nid_no_patch(void*, void* memory) {
     GuestHeap::GuestHeapFree_nid_postfix(memory);
 }
 
+void* APS5_VABI GuestAllocateTexture_nid_no_patch(void*, std::uint32_t alignment, std::uint32_t size) {
+    return GuestHeap::GuestHeapAlignForGpu_nid_postfix(std::max<std::uint32_t>(alignment, 16), size);
+}
+
 AvPlayerMemAllocator WithGuestHeapFallback(AvPlayerMemAllocator memory) {
     if (!memory.allocate || !memory.deallocate) {
         memory.allocate = GuestAllocate_nid_no_patch;
         memory.deallocate = GuestDeallocate_nid_no_patch;
     }
     if (!memory.allocate_texture || !memory.deallocate_texture) {
-        memory.allocate_texture = GuestAllocate_nid_no_patch;
+        memory.allocate_texture = GuestAllocateTexture_nid_no_patch;
         memory.deallocate_texture = GuestDeallocate_nid_no_patch;
     }
     return memory;

@@ -244,6 +244,7 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
         Require(program.snapshot->prepared->entries.size() == predicted + 1, "an artifact prepared at a draw was not reused");
     }
     ShaderRegistry invalidRegistry;
+    invalidRegistry[1] = {std::make_shared<const ShaderSnapshot>(ShaderSnapshot{1, 0, 2, {}, {}})};
     DrawDecode invalid{};
     invalid.state = prepared.state;
     Reject([&] { DecodeGraphicsPrograms(invalid, queue, invalidRegistry, true, true); }, "registered");

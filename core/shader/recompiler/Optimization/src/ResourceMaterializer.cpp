@@ -91,7 +91,7 @@ RdnaImageDimension descriptorDimension(const DescriptorValue& descriptor, RdnaIm
         case ImageType::Cube:
             return RdnaImageDimension::Dim2DArray;
         case ImageType::Color2DArray:
-            return wantArray ? RdnaImageDimension::Dim2DArray : RdnaImageDimension::Dim2D;
+            return wantArray || requested == RdnaImageDimension::Dim3D ? RdnaImageDimension::Dim2DArray : RdnaImageDimension::Dim2D;
         case ImageType::Color2DMsaaArray:
             return wantArray ? RdnaImageDimension::Dim2DMsaaArray : RdnaImageDimension::Dim2DMsaa;
         case ImageType::Color2D:
@@ -632,9 +632,11 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             modes.push_back(volume);
         }
         if (image.dimension == RdnaImageDimension::Dim3D && image.flatVolumeCompatible && !storage && !depth && conversion == IrBufferFormat::Invalid && packed == IrBufferFormat::Invalid) {
-            auto plane = mode;
-            plane.dimension = RdnaImageDimension::Dim2D;
-            modes.push_back(plane);
+            for (const auto dimension : {RdnaImageDimension::Dim2D, RdnaImageDimension::Dim2DArray}) {
+                auto plane = mode;
+                plane.dimension = dimension;
+                modes.push_back(plane);
+            }
         }
         if (image.dimension == RdnaImageDimension::Dim2D && storage && image.written && !image.read && !image.atomic && image.mipMode != ImageMipMode::DynamicStorage && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u) {
             auto line = mode;
@@ -744,7 +746,19 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
         }
     }
     if (modes.empty()) throw std::runtime_error("image instruction has no supported runtime modes");
+    if (image.foldTexelOffsetsOnly && std::ranges::any_of(modes, [](const ImageResource& mode) { return UnnormalizedSampleMismatch(mode) == nullptr; })) {
+        std::erase_if(modes, [](const ImageResource& mode) { return UnnormalizedSampleMismatch(mode) != nullptr; });
+    }
     return modes;
+}
+
+const char* ResourceMaterializer::UnnormalizedSampleMismatch(const ImageResource& image) {
+    if (image.indirectRoot != ImageResource::NoIndirectImage) return "samples an image selected at run time";
+    if (image.constantSwizzle) return nullptr;
+    if ((image.dimension != RdnaImageDimension::Dim1D && image.dimension != RdnaImageDimension::Dim2D) || image.cube) return "samples a 1D-array, 2D-array, 3D, cube or multisampled image";
+    if (image.depthCompare) return "is used with depth comparison";
+    if (image.conversionFormat != IrBufferFormat::Invalid || image.packed) return "samples an image that needs a format conversion or packed access";
+    return nullptr;
 }
 
 std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes) {
@@ -774,6 +788,7 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
     }
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         const auto& mode = modes[index];
+        if (mode.constantSwizzle) continue;
         if (((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u) != emulated) continue;
         if (decoded.fmask) {
             if (mode.packedFormat == IrBufferFormat::Fmask8_S2_F1) return index;
@@ -782,6 +797,7 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
         if (mode.numericClass == decoded.numericClass && mode.dimension == decoded.dimension && mode.conversionFormat == decoded.conversionFormat && mode.packedFormat == decoded.packedFormat && mode.cube == decoded.cube && mode.depthBits == decoded.depthBits && mode.depthUnorm16 == decoded.depthUnorm16 && mode.srgbDecode == decoded.srgbDecode) return index;
     }
     if (image.dimension == RdnaImageDimension::Dim1D && decoded.dimension != RdnaImageDimension::Dim1D) throw std::runtime_error("image address has too few coordinate components");
+    if (image.foldTexelOffsetsOnly) throw std::runtime_error("image sample with a texel offset that is not a constant takes only images an unnormalized S# can sample without VK_KHR_maintenance8 and shaderImageGatherExtended");
     const auto describe = [](IrTextureNumericClass numeric, RdnaImageDimension dimension, IrBufferFormat conversion, IrBufferFormat packed, bool cube, bool depthBits, bool depthUnorm16, bool srgb) {
         return "{class " + std::to_string(static_cast<int>(numeric)) + ", dim " + std::to_string(static_cast<int>(dimension)) + ", conversion " + std::to_string(static_cast<int>(conversion)) + ", packed " + std::to_string(static_cast<int>(packed)) + ", cube " + std::to_string(cube) + ", depthBits " + std::to_string(depthBits) + ", unorm16 " + std::to_string(depthUnorm16) + ", srgb " + std::to_string(srgb) + "}";
     };
@@ -805,12 +821,17 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
             for (const auto* inst : block->Instructions()) {
                 if (inst->Opcode() != IrOpcode::ImageSampleRaw) continue;
                 const auto& memory = resources.memoryInfo.at(inst->Flags<MemoryFlags>().index);
-                if ((memory.imageSampleFlags & (RdnaImageSampleFlagCompare | RdnaImageSampleFlagOffset)) != (RdnaImageSampleFlagCompare | RdnaImageSampleFlagOffset)) continue;
+                if ((memory.imageSampleFlags & RdnaImageSampleFlagOffset) == 0u) continue;
                 const auto* address = inst->Argument(2)->Resolve();
                 const auto component = GetRdnaImageAddressComponentLayout(memory.imageSampleFlags, 0u);
                 const auto argument = component.bitOffset / 32u;
                 if (component.bitWidth == 32u && argument < address->ArgumentCount() && address->Argument(argument)->Resolve()->HasImmediate()) continue;
-                images.at(memory.resource).emulatedCompare |= EmulatedCompare::NativeOffsetUnsupported;
+                if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
+                    images.at(memory.resource).emulatedCompare |= EmulatedCompare::NativeOffsetUnsupported;
+                } else {
+                    images.at(memory.resource).foldTexelOffsetsOnly = true;
+                    resources.info.samplers.at(memory.sampler).foldTexelOffsetsOnly = true;
+                }
             }
         }
     }

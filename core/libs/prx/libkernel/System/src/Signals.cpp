@@ -1,4 +1,6 @@
+#include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/Pthread/Posix/Common.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <atomic>
 #include <chrono>
@@ -11,10 +13,12 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 extern "C" int APS5_VABI getpid_nid_postfix(void);
+extern "C" Pthread APS5_VABI scePthreadSelf(void);
 
 struct GuestSignalSet {
     std::uint32_t bits[4];
@@ -198,6 +202,13 @@ int APS5_VABI kill_nid_postfix(int pid, int guest) {
     const int self = getpid_nid_postfix();
     if (pid != self && pid != 0 && pid != -self) { *__error_nid_postfix() = 3; return -1; }
     return guest == 0 ? 0 : raise_nid_postfix(guest);
+}
+int APS5_VABI pthread_kill_nid_postfix(Pthread thread, int guest) {
+    if (guest < 0 || guest > MaxSignal) return PosixThread::GUEST_EINVAL;
+    if (thread == nullptr) return PosixThread::GUEST_ESRCH;
+    if (guest == 0) return 0;
+    if (thread != scePthreadSelf()) NotImplemented_nid_no_patch(("pthread_kill signal " + std::to_string(guest) + " to another thread").c_str());
+    return raise_nid_postfix(guest) == 0 ? 0 : *__error_nid_postfix();
 }
 int APS5_VABI sigaltstack_nid_postfix(const GuestStack* stack, GuestStack* previous) {
     GuestStack replacement = alternateStack;

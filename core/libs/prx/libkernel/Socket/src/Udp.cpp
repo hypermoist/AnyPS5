@@ -915,3 +915,50 @@ std::int64_t GuestSockets::Read(int descriptor, void* buffer, std::size_t length
 std::int64_t GuestSockets::Write(int descriptor, const void* buffer, std::size_t length) {
     return send_nid_postfix(descriptor, buffer, length, 0);
 }
+
+std::int64_t GuestSockets::Readv(int descriptor, const Iovec* iov, int iovcnt) {
+    std::size_t total = 0;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].base == nullptr && iov[i].length != 0) return Fail(14);
+        if (iov[i].length > static_cast<std::size_t>(INT_MAX) - total) return Fail(22);
+        total += iov[i].length;
+    }
+    if (total == 0) return IsOpen(descriptor) ? 0 : Fail(9);
+    std::vector<char> buffer;
+    try {
+        buffer.resize(total);
+    } catch (const std::bad_alloc&) {
+        return Fail(12);
+    }
+    const auto result = Read(descriptor, buffer.data(), total);
+    if (result < 0) return result;
+    std::size_t copied = 0;
+    for (int i = 0; i < iovcnt && copied < static_cast<std::size_t>(result); ++i) {
+        const auto amount = std::min(iov[i].length, static_cast<std::size_t>(result) - copied);
+        if (amount != 0) std::memcpy(iov[i].base, buffer.data() + copied, amount);
+        copied += amount;
+    }
+    return result;
+}
+
+std::int64_t GuestSockets::Writev(int descriptor, const Iovec* iov, int iovcnt) {
+    std::size_t total = 0;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].base == nullptr && iov[i].length != 0) return Fail(14);
+        if (iov[i].length > static_cast<std::size_t>(INT_MAX) - total) return Fail(22);
+        total += iov[i].length;
+    }
+    if (total == 0) return Write(descriptor, nullptr, 0);
+    std::vector<char> buffer;
+    try {
+        buffer.resize(total);
+    } catch (const std::bad_alloc&) {
+        return Fail(12);
+    }
+    std::size_t copied = 0;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].length != 0) std::memcpy(buffer.data() + copied, iov[i].base, iov[i].length);
+        copied += iov[i].length;
+    }
+    return Write(descriptor, buffer.data(), total);
+}

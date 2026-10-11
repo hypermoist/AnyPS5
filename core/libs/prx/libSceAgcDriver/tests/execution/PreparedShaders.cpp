@@ -388,7 +388,7 @@ void SharedCodeHeaders() {
     std::vector<std::uint32_t> commands;
     for (const auto reg : vertex.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
     for (const auto reg : vertex.context) commands.insert(commands.end(), {0xc0016900u, reg.offset, reg.value});
-    commands.insert(commands.end(), {0xc0017600u, 0x8, 0, 0xc0016900u, 0xd, 0x00100010u, 0xc0016900u, 0x1c3, 4, 0xc0017900u, 0x242, 4, 0xc0012d00u, 3, 2});
+    commands.insert(commands.end(), {0xc0017600u, 0x8, 0, 0xc0016900u, 0xd, 0x00100010u, 0xc0016900u, 0x204, 0x80000u, 0xc0016900u, 0x1c3, 4, 0xc0017900u, 0x242, 4, 0xc0012d00u, 3, 2});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     for (unsigned iteration = 0; iteration < 2; ++iteration) {
         Require(sceAgcDriverSubmitDcb(&packet) == 0, "shared-code draw submission failed");

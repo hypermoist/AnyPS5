@@ -53,6 +53,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Process.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Sandbox.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SystemConfiguration.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SoftwareVersion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Signals.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/SignalSets.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/System/src/Notification.cpp
@@ -121,6 +122,13 @@ if(BUILD_TESTING)
     configure_windows_unwind(guest_process_time_tests)
     add_test(NAME guest_process_time COMMAND guest_process_time_tests)
     add_test(NAME guest_process_time_counter COMMAND guest_process_time_tests counter)
+    add_test(NAME guest_process_time_scaled COMMAND guest_process_time_tests)
+    add_test(NAME guest_process_time_counter_scaled COMMAND guest_process_time_tests counter)
+    set_tests_properties(guest_process_time_scaled guest_process_time_counter_scaled PROPERTIES ENVIRONMENT "APS5_TIME_SCALE=0.5")
+    if(WIN32)
+        set_tests_properties(guest_process_time_scaled guest_process_time_counter_scaled PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
     if(WIN32)
         set_tests_properties(guest_process_time guest_process_time_counter PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
@@ -261,6 +269,26 @@ if(BUILD_TESTING)
     set_tests_properties(guest_kernel_is_stack PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_kernel_is_stack PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_app_info_tests ${LIBS_INCLUDE_DIR}/tests/GuestAppInfo.cpp)
+    target_include_directories(guest_app_info_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_app_info_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_app_info_tests)
+    add_test(NAME guest_app_info COMMAND guest_app_info_tests)
+    set_tests_properties(guest_app_info PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_app_info PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_kernel_stack_protect_tests ${LIBS_INCLUDE_DIR}/tests/GuestKernelStackProtect.cpp)
+    target_include_directories(guest_kernel_stack_protect_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_kernel_stack_protect_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_kernel_stack_protect_tests)
+    add_test(NAME guest_kernel_stack_protect COMMAND guest_kernel_stack_protect_tests)
+    set_tests_properties(guest_kernel_stack_protect PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_kernel_stack_protect PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_thread_self_tests ${LIBS_INCLUDE_DIR}/tests/GuestThreadSelf.cpp)
@@ -464,6 +492,15 @@ if(BUILD_TESTING)
         set_tests_properties(guest_signals PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
+    add_test_executable(guest_parent_process_tests ${LIBS_INCLUDE_DIR}/tests/GuestParentProcess.cpp)
+    target_include_directories(guest_parent_process_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_parent_process_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_parent_process_tests)
+    add_test(NAME guest_parent_process COMMAND guest_parent_process_tests)
+    if(WIN32)
+        set_tests_properties(guest_parent_process PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
     add_test_executable(guest_kill_tests ${LIBS_INCLUDE_DIR}/tests/GuestKill.cpp)
     target_include_directories(guest_kill_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_kill_tests PRIVATE libkernel libc)
@@ -665,6 +702,15 @@ if(BUILD_TESTING)
     add_test(NAME guest_system_configuration COMMAND guest_system_configuration_tests)
     if(WIN32)
         set_tests_properties(guest_system_configuration PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_software_version_tests ${LIBS_INCLUDE_DIR}/tests/GuestSoftwareVersion.cpp)
+    target_include_directories(guest_software_version_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_software_version_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_software_version_tests)
+    add_test(NAME guest_software_version COMMAND guest_software_version_tests)
+    if(WIN32)
+        set_tests_properties(guest_software_version PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_system_command_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemCommand.cpp)

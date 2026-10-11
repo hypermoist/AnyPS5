@@ -10,6 +10,8 @@ using Handler = void (APS5_VABI *)(int);
 extern "C" {
 Handler APS5_VABI signal_nid_postfix(int, Handler);
 int APS5_VABI raise_nid_postfix(int);
+int APS5_VABI pthread_kill_nid_postfix(void*, int);
+void* APS5_VABI scePthreadSelf();
 int APS5_VABI sigaction_nid_postfix(int, const void*, void*);
 int APS5_VABI sigprocmask_nid_postfix(int, const void*, void*);
 int APS5_VABI pthread_sigmask_nid_postfix(int, const void*, void*);
@@ -49,6 +51,19 @@ int main() {
     Require(_is_signal_return_nid_postfix(0) == 0);
     received = 0;
     Require(raise_nid_postfix(15) == 0 && received == 15);
+    received = 0;
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), 15) == 0 && received == 15);
+    received = 0;
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), 0) == 0 && received == 0);
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), 200) == 22);
+    Require(pthread_kill_nid_postfix(scePthreadSelf(), -1) == 22);
+    Require(pthread_kill_nid_postfix(nullptr, 15) == 3);
+    Require(pthread_kill_nid_postfix(nullptr, 128) == 3);
+    Require(pthread_kill_nid_postfix(nullptr, 129) == 22);
+    bool threw = false;
+    try { pthread_kill_nid_postfix(reinterpret_cast<void*>(std::uintptr_t{0x10}), 15); }
+    catch (const std::runtime_error&) { threw = true; }
+    Require(threw && received == 0);
     Require(signal_nid_postfix(15, ignore) != invalid);
     received = 0;
     Require(raise_nid_postfix(15) == 0 && received == 0);

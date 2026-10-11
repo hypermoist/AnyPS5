@@ -117,6 +117,21 @@ static int SceErrorFromErrno(int error) {
     return static_cast<int>(0x80020000u | static_cast<unsigned>(guest));
 }
 
+static int SceIoErrorFromErrno(int error) {
+    int guest = SceErrorFromErrno(error) & 0xffff;
+    if (error == EAGAIN) guest = 35;
+#ifdef EDEADLK
+    else if (error == EDEADLK) guest = 11;
+#endif
+#ifdef EDQUOT
+    else if (error == EDQUOT) guest = 69;
+#endif
+#ifdef EOVERFLOW
+    else if (error == EOVERFLOW) guest = 84;
+#endif
+    return static_cast<int>(0x80020000u | static_cast<unsigned>(guest));
+}
+
 extern "C" {
 
 int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
@@ -178,9 +193,7 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     if (!destination.Open()) errno = EFAULT;
     else if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<std::int64_t>(nbytes);
     auto n = destination.Open() ? NativeRead(d, buf, nbytes) : -1;
-    if (n < 0) {
-        throw std::runtime_error(std::string(__func__) + ": read failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
-    }
+    if (n < 0) return SceIoErrorFromErrno(errno);
     return static_cast<std::int64_t>(n);
 }
 
@@ -193,9 +206,7 @@ std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes
         throw std::invalid_argument(std::string(__func__) + ": buf is null");
     }
     auto n = NativeWrite(d, buf, nbytes);
-    if (n < 0) {
-        throw std::runtime_error(std::string(__func__) + ": write failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
-    }
+    if (n < 0) return SceIoErrorFromErrno(errno);
     return static_cast<std::int64_t>(n);
 }
 
@@ -204,9 +215,7 @@ std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
         throw std::invalid_argument(std::string(__func__) + ": invalid whence=" + std::to_string(whence));
     }
     std::int64_t result = NativeLseek(d, offset, whence);
-    if (result < 0) {
-        throw std::runtime_error(std::string(__func__) + ": lseek failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
-    }
+    if (result < 0) return SceIoErrorFromErrno(errno);
     return result;
 }
 

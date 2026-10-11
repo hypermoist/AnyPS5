@@ -59,6 +59,7 @@ int APS5_VABI sceKernelClearVirtualRangeName(const void*, std::uint64_t);
 int APS5_VABI sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t, std::size_t, int, std::int64_t*);
 int APS5_VABI sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
 int APS5_VABI sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
+int APS5_VABI sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*, std::size_t*);
 int APS5_VABI sceKernelCheckedReleaseDirectMemory(std::int64_t, std::size_t);
 int APS5_VABI sceKernelReserveVirtualRange(void**, std::size_t, int, std::size_t);
 int APS5_VABI sceKernelMemoryPoolReserve(void*, std::size_t, std::size_t, int, void**);
@@ -1621,10 +1622,41 @@ static void CheckVirtualQueryPartialMunmap() {
     Require(munmap_nid_postfix(memory + page * 2, page) == 0);
 }
 
+
+static void CheckAvailableDirectMemoryIsLargestFreeBlock() {
+    constexpr std::int64_t window = 0x4000000;
+    const std::int64_t top = static_cast<std::int64_t>(DIRECT_MEMORY_SIZE) - window;
+    std::int64_t first = -1;
+    std::int64_t gap = -1;
+    std::int64_t last = -1;
+    Require(sceKernelAllocateDirectMemory(top, top + window, 0x200000, 0x200000, 0, &first) == 0 && first == top);
+    Require(sceKernelAllocateDirectMemory(top, top + window, 0x400000, 0x200000, 0, &gap) == 0 && gap == top + 0x200000);
+    Require(sceKernelAllocateDirectMemory(top, top + window, 0x200000, 0x200000, 0, &last) == 0 && last == top + 0x600000);
+    Require(sceKernelReleaseDirectMemory(gap, 0x400000) == 0);
+
+    std::int64_t start = -1;
+    std::size_t size = 0;
+    Require(sceKernelAvailableDirectMemorySize(top, top + window, 0, &start, &size) == 0);
+    Require(start == top + 0x800000 && size == static_cast<std::size_t>(window - 0x800000));
+    Require(sceKernelAvailableDirectMemorySize(top, top + 0x800000, 0, &start, &size) == 0);
+    Require(start == top + 0x200000 && size == 0x400000);
+    Require(sceKernelAvailableDirectMemorySize(top, top + window, 0x1000000, &start, &size) == 0);
+    Require(start == top + 0x1000000 && size == static_cast<std::size_t>(window - 0x1000000));
+    Require(sceKernelAvailableDirectMemorySize(top, top + 0x200000, 0, &start, &size) == SCE_KERNEL_ERROR_EAGAIN);
+    Require(start == 0 && size == 0);
+    Require(sceKernelAvailableDirectMemorySize(top, top + window, 0, nullptr, &size) == SCE_KERNEL_ERROR_EINVAL);
+
+    Require(sceKernelReleaseDirectMemory(first, 0x200000) == 0);
+    Require(sceKernelReleaseDirectMemory(last, 0x200000) == 0);
+    Require(sceKernelAvailableDirectMemorySize(top, top + window, 0, &start, &size) == 0);
+    Require(start == top && size == static_cast<std::size_t>(window));
+}
+
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "1000");
 #endif
+    CheckAvailableDirectMemoryIsLargestFreeBlock();
     CheckVirtualQuerySplitFlexibleRanges();
     CheckVirtualQueryForNonReadableGuestRange();
     CheckReleaseFlexibleMemory();

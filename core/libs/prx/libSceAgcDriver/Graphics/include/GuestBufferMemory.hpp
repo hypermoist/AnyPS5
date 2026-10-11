@@ -28,7 +28,7 @@ struct HostImport {
     VkDeviceAddress address;
     void* alias = nullptr;
     std::shared_ptr<const GuestAllocations::Range> range {};
-    std::vector<std::shared_ptr<const GuestAllocations::Range>> continuations {};
+    std::vector<std::shared_ptr<const GuestAllocations::Range>> ranges {};
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
@@ -45,6 +45,7 @@ struct ImportProbe {
     std::uint32_t writtenAtImport = 0;
     std::uint32_t writtenAfterSubmit = 0;
     std::uint32_t writtenByCpu = 0;
+    std::uint32_t writtenAfterFill = 0;
 };
 
 ImportProbe ProbeImportWriteProtection(const Context& context);
@@ -251,7 +252,7 @@ public:
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
-        for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>(region.end - region.begin);
+        for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
         return bytes;
     }
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or

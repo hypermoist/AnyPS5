@@ -153,6 +153,7 @@ public:
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
+    bool UsesAddressTable() const { return usesBda; }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     // Whether a region the recorded work reads in place through a host import overlaps the range.
@@ -191,6 +192,8 @@ public:
     bool Reusable() const { return reusable; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
+    bool ChecksFaults() const { return bda != nullptr; }
+    void CheckFaults() const;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
@@ -427,7 +430,9 @@ private:
     // The cache pool the set was allocated from, freed back to it on release.
     VkDescriptorPool cachePool = VK_NULL_HANDLE;
     std::vector<Allocation> allocations;
-    std::vector<VkDescriptorBufferInfo> allocationDescriptors;
+    std::vector<VkDescriptorBufferInfo> descriptorBuffers;
+    std::vector<VkDescriptorImageInfo> descriptorImages;
+    std::vector<VkWriteDescriptorSet> descriptorWrites;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
@@ -449,6 +454,7 @@ private:
         std::array<std::uint32_t, 4> words{};
         bool compareEnable = false;
         bool unnormalized = false;
+        bool integerBorder = false;
         bool singleLevelImage = false;
         bool mipmappedImage = false;
     };

@@ -912,13 +912,13 @@ int APS5_VABI sceNetEpollCreate(const char* name, int flags) {
 }
 
 int APS5_VABI sceNetGetMemoryPoolStats(int memid, NetMemoryPoolStats* stats) {
-    if (stats == nullptr) {
-        return fail(NET_EINVAL);
-    }
     std::lock_guard lk(g_mutex);
     const auto pool = g_pools.find(memid);
     if (pool == g_pools.end()) {
         return fail(NET_EBADF);
+    }
+    if (stats == nullptr) {
+        return fail(NET_EINVAL);
     }
     *stats = {pool->second, 0, 0};
     return 0;

@@ -11,9 +11,11 @@
 #include "CompiledVariant.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstddef>
+#include <span>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -37,7 +39,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
     }
 }
 
-std::shared_ptr<const ShaderSnapshot> ReadRawComputeShader(std::uint64_t address) {
+std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
     GuestMemory::CheckRange(reinterpret_cast<const void*>(address), sizeof(std::uint32_t), 256);
     static std::mutex cacheMutex;
     static std::list<std::shared_ptr<const ShaderSnapshot>> cache;
@@ -100,7 +102,25 @@ std::shared_ptr<const ShaderSnapshot> ReadRawComputeShader(std::uint64_t address
             if (snapshot.code.size() == available) break;
         }
     }
-    throw std::runtime_error("AGC driver: raw compute program has no reachable end within mapped code or the size limit");
+    throw std::runtime_error("AGC driver: raw shader program has no reachable end within mapped code or the size limit");
+}
+
+std::shared_ptr<const ShaderSnapshot> ProgramSnapshot(const ShaderRegistry& shaders, std::uint64_t address, std::initializer_list<std::uint8_t> types) {
+    if (auto registered = RegisteredProgram(shaders, address, types)) return registered;
+    require(shaders.empty(), "graphics program does not belong to a compatible registered shader");
+    return ReadRawShader(address);
+}
+
+namespace {
+std::atomic<bool> rawGraphicsDrawn{false};
+}
+
+void NoteRawGraphicsDraw() {
+    rawGraphicsDrawn.store(true, std::memory_order_relaxed);
+}
+
+bool RawGraphicsDrawn() {
+    return rawGraphicsDrawn.load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -117,6 +137,21 @@ bool CommittedAbi(const ShaderSnapshot& snapshot, std::span<const std::uint64_t>
 }
 
 }
+
+bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
+    constexpr std::uint8_t Unknown = 0, Unused = 1, Used = 2;
+    if (codeOffset == 0) {
+        const auto cached = snapshot.workgroupUse->load(std::memory_order_acquire);
+        if (cached != Unknown) return cached == Used;
+    }
+    const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(std::span(snapshot.code).subspan(codeOffset));
+    const bool used = std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto& instruction) {
+        return instruction.family == ShaderRecompiler::RdnaInstructionFamily::DS || instruction.op == ShaderRecompiler::RdnaOpcode::SBarrier;
+    });
+    if (codeOffset == 0) snapshot.workgroupUse->store(used ? Used : Unused, std::memory_order_release);
+    return used;
+}
+
 
 struct ShaderPreparationTransaction::State {
     struct Change {
@@ -305,8 +340,12 @@ void ReportPreparedAtUse(const ShaderSnapshot& snapshot, const ShaderRecompiler:
         if (!snapshot.prepared->deferred) APS5_LOG_ERR("Shader 0x%llx stage %u has no artifact prepared at registration for the state of this draw or dispatch; preparing it at use", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<std::uint32_t>(request.shader.stage));
         return;
     }
-    if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
-    APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
+    if (request.shader.stage == ShaderRecompiler::ShaderStage::Compute) {
+        if (snapshot.type != 0) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
+        APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
+        return;
+    }
+    APS5_LOG_ERR("Graphics shader 0x%llx was not registered; preparing its artifact at first use", static_cast<unsigned long long>(snapshot.codeAddress));
 }
 
 }
@@ -350,24 +389,80 @@ ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, con
     return PreparedRectangle(front, vertexId, fragmentId);
 }
 
+namespace {
+
+std::string hexText(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+std::vector<std::uint32_t> ReadUserDataCallee(std::uint64_t address, std::uint32_t linkRegister) {
+    constexpr std::uint64_t page = 4096u;
+    constexpr std::size_t limitWords = 16384u;
+    if (address % 4u != 0u) throw std::runtime_error("its callee address " + hexText(address) + " is not dword aligned");
+    std::vector<std::uint32_t> words;
+    while (words.size() < limitWords) {
+        const auto next = address + words.size() * 4u;
+        const auto bytes = static_cast<std::size_t>(page - next % page);
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(next)), bytes)) throw std::runtime_error("its callee at " + hexText(address) + " is not readable at " + hexText(next));
+        const auto old = words.size();
+        words.resize(old + bytes / 4u);
+        GuestMemory::Read(next, std::as_writable_bytes(std::span(words).subspan(old)));
+        if (const auto length = ShaderRecompiler::UserDataCalleeLength(words, linkRegister)) {
+            words.resize(*length);
+            return words;
+        }
+    }
+    throw std::runtime_error("its callee at " + hexText(address) + " does not return within " + std::to_string(limitWords * 4u) + " bytes");
+}
+
+std::vector<std::uint32_t> LinkUserDataCallees(const ShaderRecompiler::RecompileRequest& request) {
+    if (request.shader.stage != ShaderRecompiler::ShaderStage::Compute) return {};
+    const auto code = request.shader.code;
+    if (std::none_of(code.begin(), code.end(), [](std::uint32_t word) { return (word & 0xff80ff00u) == 0xbe802100u; })) return {};
+    const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+    const ShaderRecompiler::SwappcInfo swappc{false, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size())};
+    const auto calls = ShaderRecompiler::FindUserDataCalls(program, swappc);
+    if (calls.empty()) return {};
+    std::vector<std::vector<std::uint32_t>> callees;
+    for (const auto& call : calls) {
+        const auto slot = call.userDataRegister - swappc.userDataBaseRegister;
+        const auto address = static_cast<std::uint64_t>(request.context.userData[slot]) | static_cast<std::uint64_t>(request.context.userData[slot + 1u]) << 32u;
+        try {
+            callees.push_back(ReadUserDataCallee(address, call.linkRegister));
+        } catch (const std::exception& error) {
+            throw std::runtime_error("AGC driver: compute shader " + hexText(request.shader.codeAddress) + " calls user data s[" + std::to_string(call.userDataRegister) + ":" +
+                std::to_string(call.userDataRegister + 1u) + "] at program counter " + hexText(call.programCounter) + ", but " + error.what());
+        }
+    }
+    return ShaderRecompiler::LinkUserDataCalls(program, calls, callees);
+}
+
+}
+
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
-    auto invocationRequest = request;
+    const auto linked = LinkUserDataCallees(request);
+    auto source = request;
+    if (!linked.empty()) source.shader.code = linked;
+    auto invocationRequest = source;
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
-    ShaderRecompiler::BuildPreparedShaderKey(request, key);
+    ShaderRecompiler::BuildPreparedShaderKey(source, key);
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
+        if (!linked.empty() && !std::ranges::equal(invocationRequest.shader.code, linked)) continue;
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
     }
-    ReportPreparedAtUse(snapshot, request);
-    auto handle = PrepareShaderWithDiagnostics(request);
-    invocationRequest = request;
+    ReportPreparedAtUse(snapshot, source);
+    auto handle = PrepareShaderWithDiagnostics(source);
+    invocationRequest = source;
     invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
     auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
     if (!invocation.has_value()) throw std::runtime_error("AGC driver: an artifact prepared at use does not match its invocation");
@@ -991,6 +1086,7 @@ void Driver::RegisterShader(const Shader* shader) {
     PerformanceTimer timing("Shader.Register");
     ShaderPreparationTransaction transaction(std::defer_lock);
     CheckFailure();
+    require(!RawGraphicsDrawn(), "a shader was registered after graphics programs were drawn without registration");
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader fields;
     std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));

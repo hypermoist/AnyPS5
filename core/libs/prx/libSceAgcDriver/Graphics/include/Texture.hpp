@@ -64,6 +64,17 @@ public:
     // CanCopyFrom says whether the two descriptors address the same surface compatibly.
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components);
+    struct DepthCopyTag {};
+    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag);
+    static VkFormat DepthCopyFormat(VkFormat colorFormat);
+    static bool CanDepthCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    bool IsDepthCopy() const { return depthCopy; }
+    bool RefreshDepthCopy();
+    struct DepthCopyCounts {
+        std::uint64_t textures;
+        std::uint64_t refreshes;
+    };
+    static DepthCopyCounts TakeDepthCopyCounts();
     static bool CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     ~Texture();
     Texture(const Texture&) = delete;
@@ -111,6 +122,11 @@ private:
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
+    bool depthCopy = false;
+    bool copiedOnce = false;
+    std::uint64_t copiedVersion = 0;
+    VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+    std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0, copyElementBytes = 0;
 };
 
 VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
