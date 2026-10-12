@@ -551,6 +551,10 @@ ShaderPreparationTransaction::ShaderPreparationTransaction() {
     root = State::active;
 }
 
+void ShaderPreparationTransaction::ForgiveNestedFailure() {
+    if (State::active != nullptr) State::active->failed = false;
+}
+
 ShaderPreparationTransaction::~ShaderPreparationTransaction() {
     if (!committed) root->failed = true;
     if (state != nullptr) State::active = nullptr;

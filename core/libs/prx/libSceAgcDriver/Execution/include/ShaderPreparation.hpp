@@ -19,6 +19,9 @@ public:
     bool Tracks(const ShaderSnapshot& snapshot) const;
     void Hold();
     void Commit();
+    // APS5_SKIP_FAILED_WORK (local debug aid): a skipped nested failure leaves the guest's
+    // enclosing transaction committable; a nested transaction that threw has edited nothing.
+    static void ForgiveNestedFailure();
 
 private:
     struct State;
