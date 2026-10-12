@@ -8,6 +8,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <chrono>
+#include <map>
+#include <set>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -177,33 +180,56 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     static const bool traceCache = std::getenv("APS5_TRACE_DISPATCH_CACHE") != nullptr;
     if (traceCache) {
         std::lock_guard traceLock(dispatchCacheMutex);
-        struct Last { std::vector<std::uint32_t> userData; std::map<std::uint32_t, std::uint32_t> shader; std::uint64_t key; };
+        struct Last { std::vector<std::uint32_t> userData; std::map<std::uint32_t, std::uint32_t> shader; std::uint64_t key; std::vector<std::set<std::uint32_t>> seen; };
+        struct Change { std::uint64_t count = 0; std::uint64_t recurring = 0; std::map<std::int64_t, std::uint64_t> deltas; };
         static std::map<std::uint64_t, Last> last;
-        static int reports = 0;
+        static std::map<std::pair<std::uint64_t, std::size_t>, Change> changes;
+        static std::uint64_t keyChanges = 0, shaderOnly = 0, firstSeen = 0;
+        static auto reportedAt = std::chrono::steady_clock::now();
         auto& previous = last[address];
-        if (previous.key != 0 && previous.key != key && reports < 200) {
-            std::string what;
+        if (previous.key == 0) {
+            ++firstSeen;
+        } else if (previous.key != key) {
+            ++keyChanges;
+            bool userChanged = false;
+            previous.seen.resize(userData.size());
             for (std::size_t i = 0; i < userData.size(); ++i) {
-                if (i >= previous.userData.size() || previous.userData[i] != userData[i]) {
-                    char text[48];
-                    std::snprintf(text, sizeof(text), " user[%zu] %08x->%08x", i, i < previous.userData.size() ? previous.userData[i] : 0u, userData[i]);
-                    what += text;
-                }
+                if (i < previous.userData.size() && previous.userData[i] == userData[i]) continue;
+                userChanged = true;
+                auto& change = changes[{address, i}];
+                ++change.count;
+                if (previous.seen[i].contains(userData[i])) ++change.recurring;
+                if (i < previous.userData.size()) ++change.deltas[static_cast<std::int64_t>(userData[i]) - static_cast<std::int64_t>(previous.userData[i])];
             }
-            for (const auto& [offset, value] : queue.shader) {
-                const auto old = previous.shader.find(offset);
-                if (old == previous.shader.end() || old->second != value) {
-                    char text[48];
-                    std::snprintf(text, sizeof(text), " sh[%x] %08x->%08x", offset, old == previous.shader.end() ? 0u : old->second, value);
-                    what += text;
-                }
-            }
-            ++reports;
-            std::fprintf(stderr, "[dispatch-cache] 0x%llx key changed:%s\n", static_cast<unsigned long long>(address), what.c_str());
+            if (!userChanged) ++shaderOnly;
+        }
+        previous.seen.resize(userData.size());
+        for (std::size_t i = 0; i < userData.size(); ++i) {
+            if (previous.seen[i].size() < 4096) previous.seen[i].insert(userData[i]);
         }
         previous.userData = userData;
         previous.shader = std::map<std::uint32_t, std::uint32_t>(queue.shader.begin(), queue.shader.end());
         previous.key = key;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - reportedAt >= std::chrono::seconds(10)) {
+            reportedAt = now;
+            std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, std::size_t>>> top;
+            for (const auto& [where, change] : changes) top.push_back({change.count, where});
+            std::sort(top.rbegin(), top.rend());
+            std::string text;
+            for (std::size_t n = 0; n < top.size() && n < 16; ++n) {
+                const auto& change = changes[top[n].second];
+                std::int64_t delta = 0;
+                std::uint64_t deltaCount = 0;
+                for (const auto& [value, count] : change.deltas) if (count > deltaCount) { delta = value; deltaCount = count; }
+                char item[160];
+                std::snprintf(item, sizeof(item), " 0x%llx user[%zu] x%llu (recurring %llu, deltas %zu, top %lld x%llu);", static_cast<unsigned long long>(top[n].second.first), top[n].second.second, static_cast<unsigned long long>(change.count), static_cast<unsigned long long>(change.recurring), change.deltas.size(), static_cast<long long>(delta), static_cast<unsigned long long>(deltaCount));
+                text += item;
+            }
+            std::fprintf(stderr, "[dispatch-key] (10 s) key changes %llu (shader registers only %llu), first seen %llu, programs %zu;%s\n", static_cast<unsigned long long>(keyChanges), static_cast<unsigned long long>(shaderOnly), static_cast<unsigned long long>(firstSeen), last.size(), text.c_str());
+            changes.clear();
+            keyChanges = shaderOnly = firstSeen = 0;
+        }
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
