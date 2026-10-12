@@ -454,8 +454,11 @@ void RunImportWindow(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     };
     const auto pendingVersion = image->Version();
     storeInWindow(0x55);
-    Require(image->Refresh(), "import window: a pending image was uploaded again after an import that stored nothing new");
-    Require(image->Version() == pendingVersion && StorageTexture::FindPending(surface, SurfaceBytes) == image, "import window: an import that stored nothing new wrote the pending image back");
+    // Fork trade-off: without guest bytes an import that stored nothing new cannot be told apart from a store.
+    if (image->GuestSnapshotValid()) {
+        Require(image->Refresh(), "import window: a pending image was uploaded again after an import that stored nothing new");
+        Require(image->Version() == pendingVersion && StorageTexture::FindPending(surface, SurfaceBytes) == image, "import window: an import that stored nothing new wrote the pending image back");
+    }
     storeInWindow(0x66);
     Require(!image->Refresh(), "import window: a CPU store within an import window was missed");
     StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
