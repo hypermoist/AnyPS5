@@ -3078,6 +3078,16 @@ bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const Stor
     return false;
 }
 
+bool StorageTexture::PendingUnitsOverlap(std::uint64_t address, std::size_t bytes) {
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    if (!pending.textures.MayOverlap(address, bytes)) return false;
+    for (const auto* texture : pending.textures) {
+        if (texture->overlaps(address, bytes) && texture->pendingUnitInside(address, bytes)) return true;
+    }
+    return false;
+}
+
 bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (ranges.empty()) return false;
     auto& pending = Pending();

@@ -179,6 +179,9 @@ public:
     // with a pending unit inside the range are stored (APS5_NO_FLUSH_PRETEST=1 lists every
     // overlapping pending image, as before).
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
+    // Whether a pending image holds results inside [address, address + bytes) that FlushPending
+    // would store: PendingStorageOverlaps without the images whose pending units lie elsewhere.
+    static bool PendingUnitsOverlap(std::uint64_t address, std::size_t bytes);
     static void FlushAllPending(const char* reason);
     static bool AnyPending();
     static bool StoreAtFlipRequested(const char* value);
