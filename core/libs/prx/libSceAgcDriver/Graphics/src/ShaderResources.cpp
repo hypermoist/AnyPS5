@@ -856,6 +856,27 @@ std::uint32_t AllocatedLevels(const GuestTextureResource& resource) {
     return resource.allocatedMipCount != 0 ? resource.allocatedMipCount : resource.mipCount;
 }
 
+// Array surfaces are keyed by their memory: every descriptor naming some of the layers shares one
+// image holding layers 0 through the highest last layer seen (layers are uniform slices of the
+// surface, so a shorter array is a prefix of a longer one). Separate images per layer range wrote
+// each other's results back through guest memory on every use (PPSA08427: about 10 GB per 10 s).
+struct WholeArrays {
+    std::mutex mutex;
+    std::map<std::array<std::uint32_t, 8>, std::uint32_t> lastLayers;
+};
+
+WholeArrays& ArraySurfaces() {
+    static WholeArrays arrays;
+    return arrays;
+}
+
+// Opt-in (APS5_WHOLE_ARRAY_STORAGE=1): on PPSA08427 it removes the per-range round trips but the
+// title's virtual texture pages are then re-uploaded every frame until device memory runs out.
+bool WholeArrayEnabled() {
+    static const bool enabled = std::getenv("APS5_WHOLE_ARRAY_STORAGE") != nullptr;
+    return enabled;
+}
+
 GuestTextureResource StorageSurface(const Context& context, const GuestTextureResource& viewed) {
     auto& surfaces = ExtendedChains();
     const bool extended = viewed.mipCount > AllocatedLevels(viewed);
@@ -892,13 +913,37 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto& counters = TextureCounts();
-    const auto resource = StorageSurface(context, viewed);
+    auto resource = StorageSurface(context, viewed);
+    std::optional<std::uint32_t> shorterArray;
+    if (WholeArrayEnabled() && (resource.dimension == TextureDimension::k2DArray || resource.dimension == TextureDimension::k1DArray) && DescribeSurface(resource).layerBytes % 65536 == 0) {
+        auto identity = resource;
+        identity.baseArray = 0;
+        identity.depthOrLastArray = 0;
+        auto& arrays = ArraySurfaces();
+        std::lock_guard lock(arrays.mutex);
+        auto& last = arrays.lastLayers.try_emplace(SurfaceKey(context, identity), resource.depthOrLastArray).first->second;
+        if (resource.depthOrLastArray > last) {
+            shorterArray = last;
+            last = resource.depthOrLastArray;
+        }
+        if (resource.baseArray != 0 || resource.depthOrLastArray != last) {
+            guestBytes = 0;
+            writeOnly = false;
+        }
+        resource.baseArray = 0;
+        resource.depthOrLastArray = last;
+    }
     const StorageKey key{context.device, SurfaceKey(context, resource)};
     auto& cache = StorageTextures();
     std::vector<std::shared_ptr<StorageTexture>> evicted;
     std::shared_ptr<StorageTexture> texture;
     {
         std::lock_guard lock(cache.mutex);
+        if (shorterArray) {
+            auto shorter = resource;
+            shorter.depthOrLastArray = *shorterArray;
+            if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, shorter)}); found != cache.entries.end()) evicted.push_back(evictStorage(cache, found, 1));
+        }
         if (resource.mipCount > AllocatedLevels(resource)) {
             auto allocated = resource;
             allocated.mipCount = AllocatedLevels(resource);
@@ -1599,7 +1644,7 @@ void ShaderResources::buildComplete() {
                         write.pImageInfo = images.data() + images.size();
                         for (const auto index : binding.imageAllocations) {
                             if (index == std::numeric_limits<std::size_t>::max()) images.push_back(absentImage(binding.layout.binding));
-                            else images.push_back({VK_NULL_HANDLE, storageAtomic64[index] ? storageTextures[index]->Atomic64View(storageMips[index], storageFirstLayer[index]) : storageAtomic[index] ? storageTextures[index]->AtomicView(storageMips[index], storageFirstLayer[index]) : storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index]), VK_IMAGE_LAYOUT_GENERAL});
+                            else images.push_back({VK_NULL_HANDLE, storageTextures[index]->BindingView(storageMips[index], storageFirstLayer[index], storageAtomic64[index] ? 2 : storageAtomic[index] ? 1 : 0, storageLayers[index].first, storageLayers[index].second), VK_IMAGE_LAYOUT_GENERAL});
                         }
                         Require(binding.imageAllocations.size() == binding.layout.descriptorCount, "descriptor allocations disagree with compact binding");
                         break;
@@ -2335,6 +2380,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                             expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex], 0, storageIndex < storageWriteOnly.size() && storageWriteOnly[storageIndex]);
                         }
                         if (expected != storageTextures[storageIndex]) return false;
+                        const auto layers = DecodeTextureResource(words);
+                        if (storageIndex >= storageLayers.size() || storageLayers[storageIndex] != std::pair{layers.baseArray, layers.depthOrLastArray}) return false;
                         ++storageIndex;
                     }
                 }
@@ -3384,6 +3431,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         storageMips.push_back(mip);
         storageKeys.push_back(resource.dccAddress);
         storageFirstLayer.push_back(firstLayer);
+        storageLayers.push_back({resource.baseArray, resource.depthOrLastArray});
         // Images the shader only reads have nothing to store back.
         storageWritten.push_back(written);
         storageWriteOnly.push_back(writeOnly && mip == 0);
@@ -3764,7 +3812,7 @@ void ShaderResources::WriteBack() {
     WriteBackBuffers();
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
-        if (storageWritten[index]) storageTextures[index]->MarkDirty();
+        if (storageWritten[index]) storageTextures[index]->MarkDirty(storageLayers[index].first, storageFirstLayer[index] ? storageLayers[index].first : storageLayers[index].second);
     }
 }
 
@@ -3775,7 +3823,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder, std::span<const MovedBuf
     recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
-        if (storageWritten[index]) storageTextures[index]->MarkDirty();
+        if (storageWritten[index]) storageTextures[index]->MarkDirty(storageLayers[index].first, storageFirstLayer[index] ? storageLayers[index].first : storageLayers[index].second);
     }
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),

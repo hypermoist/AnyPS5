@@ -160,6 +160,10 @@ public:
     VkImageView ElementView();
     VkImageView AtomicView(std::uint32_t mip, bool firstLayer);
     VkImageView Atomic64View(std::uint32_t mip, bool firstLayer);
+    // A storage binding's view of the array layers its descriptor addresses (baseArray through
+    // lastArray), when the image holds the whole array (cachedStorageTexture keys array surfaces by
+    // their memory, not by the layers one descriptor names); `kind` 0 storage, 1 atomic, 2 atomic64.
+    VkImageView BindingView(std::uint32_t mip, bool firstLayer, int kind, std::uint32_t baseArray, std::uint32_t lastArray);
     // Render targets live in the same images: draws attach mip 0 through a view of the color
     // buffer's format and mark the image dirty like a storage write.
     bool Attachable() const { return attachable; }
@@ -170,6 +174,9 @@ public:
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
+    // A write through a binding of layers baseArray..lastArray: only the units under those layers
+    // become pending, so a whole-array image does not store layers the work did not write.
+    void MarkDirty(std::uint32_t baseArray, std::uint32_t lastArray);
     void Flush();
     // Stores every pending image overlapping the range, except `except`; returns whether any was.
     // Stores into host-imported memory are recorded (not waited for): a CPU reader syncs afterwards.
@@ -471,6 +478,7 @@ private:
     bool keysFillMatches(std::uint64_t address, std::size_t bytes, bool overlapped) const;
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
     VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format) const;
+    VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format, std::uint32_t baseArray, std::uint32_t layerCount) const;
     bool singlePass();
     VkImageView elementLayerView(std::uint32_t level, std::uint32_t layer);
     void recordDirectUploadBarrier(VkCommandBuffer commands, bool discard);
@@ -558,6 +566,7 @@ private:
     std::map<std::uint32_t, VkImageView> firstLayerViews;
     std::map<std::pair<std::uint32_t, bool>, VkImageView> atomicViews;
     std::map<std::pair<std::uint32_t, bool>, VkImageView> uintViews;
+    std::map<std::tuple<std::uint32_t, bool, VkFormat, std::uint32_t, std::uint32_t>, VkImageView> layerViews;
     VkImageView elementView = VK_NULL_HANDLE;
     std::map<std::uint32_t, VkImageView> elementLayerViews;
     std::int8_t singlePassState = -1;

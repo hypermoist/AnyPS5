@@ -98,6 +98,7 @@ struct StorageTraffic {
     std::array<std::pair<std::uint64_t, std::uint64_t>, 4> uploads{};
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> uploadReasons;
     std::uint64_t directWriteBacks = 0;
+    std::map<std::pair<std::uint64_t, std::string>, std::pair<std::uint64_t, std::uint64_t>> byImage;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -112,7 +113,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     traffic.lastReport = now;
     static constexpr const char* uploadNames[4] = {"clear", "direct", "cpu", "alias"};
     std::string line;
-    char text[96];
+    char text[160];
     for (std::size_t i = 0; i < 4; ++i) {
         std::snprintf(text, sizeof(text), " %s %llu/%.1f", uploadNames[i], static_cast<unsigned long long>(traffic.uploads[i].first), traffic.uploads[i].second / 1048576.0);
         line += text;
@@ -135,12 +136,35 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
+    if (!traffic.byImage.empty()) {
+        std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, std::string>>> top;
+        for (const auto& [where, totals] : traffic.byImage) top.push_back({totals.second, where});
+        std::sort(top.rbegin(), top.rend());
+        std::string images;
+        for (std::size_t n = 0; n < top.size() && n < 24; ++n) {
+            std::snprintf(text, sizeof(text), " 0x%llx %s x%llu %.1f MiB;", static_cast<unsigned long long>(top[n].second.first), top[n].second.second.c_str(), static_cast<unsigned long long>(traffic.byImage[top[n].second].first), top[n].first / 1048576.0);
+            images += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[storage-images] (10 s) top traffic by image and kind:%s\n", images.c_str());
+        traffic.byImage.clear();
+    }
 }
 
-void countStorageUpload(std::size_t path, std::uint64_t bytes) {
+bool traceStorageImages() {
+    static const bool enabled = std::getenv("APS5_TRACE_STORAGE_IMAGES") != nullptr;
+    return enabled;
+}
+
+void countStorageUpload(std::size_t path, std::uint64_t bytes, std::uint64_t image) {
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
+    if (traceStorageImages()) {
+        static constexpr const char* pathNames[4] = {"clear", "direct", "cpu", "alias"};
+        auto& totals = traffic.byImage[{image, std::string("up:") + pathNames[path] + ":" + (uploadReason != nullptr ? uploadReason : "other") + "@" + uploadSite}];
+        ++totals.first;
+        totals.second += bytes;
+    }
     ++traffic.uploads[path].first;
     traffic.uploads[path].second += bytes;
     auto& reason = traffic.uploadReasons[std::string(uploadReason != nullptr ? uploadReason : "other") + "@" + uploadSite];
@@ -149,10 +173,15 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
     reportStorageTraffic(traffic);
 }
 
-void countStorageWriteBack(std::uint64_t bytes, bool direct) {
+void countStorageWriteBack(std::uint64_t bytes, bool direct, std::uint64_t image) {
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
+    if (traceStorageImages()) {
+        auto& totals = traffic.byImage[{image, std::string("wb:") + (flushReason != nullptr ? flushReason : "other")}];
+        ++totals.first;
+        totals.second += bytes;
+    }
     auto& totals = traffic.writeBacks[flushReason != nullptr ? flushReason : "other"];
     ++totals.first;
     totals.second += bytes;
@@ -646,7 +675,7 @@ bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResour
     if (IsBlockCompressed(descriptor.format) || IsBlockCompressed(from.format)) return false;
     // Same memory, same layout, same texel size: the GPU copy reinterprets the texels exactly as a
     // guest read through the sampled descriptor would.
-    return descriptor.baseAddress == from.baseAddress && descriptor.pipeBankXor == from.pipeBankXor && descriptor.width == from.width && descriptor.height == from.height && descriptor.dimension == from.dimension && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && descriptor.depthOrLastArray == from.depthOrLastArray && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
+    return descriptor.baseAddress == from.baseAddress && descriptor.pipeBankXor == from.pipeBankXor && descriptor.width == from.width && descriptor.height == from.height && descriptor.dimension == from.dimension && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && (descriptor.depthOrLastArray == from.depthOrLastArray || (std::getenv("APS5_NO_ARRAY_SAMPLED_VIEW") == nullptr && (descriptor.dimension == TextureDimension::k2DArray || descriptor.dimension == TextureDimension::k1DArray) && from.baseArray == 0 && descriptor.depthOrLastArray < from.depthOrLastArray)) && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
 }
 
 Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context), storageSource(source) {
@@ -1304,9 +1333,14 @@ bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<c
 }
 
 VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFormat format) const {
+    return createView(mip, firstLayer, format, descriptor.baseArray, geometry.imageLayers - descriptor.baseArray);
+}
+
+VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFormat format, std::uint32_t baseArray, std::uint32_t layerCount) const {
     Require(mip < descriptor.mipCount, "storage texture mip level is outside the texture");
     Require(!firstLayer || descriptor.dimension == TextureDimension::k2DArray, "a first-layer storage view needs a 2D array surface");
-    const auto viewLayerCount = firstLayer ? 1u : geometry.imageLayers - descriptor.baseArray;
+    Require(layerCount != 0 && baseArray + layerCount <= geometry.imageLayers, "storage view layers are outside the image");
+    const auto viewLayerCount = firstLayer ? 1u : layerCount;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1316,7 +1350,7 @@ VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFor
     viewInfo.viewType = firstLayer ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k1D ? VK_IMAGE_VIEW_TYPE_1D : descriptor.dimension == TextureDimension::k2D ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : descriptor.dimension == TextureDimension::k1DArray ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     viewInfo.format = format;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, descriptor.baseArray, viewLayerCount};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, baseArray, viewLayerCount};
     VkImageView created = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView storage");
     return created;
@@ -1523,6 +1557,35 @@ VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
     if (found != atomicViews.end()) return found->second;
     const auto created = createView(mip, firstLayer, VK_FORMAT_R64_UINT);
     atomicViews.emplace(std::pair{mip, firstLayer}, created);
+    return created;
+}
+
+VkImageView StorageTexture::BindingView(std::uint32_t mip, bool firstLayer, int kind, std::uint32_t baseArray, std::uint32_t lastArray) {
+    if (baseArray == descriptor.baseArray && lastArray == descriptor.depthOrLastArray) {
+        return kind == 2 ? Atomic64View(mip, firstLayer) : kind == 1 ? AtomicView(mip, firstLayer) : StorageView(mip, firstLayer);
+    }
+    Require(descriptor.dimension == TextureDimension::k2DArray || descriptor.dimension == TextureDimension::k1DArray, "a storage view of other layers needs an array surface");
+    Require(baseArray <= lastArray && lastArray <= descriptor.depthOrLastArray, "storage binding layers are outside the image");
+    VkFormat format = storageFormat;
+    if (kind == 2) {
+        if (storageFormat != VK_FORMAT_R64_UINT) {
+            Require(storageFormat == VK_FORMAT_R32G32_UINT || storageFormat == VK_FORMAT_R32G32_SINT || storageFormat == VK_FORMAT_R32G32_SFLOAT, "64-bit storage image atomics need a surface of two 32-bit components");
+            format = VK_FORMAT_R64_UINT;
+        }
+    } else if (kind == 1) {
+        if (storageFormat != VK_FORMAT_R32_UINT) {
+            Require(storageFormat == VK_FORMAT_R32_SINT || storageFormat == VK_FORMAT_R32_SFLOAT, "storage image atomics need a surface of one 32-bit component");
+            format = VK_FORMAT_R32_UINT;
+        }
+    } else if (const auto uint = UintFormatOfSint(storageFormat); uint != VK_FORMAT_UNDEFINED) {
+        Require(uint == VK_FORMAT_R32_UINT || StorageFormatOrUndefined(context, uint) == uint, "storage image of format " + std::to_string(storageFormat) + " has no storage view of its UINT format " + std::to_string(uint));
+        format = uint;
+    }
+    const auto key = std::tuple{mip, firstLayer, format, baseArray, lastArray};
+    const auto found = layerViews.find(key);
+    if (found != layerViews.end()) return found->second;
+    const auto created = createView(mip, firstLayer, format, baseArray, lastArray - baseArray + 1u);
+    layerViews.emplace(key, created);
     return created;
 }
 
@@ -2073,7 +2136,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, guestBytes);
-        countStorageUpload(0, guestBytes);
+        countStorageUpload(0, guestBytes, descriptor.baseAddress);
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
         return;
@@ -2097,7 +2160,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 runs.emplace_back(0, guestBytes);
             }
             const auto uploadedBytes = uploadWindows(*import, runs, layers == nullptr && version == 0);
-            countStorageUpload(1, uploadedBytes);
+            countStorageUpload(1, uploadedBytes, descriptor.baseAddress);
             if (layers != nullptr) {
                 partialUploads.fetch_add(1, std::memory_order_relaxed);
                 partialUploadBytes.fetch_add(uploadedBytes, std::memory_order_relaxed);
@@ -2158,7 +2221,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             singlePassMoves.fetch_add(1, std::memory_order_relaxed);
             if (batch) batch->SubmitAndWait();
             else recorder->EndGpuTiming(timing, uploadedBytes);
-            countStorageUpload(1, uploadedBytes);
+            countStorageUpload(1, uploadedBytes, descriptor.baseAddress);
             ++Profile().storageDirectUploads;
             ++version;
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
@@ -2195,7 +2258,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, uploadedBytes);
-        countStorageUpload(1, uploadedBytes);
+        countStorageUpload(1, uploadedBytes, descriptor.baseAddress);
         ++Profile().storageDirectUploads;
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
@@ -2246,7 +2309,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             batch.SubmitAndWait();
             APS5_LOG_CHARS_OUT("StorageTexture upload done");
     }
-    countStorageUpload(2, guestBytes);
+    countStorageUpload(2, guestBytes, descriptor.baseAddress);
     ++version;
     if (profile) LookupOutcomes::Add(LookupOutcomes::UploadCpu, start);
 }
@@ -2852,6 +2915,27 @@ void StorageTexture::MarkDirty() {
         uploadedKeys = DccKeys::Uncompressed;
     }
     markLayersPending(0, trackedLayers);
+}
+
+void StorageTexture::MarkDirty(std::uint32_t baseArray, std::uint32_t lastArray) {
+    if (descriptor.baseArray != 0 || (baseArray == 0 && lastArray == descriptor.depthOrLastArray) || trackedLayers == 1) {
+        MarkDirty();
+        return;
+    }
+    Require(baseArray <= lastArray && lastArray < geometry.layers, "written storage layers are outside the image");
+    if (descriptor.dccAddress != 0 && IsDccClear(uploadedKeys) && !IsDccClear(filledKeys)) {
+        traceKeyStore("first write", descriptor, guestBytes);
+        MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
+        uploadedKeys = DccKeys::Uncompressed;
+    }
+    if (!blockUnits) {
+        markLayersPending(baseArray, lastArray - baseArray + 1u);
+        return;
+    }
+    Require(geometry.layerBytes % 65536 == 0, "a layer range of a block-tracked storage image needs whole 64 KiB blocks per layer");
+    const auto first = static_cast<std::uint32_t>(baseArray * geometry.layerBytes / 65536);
+    const auto end = static_cast<std::uint32_t>(std::min<std::uint64_t>((lastArray + 1ull) * geometry.layerBytes / 65536, trackedLayers));
+    markLayersPending(first, end - first);
 }
 
 bool StorageTexture::anyLayerPending() const {
@@ -3959,7 +4043,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &copied);
     if (batch) batch->SubmitAndWait();
     else recorder->EndGpuTiming(timing, bytes);
-    countStorageUpload(3, bytes);
+    countStorageUpload(3, bytes, descriptor.baseAddress);
     if (borrowedFrom.lock() != source.weak_from_this().lock() || borrowedUnits.size() != trackedLayers) {
         borrowedUnits.assign(trackedLayers, false);
         borrowedFrom = source.weak_from_this();
@@ -4151,7 +4235,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             shadowImport = import;
             const auto storedBytes = writeBackWindows(*import, keep, firstStored, lastStored, shadowed, imported);
-            countStorageWriteBack(storedBytes, true);
+            countStorageWriteBack(storedBytes, true, descriptor.baseAddress);
             if (profile) Profile().storageGpu += timer.lap();
             originalValid = false;
             traceKeyStore("block write-back", descriptor, guestBytes);
@@ -4255,7 +4339,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
         }
-        countStorageWriteBack(storedBytes, true);
+        countStorageWriteBack(storedBytes, true, descriptor.baseAddress);
         if (profile) Profile().storageGpu += timer.lap();
         // The guest bytes now differ from `original`; other caches of the range see the write.
         originalValid = false;
@@ -4349,7 +4433,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     APS5_LOG_CHARS_OUT("StorageTexture writeback submit");
     batch.SubmitAndWait();
     APS5_LOG_CHARS_OUT("StorageTexture writeback done");
-    countStorageWriteBack(guestBytes, false);
+    countStorageWriteBack(guestBytes, false, descriptor.baseAddress);
     if (profile) Profile().storageGpu += timer.lap();
     if (dump) {
         char name[64];
@@ -4416,6 +4500,8 @@ void StorageTexture::release() noexcept {
     atomicViews.clear();
     for (const auto& [key, uint] : uintViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, uint, nullptr);
     uintViews.clear();
+    for (const auto& [key, layer] : layerViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, layer, nullptr);
+    layerViews.clear();
     if (elementView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, elementView, nullptr);
     elementView = VK_NULL_HANDLE;
     for (const auto& [key, element] : elementLayerViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, element, nullptr);
