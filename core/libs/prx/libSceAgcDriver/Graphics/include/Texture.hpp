@@ -79,6 +79,15 @@ public:
     };
     static DepthCopyCounts TakeDepthCopyCounts();
     static bool CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    // A block-compressed texture over the memory of an uncompressed storage image whose texels are
+    // its blocks (same address, tiling and bytes; the storage extent is the block extent), as a
+    // virtual-texture page cache written by compute and sampled compressed: an image of its own,
+    // refreshed by a GPU copy from the storage image after each write, never read back to memory.
+    struct BlockCopyTag {};
+    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, BlockCopyTag);
+    static bool CanBlockCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    bool IsBlockCopy() const { return blockCopy; }
+    bool RefreshBlockCopy();
     ~Texture();
     Texture(const Texture&) = delete;
     Texture& operator=(const Texture&) = delete;
@@ -134,6 +143,7 @@ private:
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
     bool depthCopy = false;
+    bool blockCopy = false;
     bool copiedOnce = false;
     std::uint64_t copiedVersion = 0;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;

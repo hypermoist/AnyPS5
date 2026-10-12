@@ -558,8 +558,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
     const bool depthCopy = depthCompare && guestBytes >= DepthCopyMinBytes() && Texture::DepthCopyFormat(ResolveTextureFormat(resource.format)) != VK_FORMAT_UNDEFINED && resource.dimension != TextureDimension::k3D;
+    static const bool blockCopies = std::getenv("APS5_NO_BLOCK_COPY") == nullptr;
+    const bool blockCopyable = blockCopies && !depthCompare && IsBlockCompressed(resource.format) && resource.dimension == TextureDimension::k2D && resource.mipCount == 1;
     auto source = StorageTexture::FindPending(address, guestBytes);
-    if (source != nullptr && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : !Texture::CanCopyFrom(*source, resource))) source.reset();
+    if (source != nullptr && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : !Texture::CanCopyFrom(*source, resource) && !(blockCopyable && Texture::CanBlockCopyFrom(*source, resource)))) source.reset();
+    if (source == nullptr && blockCopyable) {
+        if (const auto live = StorageTexture::FindLive(address, guestBytes); live != nullptr && Texture::CanBlockCopyFrom(*live, resource)) {
+            const StorageUploadSite site("block-copy");
+            source = cachedStorageTexture(context, {}, live->Descriptor(), 0);
+            if (source != nullptr && !Texture::CanBlockCopyFrom(*source, resource)) source.reset();
+        }
+    }
     if (source != nullptr && MetadataMoved(*source, resource)) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
@@ -633,6 +642,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             texture->RefreshDepthCopy();
             return texture;
         }
+        if (source != nullptr && !Texture::CanCopyFrom(*source, resource)) {
+            auto texture = std::make_shared<Texture>(context, source, resource, components, Texture::BlockCopyTag{});
+            texture->RefreshBlockCopy();
+            return texture;
+        }
         if (source != nullptr) return std::make_shared<Texture>(context, source, resource, components);
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
@@ -653,6 +667,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                     it->source->Refresh();
                 }
                 if (it->texture->IsDepthCopy()) it->texture->RefreshDepthCopy();
+                if (it->texture->IsBlockCopy()) it->texture->RefreshBlockCopy();
                 it->keys = *keys;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, 0, it->source.get()});
@@ -698,10 +713,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (depthCompare) {
             entry.texture = std::make_shared<Texture>(context, source, resource, components, Texture::DepthCopyTag{});
             entry.texture->RefreshDepthCopy();
+        } else if (!Texture::CanCopyFrom(*source, resource)) {
+            entry.texture = std::make_shared<Texture>(context, source, resource, components, Texture::BlockCopyTag{});
+            entry.texture->RefreshBlockCopy();
         } else {
             entry.texture = std::make_shared<Texture>(context, source, resource, components);
         }
-        entry.accounted = source->Cached() ? 0u : heldBytes(*source);
+        entry.accounted = (source->Cached() ? 0u : heldBytes(*source)) + (entry.texture->IsBlockCopy() ? entry.texture->AllocationBytes() : 0u);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else if (import != nullptr) {
         entry.fromImport = true;
@@ -2517,6 +2535,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+        if (texture != nullptr && texture->IsBlockCopy()) texture->RefreshBlockCopy();
     }
     return finish(fast, true);
 }

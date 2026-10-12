@@ -90,6 +90,7 @@ std::atomic<std::uint64_t> writeOnlyRefreshes{0}, writeOnlyDropped{0};
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
+std::atomic<std::uint64_t> blockCopyTextures{0}, blockCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 
 struct StorageTraffic {
@@ -663,6 +664,102 @@ bool Texture::RefreshDepthCopy() {
     copiedOnce = true;
     copiedVersion = storageSource->Version();
     depthCopyRefreshes.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool Texture::CanBlockCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor) {
+    const auto& from = source.Descriptor();
+    if (!IsBlockCompressed(descriptor.format) || IsBlockCompressed(from.format)) return false;
+    const auto blockWidth = BlockWidth(descriptor.format);
+    const auto blockHeight = BlockHeight(descriptor.format);
+    return descriptor.baseAddress == from.baseAddress && descriptor.pipeBankXor == from.pipeBankXor && descriptor.tileMode == from.tileMode && descriptor.dimension == TextureDimension::k2D && from.dimension == TextureDimension::k2D && descriptor.mipCount == 1 && from.mipCount == 1 && descriptor.baseLevel == 0 && source.ImageLayers() == 1 && (descriptor.width + blockWidth - 1u) / blockWidth == from.width && (descriptor.height + blockHeight - 1u) / blockHeight == from.height && BytesPerElement(descriptor.format) == BytesPerElement(from.format);
+}
+
+Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, BlockCopyTag) : context(context), storageSource(source), blockCopy(true) {
+    try {
+        Require(source != nullptr && CanBlockCopyFrom(*source, descriptor), "storage image cannot serve a block copy of the sampled texture");
+        const auto format = SampledTextureFormat(context, descriptor.format);
+        APS5_LOG_OUT("Texture address=0x%llx %ux%u block copy of storage image %ux%u (vk=%d -> %d)", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, source->Descriptor().width, source->Descriptor().height, static_cast<int>(source->StorageFormat()), static_cast<int>(format));
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = format;
+        imageInfo.extent = {descriptor.width, descriptor.height, 1u};
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage block copy");
+        owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
+        VkMemoryRequirements requirements{};
+        context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocationBytes = requirements.size;
+        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory block copy");
+        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory block copy");
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = format;
+        viewFormat = format;
+        viewInfo.components = components;
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
+        ChainMinLod(context, descriptor, viewInfo, minLod);
+        Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView block copy");
+        viewRange = {viewInfo.viewType, 1u, 1u};
+        blockCopyTextures.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+        release();
+        throw;
+    }
+}
+
+bool Texture::RefreshBlockCopy() {
+    if (!blockCopy || storageSource == nullptr) return false;
+    if (copiedOnce && storageSource->Version() == copiedVersion) return false;
+    auto* recorder = Recorder::Active();
+    std::unique_ptr<CommandBatch> batch;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (recorder != nullptr) {
+        commands = recorder->Commands();
+        recorder->Keep(owned);
+        recorder->Keep(storageSource);
+    } else {
+        batch = std::make_unique<CommandBatch>(context);
+        commands = batch->Handle();
+    }
+    const auto barrier = context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    const VkMemoryBarrier produced{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    VkImageMemoryBarrier toTransferDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toTransferDst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    toTransferDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toTransferDst.oldLayout = copiedOnce ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    toTransferDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransferDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferDst.image = image;
+    toTransferDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &produced, 0, nullptr, 1, &toTransferDst);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.extent = {storageSource->Descriptor().width, storageSource->Descriptor().height, 1u};
+    context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, storageSource->Image(), VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    VkImageMemoryBarrier toShaderRead = toTransferDst;
+    toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    toShaderRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
+    if (batch) batch->SubmitAndWait();
+    copiedOnce = true;
+    copiedVersion = storageSource->Version();
+    blockCopyRefreshes.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
