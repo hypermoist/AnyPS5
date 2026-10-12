@@ -98,6 +98,9 @@ private:
     Stats stats;
 };
 
+// Debug aid (APS5_PROFILE_DRAW): why the last MovedReadOnlyBuffers on this thread refused a template.
+const char* LastMoveRefusal();
+
 class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);

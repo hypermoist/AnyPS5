@@ -42,6 +42,7 @@
 #include <fstream>
 #include <cctype>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <SDL_loadso.h>
 #include <SDL_error.h>
@@ -60,6 +61,27 @@
 #include <unordered_map>
 #include <vector>
 #include <utility>
+
+namespace AgcDriver {
+namespace {
+// Debug aid (APS5_PROFILE_DRAW): dispatch resource-cache lookups by outcome, every 10 s.
+void countRescacheMiss(const char* reason) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::mutex mutex;
+    static std::map<std::string, std::uint64_t> counts;
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    ++counts[reason != nullptr ? reason : "hit"];
+    if (std::chrono::steady_clock::now() - last < std::chrono::seconds(10)) return;
+    last = std::chrono::steady_clock::now();
+    std::string line;
+    for (const auto& [name, count] : counts) line += " " + name + " " + std::to_string(count) + ";";
+    std::fprintf(stderr, "[rescache-miss] dispatch lookups (10 s):%s\n", line.c_str());
+    counts.clear();
+}
+}
+}
 
 namespace AgcDriver {
 namespace {
@@ -4041,9 +4063,11 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         static const bool preparedFind = std::getenv("APS5_NO_PREPARED_FIND") == nullptr;
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
+        if (cached == nullptr) countRescacheMiss("no entry");
         if (cached != nullptr) {
             if (cached->Revalidate(shaders[0])) {
                 std::optional<std::vector<Graphics::ShaderResources::MovedBuffer>> moved = std::vector<Graphics::ShaderResources::MovedBuffer>{};
+                bool copiedWriter = false;
                 if (MovableDispatchBuffers()) moved = cached->MovedReadOnlyBuffers(std::span<const Graphics::CompiledShader>(shaders), *state->recorder, true);
                 if (moved.has_value()) {
                     for (const auto& entry : *moved) {
@@ -4051,20 +4075,24 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(entry.address, entry.size); };
                         if (std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), overlaps) || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), overlaps)) {
                             moved.reset();
+                            copiedWriter = true;
                             break;
                         }
                     }
                 }
                 if (moved.has_value()) {
+                    countRescacheMiss(nullptr);
                     movedWrites = *moved;
                     movedBindings = cached->PrepareMovedBindings(*state->recorder, *moved);
                     resources = std::move(cached);
                     fromCache = true;
                     ++d.cacheHits;
                 } else {
+                    countRescacheMiss(copiedWriter ? "written element has a copied writer" : Graphics::LastMoveRefusal() != nullptr ? Graphics::LastMoveRefusal() : "move refused");
                     ++d.cacheMisses;
                 }
             } else {
+                countRescacheMiss("revalidation failed");
                 state->resourceCache.Remove(contentKey, cached.get());
                 ++d.cacheInvalidated;
                 // Off the mutex with its batch, as an evicted entry (insert()).
