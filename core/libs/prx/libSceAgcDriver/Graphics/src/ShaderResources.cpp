@@ -3527,7 +3527,10 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return refuseMove("inaccessible");
                 if (elementWritten || item.written) {
-                    if (!written || !elementWritten || !item.written || size != item.size || !guestMemory.BoundInPlace(item.address)) return refuseMove("written element mismatch");
+                    if (!written) return refuseMove("written element, written moves off");
+                    if (!elementWritten || !item.written) return refuseMove("written element, written flags differ");
+                    if (size != item.size) return refuseMove("written element, size changed");
+                    if (!guestMemory.BoundInPlace(item.address)) return refuseMove("written element, not bound in place");
                     const auto* import = HostImportFor(context, begin, bytes);
                     if (import == nullptr || (begin - import->base) % context.limits.minStorageBufferOffsetAlignment != 0) return refuseMove("written element not in an aligned import");
                     if (guestMemory.WritesOverlap(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return refuseMove("written element overlaps pending work");
