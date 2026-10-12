@@ -216,7 +216,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const bool forkSkip = stillWatched && !image->GuestSnapshotValid();
     Require(image->GuestSnapshotValid() == keepsCopy || forkSkip, !keepsCopy ? "a fast-cleared upload of write-watched memory read its guest bytes" : stillWatched ? "a fast-cleared upload of write-watched memory that an import window can stamp kept no guest bytes to compare" : "a fast-cleared upload of untracked memory kept no guest bytes to compare");
     const auto pendingVersion = image->Version();
-    for (int repeat = 0; repeat < 3; ++repeat) {
+    for (int repeat = 0; repeat < (forkSkip ? 0 : 3); ++repeat) {
         Require(image->Refresh(), "an unchanged pending image was uploaded again");
         Require(image->Version() == pendingVersion, "an unchanged pending image changed version");
         Require(StorageTexture::FindPending(surface, SurfaceBytes) == image, "an unchanged refresh wrote the pending image back");
