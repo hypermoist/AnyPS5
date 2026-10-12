@@ -2325,21 +2325,25 @@ void noteDissolveShape(const Regions& base, std::uint64_t begin, std::uint64_t e
     std::size_t touched = startsInside ? 1 : 0;
     std::uint64_t gaps = 0;
     std::uint64_t cursor = startsInside ? std::prev(first)->end : begin;
+    const void* import = startsInside ? static_cast<const void*>(std::prev(first)->direct) : nullptr;
+    bool oneImport = startsInside && import != nullptr;
+    bool mirrors = startsInside && std::prev(first)->mirror != nullptr;
     for (auto it = first; it != base.end() && it->begin < end; ++it) {
+        if (static_cast<const void*>(it->direct) != import) oneImport = false;
+        mirrors = mirrors || it->mirror != nullptr;
         if (it->begin > cursor) gaps += it->begin - cursor;
         cursor = std::max(cursor, it->end);
         ++touched;
     }
     if (cursor < end) gaps += end - cursor;
-    char key[160];
-    std::snprintf(key, sizeof(key), "%s %s, %s regions, %s", site, startsInside ? "starts inside" : "starts outside", touched <= 1 ? "1" : touched == 2 ? "2" : ">2", gaps == 0 ? "no gap" : gaps <= 4096 ? "gap <=4K" : gaps <= 65536 ? "gap <=64K" : "gap >64K");
+    char key[200];
+    std::snprintf(key, sizeof(key), "%s %s, %s regions, %s, %s", site, startsInside ? "starts inside" : "starts outside", touched <= 1 ? "1" : touched == 2 ? "2" : ">2", gaps == 0 ? "no gap" : gaps <= 4096 ? "gap <=4K" : gaps <= 65536 ? "gap <=64K" : "gap >64K", oneImport ? "one import" : mirrors ? "mirrors" : "several imports");
     std::lock_guard lock(mutex);
     ++shapes[key];
-    if (examples.size() < 12 && !examples.contains(key)) {
+    if (examples.size() < 12 && examples.emplace(key, 0).second) {
         const auto& near = startsInside ? *std::prev(first) : (first != base.end() ? *first : base.back());
         char example[200];
         std::snprintf(example, sizeof(example), "%s: [0x%llx, 0x%llx) vs region [0x%llx, 0x%llx)", key, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(near.begin), static_cast<unsigned long long>(near.end));
-        examples.emplace(example, 0);
         std::fprintf(stderr, "[dissolve] example %s\n", example);
     }
     const auto now = std::chrono::steady_clock::now();
