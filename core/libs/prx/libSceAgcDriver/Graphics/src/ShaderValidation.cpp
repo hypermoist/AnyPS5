@@ -44,6 +44,7 @@ struct Module {
     std::map<std::uint32_t, std::string> outputs;
     std::optional<std::string> secondSource;
     bool position = false;
+    bool clipDistance = false;
     bool primitiveIndices = false;
     bool fragmentBarycentric = false;
     std::map<std::uint32_t, std::vector<std::uint32_t>> modes;
@@ -108,6 +109,11 @@ struct Module {
         if (stage == Stage::Geometry) {
             Require(value == spv::BuiltInPosition && Signature(type) == "f32x4" && (input || !position), "unsupported geometry built-in");
             if (!input) position = true;
+            return;
+        }
+        if (value == spv::BuiltInClipDistance && !input && (vertex || stage == Stage::TessellationEvaluation)) {
+            Require(!clipDistance && Signature(type) == "f32[1]", "invalid or duplicate clip distance output");
+            clipDistance = true;
             return;
         }
         if (stage == Stage::TessellationControl || stage == Stage::TessellationEvaluation || stage == Stage::Mesh) {
@@ -244,6 +250,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                     capability == spv::CapabilityImage1D ||
                     capability == spv::CapabilityImageGatherExtended ||
                     capability == spv::CapabilityImageQuery ||
+                    ((vertex || evaluation) && clipDistance && capability == spv::CapabilityClipDistance) ||
                     (fragment && geometryShader && capability == spv::CapabilityGeometry) ||
                     (fragment && sampleRateShading && capability == spv::CapabilitySampleRateShading) ||
                     capability == spv::CapabilityImageMSArray ||

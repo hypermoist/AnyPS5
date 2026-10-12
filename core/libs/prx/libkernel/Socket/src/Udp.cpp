@@ -14,10 +14,12 @@
 #endif
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libkernel/Socket/include/SocketError.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
+#include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -110,8 +112,8 @@ struct Waker {
     }
 };
 Waker& ThreadWaker() {
-    thread_local Waker waker;
-    return waker;
+    struct WakerTag {};
+    return HostThreadLocal<Waker, WakerTag>();
 }
 std::mutex socketsMutex;
 std::map<int, std::shared_ptr<Socket>> sockets;
@@ -463,6 +465,10 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
 }
 int APS5_VABI setsockopt_nid_postfix(int descriptor, int level, int option,
                                     const void* value, std::uint32_t length) {
+    int netError = 0;
+    if (descriptor < GuestSockets::FirstDescriptor && KernelSetSocketOption_nid_no_patch(descriptor, level, option, value, length, &netError)) {
+        return netError == 0 ? 0 : Fail(netError);
+    }
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     const int nativeOption = Option(option);
@@ -711,7 +717,10 @@ std::int64_t APS5_VABI recvfrom_nid_postfix(int descriptor, void* buffer, std::u
         if (socket->type == 1) *addressLength = 0; else UnnamedAddress(address, addressLength);
         return result;
     }
-    if (address) GuestAddress(native, address, addressLength);
+    if (address) {
+        if (native.ss_family == AF_INET || native.ss_family == AF_INET6) GuestAddress(native, address, addressLength);
+        else *addressLength = 0;
+    }
     return result;
 }
 struct GuestIovec {

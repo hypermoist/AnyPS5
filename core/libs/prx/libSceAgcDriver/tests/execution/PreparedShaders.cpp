@@ -531,7 +531,7 @@ void RegisteredVertexWorkgroup(const ShaderRecompiler::SpirvTarget& target, bool
         return;
     }
     alignas(256) static constexpr std::array<std::uint32_t, 8> code{
-        0xd8340000u, 0u, 0xd7600000u, 0x00017f00u, 0x7e020200u, 0xf80008cfu, 0x04030201u, 0xbf810000u
+        0xd8340000u, 0u, 0xd7600000u, 0x00017f05u, 0x7e020200u, 0xf80008cfu, 0x04030201u, 0xbf810000u
     };
     struct Header {
         Shader shader{};

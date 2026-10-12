@@ -2140,6 +2140,45 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     Require(InPlaceDrawInput(unrecorded, vertices, 256, 4) == nullptr, "a draw without a recorder bound its input in place");
     recorder.Sync();
     Require(!recorder.PendingReadOverlaps(vertices, 256), "an in-place draw input's read outlived its batch");
+    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host imports are compared, not watched: kept highest indices not tested\n";
+        return;
+    }
+    const auto indices = address + 20480;
+    constexpr std::size_t kept = Recorder::KeptIndexRangeIndices * 2;
+    std::vector<std::uint16_t> first(Recorder::KeptIndexRangeIndices * 2, 1);
+    first[0] = 3;
+    first[1] = 9;
+    first[2] = 0xffff;
+    std::memcpy(reinterpret_cast<void*>(indices), first.data(), kept * 2);
+    auto range = InPlaceIndexRange(recorder, indices, kept, 2, false);
+    Require(!range.reused && range.highest == 0xffffu, "an in-place index range was not scanned at its first use");
+    range = InPlaceIndexRange(recorder, indices, kept, 2, false);
+    Require(range.reused && range.highest == 0xffffu, "an unchanged in-place index range was scanned again");
+    range = InPlaceIndexRange(recorder, indices, kept, 2, true);
+    Require(!range.reused && range.highest == 9u, "an in-place index range served a scan made under the other restart rule");
+    Require(!InPlaceIndexRange(recorder, indices, kept + 2, 2, true).reused, "an in-place index range served a scan of another size");
+    const std::uint16_t raised = 12;
+    std::memcpy(reinterpret_cast<void*>(indices + 2), &raised, sizeof(raised));
+    range = InPlaceIndexRange(recorder, indices, kept, 2, true);
+    Require(!range.reused && range.highest == 12u, "an in-place index range kept its highest index over a guest write");
+    range = InPlaceIndexRange(recorder, indices, kept, 2, true);
+    Require(range.reused && range.highest == 12u, "a rescanned in-place index range was not kept");
+    range = InPlaceIndexRange(recorder, indices, kept - 2, 2, true);
+    Require(!range.reused && range.highest == 12u, "an in-place index range below the kept size was not scanned");
+    range = InPlaceIndexRange(recorder, indices, kept - 2, 2, true);
+    Require(!range.reused && range.highest == 12u, "an in-place index range below the kept size was kept");
+    range = InPlaceIndexRange(recorder, indices, kept * 2 - 4, 4, false);
+    Require(!range.reused && range.highest == 0x000c0003u, "a 32-bit in-place index range below the kept size was not scanned");
+    Require(!InPlaceIndexRange(recorder, indices, kept * 2 - 4, 4, false).reused, "a 32-bit in-place index range below the kept size was kept");
+    Require(!InPlaceIndexRange(recorder, indices, kept * 2, 4, false).reused, "a 32-bit in-place index range was not scanned at its first use");
+    range = InPlaceIndexRange(recorder, indices, kept * 2, 4, false);
+    Require(range.reused && range.highest == 0x000c0003u, "an unchanged 32-bit in-place index range was scanned again");
+    const std::vector<std::uint16_t> restarts(Recorder::KeptIndexRangeIndices, 0xffff);
+    std::memcpy(reinterpret_cast<void*>(indices + 20480), restarts.data(), kept);
+    Require(!InPlaceIndexRange(recorder, indices + 20480, kept, 2, true).highest.has_value(), "an index range of restart indices has a highest index");
+    range = InPlaceIndexRange(recorder, indices + 20480, kept, 2, true);
+    Require(range.reused && !range.highest.has_value(), "an empty in-place index range was scanned again");
 }
 
 // Unit shadows (UnitShadow.hpp) over a host import of write-watched arena memory: a retile piece's
@@ -5351,6 +5390,37 @@ void pipelineLibraryTests(const Device& device) {
     state.samples = 1;
     state.colors.front().samples = 1;
     Require(lookup() != multisampled && counters().built == std::array<std::uint64_t, 4>{2, 2, 4, 4}, "the 1x pipeline after a 4x one built its libraries again");
+    if ((context.sampleLocationSampleCounts & VK_SAMPLE_COUNT_4_BIT) != 0) {
+        state.samples = 4;
+        state.colors.front().samples = 4;
+        state.customSampleLocations = true;
+        state.sampleLocations = {0x10, 0x21, 0x32, 0x43};
+        const auto pattern = lookup();
+        const auto beforePatternChange = counters().built;
+        state.sampleLocations[0] = 0x20;
+        const auto otherPattern = lookup();
+        Require(otherPattern != pattern && counters().built[2] == beforePatternChange[2] + 1u && counters().built[3] == beforePatternChange[3] + 1u && counters().built[0] == beforePatternChange[0] && counters().built[1] == beforePatternChange[1], "a custom sample pattern did not rebuild exactly the fragment shader and fragment output libraries");
+        state.sampleLocations[0] = 0x10;
+        Require(lookup() == pattern && counters().built[2] == beforePatternChange[2] + 1u && counters().built[3] == beforePatternChange[3] + 1u, "a cached custom sample pattern was not reused");
+
+        std::optional<VkFormat> compatibleDepth, incompatibleDepth;
+        state.customSampleLocations = false;
+        for (const auto format : {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
+            state.depth = DepthTarget{};
+            state.depth->format = format;
+            state.depth->samples = state.samples;
+            (ValidateSampleLocations(context, state) ? compatibleDepth : incompatibleDepth) = format;
+        }
+        if (compatibleDepth && incompatibleDepth) {
+            state.depth->format = *compatibleDepth;
+            const auto compatible = lookup();
+            const auto beforeDepthChange = counters().built;
+            state.depth->format = *incompatibleDepth;
+            const auto incompatible = lookup();
+            Require(incompatible != compatible && counters().built[2] == beforeDepthChange[2] + 1u && counters().built[3] == beforeDepthChange[3] + 1u, "depth-format sample-location enablement did not rebuild both fragment libraries");
+        }
+        state.customSampleLocations = true;
+    }
     WaitForOptimizedPipelines(context.device);
     const auto lto = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr && context.pipelineLinkTimeOptimization;
     Require(counters().optimized == (lto ? counters().linked : 0u), "a linked pipeline was not optimized in the background");
@@ -5431,6 +5501,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--cmask-only") {
             cmaskPassTests(device, recorder);
             std::cout << "CMASK copied clear, write-back and failure tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-inputs-in-place-only") {
+            drawInputInPlaceTests(device, recorder);
+            std::cout << "In-place draw input tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--multisample-only") {

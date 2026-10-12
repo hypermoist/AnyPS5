@@ -1,6 +1,7 @@
 #include <relinker/guest/GuestImage.hpp>
 #include <elfpatcher/general/GuestModuleWriter.hpp>
 #include <codegen/IAmd64OnlyConverter.hpp>
+#include <domain/ImportModule.hpp>
 #include <io/FileReader.hpp>
 #include <io/NativePath.hpp>
 #include <io/BufferUtils.hpp>
@@ -102,6 +103,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 continue;
             }
             if (!entry.is_regular_file()) continue;
+            if (std::filesystem::equivalent(entry.path(), inputPath)) continue;
             if (isElf(entry.path())) paths.push_back(entry.path());
         }
     }
@@ -119,9 +121,8 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     Io::FileReader reader;
     std::map<std::filesystem::path, GuestImage> discovered;
     const auto matchesIdentity = [](const std::string& name, const std::vector<std::string>& identities) {
-        return std::any_of(identities.begin(), identities.end(), [&](const auto& identity) {
-            return name == identity || name == identity + ".prx" || name == identity + ".sprx" || name == identity + ".suprx";
-        });
+        const auto stem = std::string_view(name).substr(0, name.size() - Domain::ModuleSuffix(name).size());
+        return std::any_of(identities.begin(), identities.end(), [&](const auto& identity) { return name == identity || stem == identity; });
     };
     for (const auto& path : paths) discovered.emplace(path, GuestImageReader().Read(path, reader.Read(Io::Utf8Path(path)), windows));
     if (!unmatchedExclusions.empty()) throw Domain::RelinkerException("Excluded guest module file not found: " + *unmatchedExclusions.begin());
@@ -288,6 +289,10 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     const auto deferred = [&](const std::size_t index) {
         return !required[index] && std::find(runtimeDirectories.begin(), runtimeDirectories.end(), images[index].SourcePath.parent_path().lexically_normal()) != runtimeDirectories.end();
     };
+    const auto appDirectory = [&](const GuestImage& image) {
+        const auto directory = image.SourcePath.parent_path().lexically_relative(root).generic_string();
+        return directory == "." ? std::string("app0") : "app0/" + directory;
+    };
     if (!windows) {
         for (auto& image : images) {
             for (std::size_t index = 1; index < image.Symbols.size(); ++index) {
@@ -324,7 +329,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         Io::AppendU64(dynamic.DynamicSegmentData, dynamic.DynStrData.size());
         Io::AppendString(dynamic.DynStrData, name);
     };
-    for (const auto index : order) if (!windows && !deferred(index)) addNeeded("$ORIGIN/app0/" + images[index].SourcePath.parent_path().lexically_relative(root).generic_string() + "/" + images[index].OutputName);
+    for (const auto index : order) if (!windows && !deferred(index)) addNeeded("$ORIGIN/" + appDirectory(images[index]) + "/" + images[index].OutputName);
     for (const auto& name : hostLibraries) addNeeded(name);
     if (!windows && runPath != "$ORIGIN" && !runPath.starts_with("$ORIGIN/") && !std::filesystem::path(runPath).is_absolute()) throw Domain::RelinkerException("Guest Linux run path must be absolute or begin with $ORIGIN");
     const auto outputDirectory = std::filesystem::absolute(outputPath).parent_path().lexically_normal();
@@ -350,7 +355,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 image.Bytes[header.Offset + offset + 1] = 0x0B;
             }
         }
-        const auto relativeDirectory = "app0/" + image.SourcePath.parent_path().lexically_relative(root).generic_string();
+        const auto relativeDirectory = appDirectory(image);
         const auto destination = outputDirectory / relativeDirectory;
         const auto target = destination / image.OutputName;
         if (target.lexically_normal() == std::filesystem::absolute(outputPath).lexically_normal()) throw Domain::RelinkerException("Guest output collides with the executable output");

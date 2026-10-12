@@ -328,7 +328,12 @@ std::uint32_t decodeSamples(const Registers& cx) {
     }
     Require(log2 <= 3u, "more than eight samples are unsupported");
     Require(((config >> 20u) & 7u) == log2, "exposing fewer samples than are rasterized is unsupported");
-    const auto samples = 1u << log2;
+    return 1u << log2;
+}
+
+void decodeSampleLocations(const Registers& cx, State& state) {
+    const auto samples = state.samples;
+    if (samples == 1) return;
     const std::span<const std::array<std::int8_t, 2>> standard = samples == 2 ? std::span<const std::array<std::int8_t, 2>>(StandardLocations2) : samples == 4 ? std::span<const std::array<std::int8_t, 2>>(StandardLocations4) : std::span<const std::array<std::int8_t, 2>>(StandardLocations8);
     for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
         for (std::uint32_t sample = 0; sample < samples; ++sample) {
@@ -336,10 +341,14 @@ std::uint32_t decodeSamples(const Registers& cx) {
             const auto bits = (word >> (8u * (sample % 4u))) & 0xffu;
             const auto x = static_cast<std::int8_t>(static_cast<std::uint8_t>(bits << 4u)) >> 4;
             const auto y = static_cast<std::int8_t>(static_cast<std::uint8_t>(bits & 0xf0u)) >> 4;
-            Require(x == standard[sample][0] && y == standard[sample][1], "nonstandard sample locations are unsupported");
+            if (pixel == 0) {
+                state.sampleLocations[sample] = static_cast<std::uint8_t>(bits);
+                state.customSampleLocations |= x != standard[sample][0] || y != standard[sample][1];
+            } else {
+                Require(bits == state.sampleLocations[sample], "nonstandard sample locations varying between pixels are unsupported");
+            }
         }
     }
-    return samples;
 }
 
 bool colorControlSupported(std::uint32_t colorControl, bool hasColorTarget) {
@@ -520,6 +529,23 @@ void intersect(VkRect2D& result, const Registers& registers, std::uint32_t offse
 
 }
 
+std::array<VkSampleLocationEXT, 8> SampleLocations(const State& state) {
+    Require(state.samples == 1 || state.samples == 2 || state.samples == 4 || state.samples == 8, "invalid sample count");
+    std::array<VkSampleLocationEXT, 8> locations{};
+    for (std::uint32_t sample = 0; sample < state.samples; ++sample) {
+        std::array<int, 2> position{};
+        if (state.customSampleLocations) {
+            const auto bits = state.sampleLocations[sample];
+            position = {static_cast<int>(bits & 7u) - static_cast<int>(bits & 8u), static_cast<int>((bits >> 4u) & 7u) - static_cast<int>((bits >> 4u) & 8u)};
+        } else if (state.samples != 1) {
+            const auto& standard = state.samples == 2 ? StandardLocations2[sample] : state.samples == 4 ? StandardLocations4[sample] : StandardLocations8[sample];
+            position = {standard[0], standard[1]};
+        }
+        locations[sample] = {0.5f + position[0] / 16.0f, 0.5f + position[1] / 16.0f};
+    }
+    return locations;
+}
+
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
     const auto value = read(queue.context, 0x2d5);
     const auto validate = [&](bool condition, const char* reason) {
@@ -577,7 +603,22 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
     return result;
 }
 
+bool DepthResummarizeDrawsNothing(const QueueState& queue) {
+    const auto& cx = queue.context;
+    const auto control = find(cx, 0x000);
+    const auto depthControl = find(cx, 0x200);
+    const auto zInfo = find(cx, 0x010);
+    const auto stencilInfo = find(cx, 0x011);
+    const auto targetMask = find(cx, 0x8e);
+    const auto shaderMask = find(cx, 0x8f);
+    if (control == cx.end() || control->second != 0x10u || depthControl == cx.end() || zInfo == cx.end() || stencilInfo == cx.end() || targetMask == cx.end() || shaderMask == cx.end()) return false;
+    const auto depth = depthControl->second;
+    const auto format = zInfo->second & 3u;
+    return (depth & 2u) != 0 && (depth & 0xc000000cu) == 0 && depthPassThrough(depth) && (format == 1u || format == 3u) && (stencilInfo->second & 1u) == 0 && ColorWriteMask(cx) == 0 && PixelProgramSkipped(queue);
+}
+
 std::string DepthMaintenanceRejection(const QueueState& queue) {
+    if (DepthResummarizeDrawsNothing(queue)) return {};
     const auto control = find(queue.context, 0x000);
     if (control == queue.context.end() || (control->second & ~0x2063u) == 0) return {};
     const auto depthControl = find(queue.context, 0x200);
@@ -622,6 +663,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     Require(std::popcount(read(cx, 0x207) & 0xffffu) <= 8, "more than eight clip and cull distances are unsupported");
     result.paClVsOutCntl = read(cx, 0x207);
     result.samples = decodeSamples(cx);
+    decodeSampleLocations(cx, result);
     {
         const auto depthControl = read(cx, 0x200);
         const auto renderControl = find(cx, 0x000);

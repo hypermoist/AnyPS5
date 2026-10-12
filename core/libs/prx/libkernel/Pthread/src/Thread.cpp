@@ -541,6 +541,12 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
     p->stackSize = attr ? (*attr)->_stacksize : DEFAULT_STACK_SIZE;
     if (attr) {
         p->priority.store((*attr)->_schedpriority, std::memory_order_relaxed);
+        if ((*attr)->_inheritsched != GUEST_INHERIT_SCHED)
+            p->scope = (*attr)->_scope;
+        else if (CurrentGuestState().current)
+            p->scope = CurrentGuestState().current->scope;
+    } else if (CurrentGuestState().current) {
+        p->scope = CurrentGuestState().current->scope;
     }
     if (name) p->name = name;
     std::promise<bool> start;

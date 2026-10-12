@@ -122,14 +122,14 @@ class Check:
     def duplicates(self, exports):
         if not exports:
             return
-        pattern = r"\bAPS5_VABI\s+(" + "|".join(exports) + r")\s*\("
+        pattern = r"(^|[^[:alnum:]_])APS5_VABI[[:space:]]+(" + "|".join(exports) + r")[[:space:]]*\("
         result = subprocess.run(["git", "grep", "-nE", pattern, self.head, "--", "core/libs/prx"], capture_output=True, encoding="utf-8", errors="replace")
         for line in result.stdout.splitlines():
-            _, path, _, text = line.split(":", 3)
+            _, path, number, text = line.split(":", 3)
             name = EXPORT.search(text).group(1)
-            own, number = exports[name]
-            if library(path) != library(own) and not text.rstrip().endswith(";"):
-                self.report("duplicate-export", own, number, f"{name} is also in {library(path)}")
+            own, own_number = exports[name]
+            if library(path) != library(own) and function_body(self.show(path).splitlines(), int(number) - 1) is not None:
+                self.report("duplicate-export", own, own_number, f"{name} is also in {library(path)}")
 
     def build(self):
         for path, lines in self.files(lambda p: p.name == "CMakeLists.txt" or p.suffix == ".cmake"):
@@ -143,7 +143,18 @@ class Check:
             if match and not match.group(1).startswith("3rdparty/"):
                 self.report("system-dependency", ".gitmodules", number, match.group(1))
 
+    def submodules(self):
+        result = subprocess.run(["git", "config", "--no-includes", "-z", "--blob", f"{self.head}:.gitmodules", "--list"],
+                                capture_output=True, encoding="utf-8", errors="replace")
+        values = {key: value for key, _, value in (entry.partition("\n") for entry in result.stdout.split("\0") if entry)}
+        return {path for key, path in values.items() if key.endswith(".path") and values.get(f"{key[:-5]}.url")}
+
     def repository(self):
+        gitlinks = {path for path, mode in self.modes.items() if mode == "160000" and path.startswith("3rdparty/")}
+        checked = gitlinks if ".gitmodules" in self.status else gitlinks & self.status.keys()
+        if checked:
+            for path in sorted(checked - self.submodules()):
+                self.report("system-dependency", path, 0, "submodule without a url in .gitmodules")
         for path, (added, deleted) in self.numstat.items():
             if path.startswith("3rdparty/"):
                 continue
