@@ -3547,14 +3547,19 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                     }
                     const auto* import = HostImportFor(context, begin, bytes);
                     if (import == nullptr || (begin - import->base) % context.limits.minStorageBufferOffsetAlignment != 0) return refuseMove("written element not in an aligned import");
-                    if (guestMemory.WritesOverlap(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return refuseMove("written element overlaps pending work");
+                    if (guestMemory.WritesOverlap(begin, bytes)) return refuseMove("written element overlaps the template's own writes");
+                    if (PendingStorageOverlaps(begin, bytes, nullptr)) return refuseMove("written element overlaps a pending storage image");
+                    if (AnyShadowedOverlaps(begin, bytes)) return refuseMove("written element overlaps a shadow");
                     MovedBuffer entry{index, address, static_cast<std::size_t>(size)};
                     entry.written = true;
                     entry.stagedFrom = stagedFrom;
                     moved.push_back(std::move(entry));
                     continue;
                 }
-                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return refuseMove("read element overlaps pending work");
+                if (guestMemory.WritesOverlap(begin, bytes)) return refuseMove("read element overlaps the template's own writes");
+                if (recorder.PendingWriteOverlaps(begin, bytes)) return refuseMove("read element overlaps a pending write");
+                if (PendingStorageOverlaps(begin, bytes, nullptr)) return refuseMove("read element overlaps a pending storage image");
+                if (AnyShadowedOverlaps(begin, bytes)) return refuseMove("read element overlaps a shadow");
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
             }
         }
