@@ -173,13 +173,13 @@ void Run(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget
         {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(PixelCode.data()), PixelCode, 0, {}},
         {64, 0, pixelUserData, std::nullopt, pixel, std::nullopt, pixelMemory},
         target,
-        {0, 0, geometryPush, (mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : 128u) - geometryPush}
+        PixelPushLayout(geometryPush, target)
     };
     fragment.useCache = false;
     const auto pixelResult = ShaderRecompiler::Recompile(fragment);
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {stage, &geometryResult, 0},
-        {ShaderStage::Fragment, &pixelResult, geometryPush}
+        {ShaderStage::Fragment, &pixelResult, PixelPushOffset(geometryPush, target)}
     }};
 
     AgcDriver::Graphics::State state{};
