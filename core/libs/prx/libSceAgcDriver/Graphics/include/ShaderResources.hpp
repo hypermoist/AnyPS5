@@ -142,10 +142,14 @@ public:
         std::size_t size;
         std::vector<std::uint32_t> words;
         bool written = false;
+        // The template's own address of a written element it staged: that region's copy-back is
+        // skipped for this use (SkipStagedCopyBack), 0 when the element was bound in place.
+        std::uint64_t stagedFrom = 0;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, bool written = false) const;
     std::shared_ptr<DrawBindings> PrepareMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
+    void SkipStagedCopyBack(std::uint64_t address) { guestMemory.SkipStagedCopyBack(address); }
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU

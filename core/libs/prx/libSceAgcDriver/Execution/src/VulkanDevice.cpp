@@ -4068,6 +4068,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             if (cached->Revalidate(shaders[0])) {
                 std::optional<std::vector<Graphics::ShaderResources::MovedBuffer>> moved = std::vector<Graphics::ShaderResources::MovedBuffer>{};
                 bool copiedWriter = false;
+                const char* movedRefused = nullptr;
                 if (MovableDispatchBuffers()) moved = cached->MovedReadOnlyBuffers(std::span<const Graphics::CompiledShader>(shaders), *state->recorder, true);
                 if (moved.has_value()) {
                     for (const auto& entry : *moved) {
@@ -4080,15 +4081,29 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         }
                     }
                 }
+                std::shared_ptr<Graphics::ShaderResources::DrawBindings> prepared;
+                if (moved.has_value() && !moved->empty()) {
+                    prepared = cached->PrepareMovedBindings(*state->recorder, *moved);
+                    // No bindings for moved elements (the import table moved meanwhile): the set's own
+                    // descriptors name the old addresses, so the use rebuilds.
+                    if (prepared == nullptr) {
+                        moved.reset();
+                        copiedWriter = false;
+                        movedRefused = "moved bindings unavailable";
+                    }
+                }
                 if (moved.has_value()) {
                     countRescacheMiss(nullptr);
+                    for (const auto& entry : *moved) {
+                        if (entry.stagedFrom != 0) cached->SkipStagedCopyBack(entry.stagedFrom);
+                    }
                     movedWrites = *moved;
-                    movedBindings = cached->PrepareMovedBindings(*state->recorder, *moved);
+                    movedBindings = std::move(prepared);
                     resources = std::move(cached);
                     fromCache = true;
                     ++d.cacheHits;
                 } else {
-                    countRescacheMiss(copiedWriter ? "written element has a copied writer" : Graphics::LastMoveRefusal() != nullptr ? Graphics::LastMoveRefusal() : "move refused");
+                    countRescacheMiss(movedRefused != nullptr ? movedRefused : copiedWriter ? "written element has a copied writer" : Graphics::LastMoveRefusal() != nullptr ? Graphics::LastMoveRefusal() : "move refused");
                     ++d.cacheMisses;
                 }
             } else {

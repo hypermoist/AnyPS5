@@ -3530,12 +3530,27 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                     if (!written) return refuseMove("written element, written moves off");
                     if (!elementWritten || !item.written) return refuseMove("written element, written flags differ");
                     if (size != item.size) return refuseMove("written element, size changed");
-                    if (!guestMemory.BoundInPlace(item.address)) return refuseMove("written element, not bound in place");
+                    std::uint64_t stagedFrom = 0;
+                    if (!guestMemory.BoundInPlace(item.address)) {
+                        const auto staged = guestMemory.StagedRegionAt(item.address);
+                        if (!staged.has_value()) return refuseMove("written element, not bound in place");
+                        // Skipping the region's copy-back loses nothing only when this element is the
+                        // only written one the region holds.
+                        for (std::size_t other = 0; other < allocations.size(); ++other) {
+                            const auto& candidate = allocations[other];
+                            if (other == index || !candidate.guest || !candidate.written) continue;
+                            const auto from = candidate.address - candidate.adjustment;
+                            const auto to = from + GuestBufferMemory::ViewBytes(candidate.size, candidate.adjustment);
+                            if (from < staged->second && staged->first < to) return refuseMove("written element, staged region shared");
+                        }
+                        stagedFrom = item.address;
+                    }
                     const auto* import = HostImportFor(context, begin, bytes);
                     if (import == nullptr || (begin - import->base) % context.limits.minStorageBufferOffsetAlignment != 0) return refuseMove("written element not in an aligned import");
                     if (guestMemory.WritesOverlap(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return refuseMove("written element overlaps pending work");
                     MovedBuffer entry{index, address, static_cast<std::size_t>(size)};
                     entry.written = true;
+                    entry.stagedFrom = stagedFrom;
                     moved.push_back(std::move(entry));
                     continue;
                 }

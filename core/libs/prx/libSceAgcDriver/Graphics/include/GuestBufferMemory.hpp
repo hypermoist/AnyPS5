@@ -209,6 +209,11 @@ public:
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
+    // The [begin, end) of the device-local staged region of this build's own that holds `address`.
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> StagedRegionAt(std::uint64_t address) const;
+    // Leaves that staged region out of this use's copy-back: a template binds its element at another
+    // address for this use, so the shadow holds nothing the use wrote. RecordStagingCopies restores it.
+    void SkipStagedCopyBack(std::uint64_t address);
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is

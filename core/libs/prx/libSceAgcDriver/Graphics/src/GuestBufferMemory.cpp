@@ -3674,6 +3674,21 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceRe
     return result;
 }
 
+std::optional<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::StagedRegionAt(std::uint64_t address) const {
+    if (!uploaded || committed) return std::nullopt;
+    for (const auto& region : regions) {
+        if (region.gpuCopy && region.deviceLocal && region.begin <= address && address < region.end) return std::pair {region.begin, region.end};
+    }
+    return std::nullopt;
+}
+
+void GuestBufferMemory::SkipStagedCopyBack(std::uint64_t address) {
+    if (!uploaded || committed) return;
+    for (auto& region : regions) {
+        if (region.gpuCopy && region.deviceLocal && region.begin <= address && address < region.end) region.copiedBack = true;
+    }
+}
+
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
