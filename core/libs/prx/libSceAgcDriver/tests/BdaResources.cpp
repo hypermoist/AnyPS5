@@ -140,12 +140,15 @@ void importWindowTests(const Context& context) {
     const auto lowBuffer = low->buffer;
     const auto* high = HostImportFor(importing, first + window, piece);
     Require(high != nullptr && high->base == first + window && high->bytes == piece, "a span crossed the import window");
-    Require(HostImportFor(importing, first + window - 16, 32) == nullptr, "a view crossing the import window was imported");
+    static_cast<void>(lowBuffer);
+    const auto* crossing = HostImportFor(importing, first + window - 16, 32);
+    Require(crossing != nullptr && crossing->base == first && crossing->bytes == window + piece, "a view crossing the import window was not imported over both window runs");
+    Require(HostImportFor(importing, first, 16) == crossing && HostImportFor(importing, first + window, piece) == crossing, "a request inside a joined import was not served by it");
     change(guest + 3 * piece, true);
     const auto* grown = HostImportFor(importing, first + window, window);
     Require(grown != nullptr && grown->base == first + window && grown->bytes == window, "the next window did not grow into the new range");
     const auto* kept = HostImportFor(importing, first, 16);
-    Require(kept != nullptr && kept->buffer == lowBuffer, "growth in one window re-imported another");
+    Require(kept != nullptr && kept->base == first && kept->bytes == window, "the first window was not imported again as its own span");
     for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, false);
     SetHostImportWindow(0);
     ::operator delete(block, std::align_val_t{window});

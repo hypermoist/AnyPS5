@@ -593,18 +593,19 @@ ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address)
     return run;
 }
 
-// The ranges from the one containing `address` to the one containing `end - 1`, joined while
-// they continue a run: the import a view crossing a window edge needs, which the window runs never
-// give it (it was copied by the CPU at every use). Made only for such a view.
+// The window runs a view crossing a window edge spans, joined: the window runs never give such a
+// view an import (it was copied by the CPU at every use). Requests inside either window are served
+// by the joined import; it is replaced only when one of its windows changes.
 ImportRun extentRun(const GuestAllocations::Lease& lease, std::uint64_t address, std::uint64_t end) {
-    const auto index = leasedIndexContaining(lease, address);
-    if (index == lease.size()) return {};
-    auto last = index;
-    while (lease[last]->address + lease[last]->bytes < end && last + 1 < lease.size() && continuesRun(*lease[last], *lease[last + 1])) ++last;
-    if (lease[last]->address + lease[last]->bytes < end) return {};
-    if (last != index && Imports().unaliasedSpans.contains(lease[index]->address)) return {};
-    ImportRun run{lease[index]->address, lease[last]->address + lease[last]->bytes - lease[index]->address, {}};
-    run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(index), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+    auto run = importRun(lease, address);
+    if (run.ranges.empty()) return {};
+    while (run.base + run.bytes < end) {
+        auto next = importRun(lease, run.base + run.bytes);
+        if (next.ranges.empty() || next.base != run.base + run.bytes || !continuesRun(*run.ranges.back(), *next.ranges.front())) return {};
+        run.bytes += next.bytes;
+        run.ranges.insert(run.ranges.end(), next.ranges.begin(), next.ranges.end());
+    }
+    if (run.ranges.size() > 1 && Imports().unaliasedSpans.contains(run.base)) return {};
     return run;
 }
 
