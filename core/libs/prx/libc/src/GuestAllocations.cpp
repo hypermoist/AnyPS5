@@ -36,6 +36,11 @@ struct Registry {
     std::map<std::uint64_t, std::shared_ptr<const Range>> ranges;
     bool mainImageRegistered = false;
     std::map<std::uintptr_t, std::uintptr_t> registeredImages;
+    // AcquireShared's snapshot; dropped when a mutation begins, so it never pins a range a mutation
+    // checks (RequireUnpinned counts references).
+    std::shared_ptr<const Lease> readable;
+    // Mutations begun and not ended (RequireUnpinned releases the lock while it waits): none caches.
+    int mutating = 0;
 };
 
 Registry& registry() {
@@ -109,12 +114,16 @@ bool backWritableImageAnonymously() {
 }
 
 void* GuestAllocationsBegin_nid_postfix() {
-    return new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
+    auto* state = new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
+    registry().readable.reset();
+    ++registry().mutating;
+    return state;
 }
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
     const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
+    if (state->lock.owns_lock()) --registry().mutating;
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
     }
@@ -492,6 +501,19 @@ Lease GuestAllocationsAcquire_nid_postfix() {
         if (range->readable && range->bytes != 0) result.push_back(range);
     }
     return result;
+}
+
+std::shared_ptr<const Lease> GuestAllocationsAcquireShared_nid_postfix() {
+    std::lock_guard lock(registry().mutex);
+    auto& state = registry();
+    if (state.readable != nullptr) return state.readable;
+    auto snapshot = std::make_shared<Lease>();
+    snapshot->reserve(state.ranges.size());
+    for (const auto& [address, range] : state.ranges) {
+        if (range->readable && range->bytes != 0) snapshot->push_back(range);
+    }
+    if (state.mutating == 0) state.readable = snapshot;
+    return snapshot;
 }
 
 Lease GuestAllocationsAcquireAll_nid_postfix() {

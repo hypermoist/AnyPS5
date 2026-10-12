@@ -262,7 +262,7 @@ public:
     void RecordCopyBacks(Recorder& recorder);
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
-    bool HoldsLease() const { return !lease.empty() || space != nullptr; }
+    bool HoldsLease() const { return lease != nullptr || space != nullptr; }
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
         for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
@@ -382,7 +382,7 @@ private:
     Context context;
     bool stagingAllowed = false;
     bool adjustedRegions = false;
-    GuestAllocations::Lease lease;
+    std::shared_ptr<const GuestAllocations::Lease> lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).
     std::shared_ptr<const AddressSpace> space;
