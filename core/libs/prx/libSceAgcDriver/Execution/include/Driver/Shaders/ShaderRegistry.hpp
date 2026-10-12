@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+struct Shader;
+
 namespace ShaderRecompiler {
 class ShaderPreparationContext;
 }
@@ -90,12 +92,14 @@ std::shared_ptr<const ShaderSnapshot> ProgramSnapshot(const ShaderRegistry& shad
 void NoteRawGraphicsDraw();
 bool RawGraphicsDrawn();
 bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset);
+bool VertexWorkgroupRequired(const QueueState& queue, const ShaderRegistry& registry);
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation = nullptr);
 
 std::uint64_t NullPixelProgramAddress();
 ShaderSnapshot PrepareNullPixelProgram(const VulkanDevice& device);
 std::optional<ShaderRecompiler::ShaderFloatMode> RegisteredFloatMode(const ShaderSnapshot& snapshot);
+std::shared_ptr<const ShaderSnapshot> RegisteredHeader(const ShaderRegistry& registry, const Shader* shader);
 std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& registry, std::uint64_t address, std::initializer_list<std::uint8_t> types);
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot);
 void SubmitRegistrationPreparation(std::function<void()> task);

@@ -144,10 +144,16 @@ void testRegisterFile() {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> order;
     for (const auto& [offset, value] : registers) order.emplace_back(offset, value);
     check(order == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{0x10, 7}, {0x41, 2}, {0x300, 3}}, "register file order");
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> visited;
+    registers.ForEach([&](std::uint32_t offset, std::uint32_t value) { visited.emplace_back(offset, value); });
+    check(visited == order, "register file visit order");
     auto copy = registers;
     copy[0x7000] = 5;
     check(copy.size() == 4 && registers.size() == 3 && !registers.contains(0x7000) && !(copy == registers), "register file copy");
     check(copy.erase(0x7000) == 1 && copy.erase(0x7000) == 0 && copy == registers, "register file erase");
+    visited.clear();
+    copy.ForEach([&](std::uint32_t offset, std::uint32_t value) { visited.emplace_back(offset, value); });
+    check(visited == order, "register file visited an erased register");
     bool threw = false;
     try {
         static_cast<void>(registers.at(0x42));
@@ -356,11 +362,22 @@ void testMemory() {
     check(data[0] == 61 && data[1] == 62, "WRITE_DATA with a cache policy failed");
     execute(state, makePacket(0x37, {0x40100500, low(data.data()), high(data.data()), 81, 82}));
     check(data[0] == 81 && data[1] == 82, "WRITE_DATA to memory from the graphics queue failed");
+    execute(state, makePacket(0x37, {0x06100300, low(data.data()), high(data.data()), 91, 92}));
+    check(data[0] == 91 && data[1] == 92, "WRITE_DATA with destination 3 did not write memory");
+    const auto fence = makePacket(0x37, {0x06100300, low(data.data()), high(data.data()), 0});
+    const auto fenceLabel = AgcDriver::Pm4::DecodeLabelWrite(fence);
+    check(fenceLabel.has_value() && fenceLabel->address == reinterpret_cast<std::uint64_t>(data.data()), "WRITE_DATA with destination 3 did not resolve as a label");
+    expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x37, {0x100000, low(data.data()), high(data.data()), 1}), 0); }, "register destination");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x37, {0x08000100, low(data.data()), high(data.data()), 71}), 0); }, "reserved");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x37, {0x80000100, low(data.data()), high(data.data()), 51}), 0); }, "engine");
+    execute(state, makePacket(0x83, {0xbff8, 2, low(data.data()), high(data.data())}));
+    check(data[0] == 0 && data[1] == 0, "unwritten constant RAM is not zero");
     execute(state, makePacket(0x81, {4, 31, 32}));
     execute(state, makePacket(0x83, {4, 2, low(data.data()), high(data.data())}));
     check(data[0] == 31 && data[1] == 32, "constant RAM round trip failed");
+    auto copied = state;
+    execute(copied, makePacket(0x83, {0, 3, low(data.data()), high(data.data())}));
+    check(data[0] == 0 && data[1] == 31 && data[2] == 32, "a copied queue state lost its constant RAM");
     expectFailure([&] { execute(state, makePacket(0x81, {0xbffc, 1, 2})); }, "overflow");
     expectFailure([&] { execute(state, makePacket(0x40, {0x10105, 0, 0, low(data.data()), high(data.data())})); }, "64-bit immediate");
 }

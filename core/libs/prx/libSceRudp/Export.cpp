@@ -19,6 +19,7 @@ constexpr int RUDP_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80770004u);
 constexpr int RUDP_ERROR_MEMORY = static_cast<int>(0x80770007u);
 constexpr int RUDP_ERROR_CONN_RESET = static_cast<int>(0x80770009u);
 constexpr int RUDP_ERROR_CONN_REFUSED = static_cast<int>(0x8077000Au);
+constexpr int RUDP_ERROR_NOT_ACCEPTABLE = static_cast<int>(0x80770011u);
 
 constexpr int RUDP_POOL_MIN_SIZE = 0xC58;
 constexpr std::uintptr_t RUDP_POOL_ALIGNMENT = 8;
@@ -100,6 +101,11 @@ int APS5_VABI sceRudpEnableInternalIOThread(uint32_t stack_size, uint32_t priori
     return g_inited ? 0 : RUDP_ERROR_NOT_INITIALIZED;
 }
 
+int APS5_VABI sceRudpEnableInternalIOThread2() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 int APS5_VABI sceRudpSetEventHandler(GuestRudpEventHandler handler, void* arg) {
     std::lock_guard<std::mutex> lk(g_mutex);
     g_handler = handler;
@@ -149,6 +155,11 @@ int APS5_VABI sceRudpSetOption(int ctx_id, int option, const void* value, uint32
     return valid_ctx(ctx_id) ? 0 : RUDP_ERROR_INVALID_CONTEXT_ID;
 }
 
+int APS5_VABI sceRudpGetOption() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 int APS5_VABI sceRudpInitiate(int ctx_id, const void* to, uint32_t tolen, uint16_t vport) {
     (void)to;
     (void)tolen;
@@ -177,6 +188,53 @@ int APS5_VABI sceRudpGetContextStatus(int ctx_id, void* status, uint32_t size) {
     return 0;
 }
 
+int APS5_VABI sceRudpGetRemoteInfo() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceRudpGetNumberOfPacketsToRead(int ctx_id) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_inited) {
+        return RUDP_ERROR_NOT_INITIALIZED;
+    }
+    if (ctx_id < 0) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    if (!valid_ctx(ctx_id)) {
+        return RUDP_ERROR_INVALID_CONTEXT_ID;
+    }
+    return 0;
+}
+
+int APS5_VABI sceRudpGetSizeWritable(int ctx_id) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_inited) {
+        return RUDP_ERROR_NOT_INITIALIZED;
+    }
+    if (ctx_id < 0) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    if (!valid_ctx(ctx_id)) {
+        return RUDP_ERROR_INVALID_CONTEXT_ID;
+    }
+    return RUDP_ERROR_NOT_ACCEPTABLE;
+}
+
+int APS5_VABI sceRudpGetSizeReadable(int ctx_id) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_inited) {
+        return RUDP_ERROR_NOT_INITIALIZED;
+    }
+    if (ctx_id < 0) {
+        return RUDP_ERROR_INVALID_ARGUMENT;
+    }
+    if (!valid_ctx(ctx_id)) {
+        return RUDP_ERROR_INVALID_CONTEXT_ID;
+    }
+    return RUDP_ERROR_NOT_ACCEPTABLE;
+}
+
 int APS5_VABI sceRudpWrite(int ctx_id, const void* data, uint32_t len, int flags) {
     (void)data;
     (void)len;
@@ -199,4 +257,25 @@ int APS5_VABI sceRudpRead(int ctx_id, void* data, uint32_t len, int flags, void*
     }
     return valid_ctx(ctx_id) ? RUDP_ERROR_CONN_RESET : RUDP_ERROR_INVALID_CONTEXT_ID;
 }
+
+int APS5_VABI sceRudpNetFlush(void) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_inited ? 0 : RUDP_ERROR_NOT_INITIALIZED;
+}
+
+int APS5_VABI sceRudpProcessEvents(void) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return g_inited ? 0 : RUDP_ERROR_NOT_INITIALIZED;
+}
+
+int APS5_VABI sceRudpNetReceived(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
+int APS5_VABI sceRudpGetMaxSegmentSize(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 }

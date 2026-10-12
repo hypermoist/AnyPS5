@@ -82,6 +82,8 @@ static std::uint64_t GetStartNanos() {
     return start;
 }
 
+static const std::uint64_t g_processStart = GetStartNanos();
+
 #ifdef _WIN32
 // Every relative wait in the process (winpthreads nanosleep, std::condition_variable::wait_for, the
 // GPU driver's poll sleeps) rounds up to the scheduler tick, 15.6 ms by default; a console game and
@@ -471,8 +473,7 @@ int APS5_VABI gettimeofday_nid_postfix(KernelTimeval* tv, KernelTimezone* tz) {
 }
 
 int APS5_VABI clock_getres_nid_postfix(int clockId, KernelTimespec* res) {
-    KernelTimespec ignoredResolution{};
-    if (res == nullptr) res = &ignoredResolution;
+    if (res == nullptr) return 0;
     if (IsCpuClock(clockId))
         return clock_getres_nid_postfix(GUEST_CLOCK_THREAD_CPUTIME_ID, res);
     if (clockId == 1 || clockId == 2) {

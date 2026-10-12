@@ -150,6 +150,37 @@ extern "C" unsigned int APS5_VABI GuestAlarm_nid_no_patch(unsigned int seconds) 
     return remaining;
 }
 
+struct GuestItimerval {
+    KernelTimeval interval;
+    KernelTimeval value;
+};
+static_assert(sizeof(GuestItimerval) == 32 && offsetof(GuestItimerval, value) == 16);
+
+extern "C" int APS5_VABI getitimer_nid_postfix(int which, GuestItimerval* output) {
+    if (which < 0 || which > 2) {
+        *__error_nid_postfix() = 22;
+        return -1;
+    }
+    if (which != 0) throw std::runtime_error("getitimer: CPU interval timers are not implemented");
+    if (output == nullptr) {
+        *__error_nid_postfix() = 14;
+        return -1;
+    }
+    GuestItimerval result{};
+    auto& alarms = Alarms();
+    {
+        std::lock_guard lock(alarms.lock);
+        const auto now = std::chrono::steady_clock::now();
+        if (alarms.deadline && *alarms.deadline > now) {
+            const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(*alarms.deadline - now).count();
+            result.value.tv_sec = micros / 1000000;
+            result.value.tv_usec = micros % 1000000;
+        }
+    }
+    *output = result;
+    return 0;
+}
+
 struct GuestStack {
     void* sp;
     std::size_t size;
@@ -165,8 +196,7 @@ thread_local GuestStack alternateStack{nullptr, 0, SsDisable};
 extern "C" {
 GuestHandler APS5_VABI signal_nid_postfix(int guest, GuestHandler handler) {
     const auto invalid = reinterpret_cast<GuestHandler>(static_cast<std::uintptr_t>(-1));
-    const int native = NativeSignal(guest);
-    if (!native || handler == invalid) { *__error_nid_postfix() = 22; return invalid; }
+    if (guest < 1 || guest > MaxSignal || ((guest == GuestSigkill || guest == GuestSigstop) && handler != nullptr)) { *__error_nid_postfix() = 22; return invalid; }
     std::lock_guard lock(registration);
     const GuestSigaction action{reinterpret_cast<std::uintptr_t>(handler), SaRestart, {}};
     if (!Install(guest, action)) { *__error_nid_postfix() = 22; return invalid; }
@@ -249,6 +279,33 @@ int APS5_VABI sigprocmask_nid_postfix(int how, const void* set, void* previousSe
 int APS5_VABI pthread_sigmask_nid_postfix(int how, const GuestSignalSet* set, GuestSignalSet* previousSet) {
     if (set != nullptr && (how < 1 || how > 3)) return 22;
     return _sigprocmask_nid_postfix(how, set, previousSet);
+}
+
+int APS5_VABI sigtimedwait_nid_postfix(const GuestSignalSet* set, void* info, const void* timeout) {
+    (void)set;
+    (void)info;
+    (void)timeout;
+    NotImplemented_nid_no_patch("sigtimedwait: waiting for a pending signal");
+    return -1;
+}
+
+int APS5_VABI sigwaitinfo_nid_postfix(const GuestSignalSet* set, void* info) {
+    (void)set;
+    (void)info;
+    NotImplemented_nid_no_patch("sigwaitinfo: waiting for a pending signal");
+    return -1;
+}
+
+int APS5_VABI sigwait_nid_postfix(const GuestSignalSet* set, int* received) {
+    (void)set;
+    (void)received;
+    NotImplemented_nid_no_patch("sigwait: waiting for a pending signal");
+    return -1;
+}
+
+int APS5_VABI pause_nid_postfix(void) {
+    NotImplemented_nid_no_patch("pause: waiting for a delivered signal");
+    return -1;
 }
 }
 

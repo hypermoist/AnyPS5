@@ -23,6 +23,15 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -41,7 +50,7 @@ void setEnvironment(const char* name, const std::string& value) {
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.imageRead == right.imageRead && left.imageUnnormalized == right.imageUnnormalized && left.imageSamplers == right.imageSamplers;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.imageRead == right.imageRead && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -122,6 +131,7 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.samplerUnnormalized = {false, true, true};
     binding.samplerIntegerBorder = {true, false, seed % 2 == 1};
     binding.imageUnnormalized = {true, false, seed % 2 == 0};
+    binding.imageUnnormalizedBaseLevel = {false, true, seed % 3 == 0};
     binding.imageSamplers = {0x5u, 0u, 0x80000000u};
     binding.bufferRead = {true, false, false, true, true, false};
     return binding;
@@ -485,6 +495,63 @@ void verifyFloatModeSerialization() {
     sample.request.context.floatMode = mode;
     const auto back = serializer.Deserialize(serializer.Serialize(sample.request));
     require(back.request.context.floatMode == mode, "the float mode did not survive serialization");
+}
+
+void verifyAtomicReplacement(const std::filesystem::path& directory) {
+    struct Reader {
+#ifdef _WIN32
+        HANDLE file;
+        explicit Reader(const std::filesystem::path& path)
+            : file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)) {
+            require(file != INVALID_HANDLE_VALUE, "cannot retain the cache file");
+        }
+        ~Reader() { CloseHandle(file); }
+        std::vector<std::byte> Read() {
+            require(SetFilePointerEx(file, {}, nullptr, FILE_BEGIN), "cannot seek the retained cache file");
+            std::array<std::byte, 32> bytes{};
+            DWORD count = 0;
+            require(ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &count, nullptr), "cannot read the retained cache file");
+            return {bytes.begin(), bytes.begin() + count};
+        }
+#else
+        std::ifstream file;
+        explicit Reader(const std::filesystem::path& path) : file(path, std::ios::binary) {
+            require(file.is_open(), "cannot retain the cache file");
+        }
+        std::vector<std::byte> Read() {
+            file.clear();
+            file.seekg(0);
+            require(!file.fail(), "cannot seek the retained cache file");
+            std::array<std::byte, 32> bytes{};
+            file.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+            require(file.eof() && !file.bad(), "cannot read the retained cache file");
+            return {bytes.begin(), bytes.begin() + file.gcount()};
+        }
+#endif
+        Reader(const Reader&) = delete;
+        Reader& operator=(const Reader&) = delete;
+    };
+    const auto root = directory / "atomic-replacement";
+    const auto path = root / "entry.bin";
+    const std::vector<std::byte> original{std::byte{0x12}, std::byte{0x00}, std::byte{0x34}};
+    const std::vector<std::byte> replacement{std::byte{0xab}, std::byte{0xcd}, std::byte{0x00}, std::byte{0xef}};
+    require(WriteFileAtomically(path, original), "cannot write the initial cache entry");
+    {
+        Reader old(path);
+        require(old.Read() == original, "the retained reader did not read the original entry");
+        require(WriteFileAtomically(path, replacement), "cannot replace cache entry with a retained reader");
+        require(old.Read() == original, "replacement changed the retained original entry");
+        std::vector<std::byte> fresh;
+        require(ReadWholeFile(path, fresh) && fresh == replacement, "a fresh reader did not read the replacement entry");
+        Reader current(path);
+        require(current.Read() == replacement, "the replacement reader did not retain its entry");
+        require(std::filesystem::remove(path), "cannot delete the replacement while readers retain it");
+        require(!ReadWholeFile(path, fresh), "the deleted cache entry remains readable by path");
+        require(old.Read() == original && current.Read() == replacement, "deletion invalidated retained cache readers");
+    }
+    require(std::filesystem::is_empty(root), "atomic replacement left a temporary file behind");
+    require(std::filesystem::remove(root), "cannot remove the empty replacement directory");
 }
 
 void verifyStore() {
@@ -1034,6 +1101,7 @@ int main(int argc, char** argv) {
         verifyDefaultDirectory(argv[0]);
         setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
         setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
+        verifyAtomicReplacement(directory);
         verifyResultRoundTrip();
         verifyEntryRoundTrip();
         verifyArtifactStorageIsolation();

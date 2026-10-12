@@ -14,6 +14,9 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 
 #ifndef _WIN32
 #include <pthread.h>
@@ -96,6 +99,7 @@ struct PthreadAttrPrivate {
     int _schedpolicy;
     int _inheritsched;
     KernelCpumask _affinity = DEFAULT_THREAD_AFFINITY;
+    bool _affinityExplicit = false;
     std::size_t _guardsize = 0x1000;
     int _solosched = 0;
 };
@@ -136,7 +140,7 @@ struct PthreadPrivate {
     std::mutex cancelLock;
     TimedWait::Condition* cancelWait = nullptr;
 
-    PthreadPrivate();
+    explicit PthreadPrivate(const PthreadAttrPrivate* attr = nullptr);
     ~PthreadPrivate();
     PthreadPrivate(const PthreadPrivate&) = delete;
     PthreadPrivate& operator=(const PthreadPrivate&) = delete;
@@ -147,5 +151,6 @@ void NoteGuestStackProtection(std::uintptr_t start, std::size_t bytes, bool read
 int GuestThreadCpuClockId(const PthreadPrivate* thread);
 bool GuestThreadCpuNanos(int cpuClockThread, std::uint64_t* nanos);
 void SetLiveGuestThreadsAffinity(KernelCpumask mask);
+KernelCpumask LiveGuestThreadsAffinity();
 
 #endif

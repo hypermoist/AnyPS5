@@ -186,22 +186,24 @@ std::uint32_t CubeLayer(SpirvEmitterState& state, std::uint32_t value) {
 }
 
 std::uint32_t CoordF32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t first, std::uint32_t components, std::uint32_t encoded) {
-    if (first == NoImageComponent || encoded < components || access.mem.imageAddressComponents < first + encoded) {
+    const bool cube = access.image.cube;
+    const auto present = std::min(encoded, components);
+    if (first == NoImageComponent || (encoded < components && (cube || encoded == 0u)) || access.mem.imageAddressComponents < first + present) {
         ctx.Fail(access.inst, "has an image address with too few coordinate components");
     }
-    const bool cube = access.image.cube;
-    auto x = AddressF32(ctx, access, first);
+    const auto component = [&](std::uint32_t index) { return index < present ? AddressF32(ctx, access, first + index) : ZeroF32(ctx.state); };
+    auto x = component(0u);
     if (components == 1u) {
         return x;
     }
-    auto y = AddressF32(ctx, access, first + 1u);
+    auto y = component(1u);
     if (cube) {
         x = CubeAxis(ctx.state, x);
         y = CubeAxis(ctx.state, y);
     }
     const auto result = ctx.state.module.AllocateId();
     if (components == 3u) {
-        auto z = AddressF32(ctx, access, first + 2u);
+        auto z = component(2u);
         if (cube) {
             z = CubeLayer(ctx.state, z);
         }
@@ -331,7 +333,7 @@ std::uint32_t ResultVector(SpirvValueEmitContext& ctx, const ImageEmitAccess& ac
     std::uint32_t component[4] = {};
     for (std::uint32_t index = 0; index < 4u; index++) {
         if (dref) {
-            component[index] = index == 0u ? F32BitsToU32(ctx, value) : ConstantU32(state, 0);
+            component[index] = F32BitsToU32(ctx, value);
             continue;
         }
         const auto scalar = state.module.AllocateId();
@@ -1334,7 +1336,8 @@ void EmitEmulatedCompareSample(SpirvValueEmitContext& ctx, const ImageEmitAccess
         else state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), coord, ux, uy);
         const auto texel = state.module.AllocateId();
         state.module.AddFunction(spv::OpImageFetch, ImageVectorType(state, IrTextureNumericClass::Float, 4), texel, descriptor, coord, spv::ImageOperandsLodMask, ConstantU32(state, 0u));
-        auto red = extract(f32, texel, 0u);
+        auto red = extract(f32, texel, 3u);
+        for (std::uint32_t channel = 3u; channel-- > 0u;) red = Select(state, f32, equal(RuntimeImageSwizzle(state, mem.resource, channel), 4u), extract(f32, texel, channel), red);
         red = Select(state, f32, equal(modeX, EmulatedCompare::AddressBorder), Select(state, f32, inside(x, width), red, borderRed), red);
         red = Select(state, f32, equal(modeY, EmulatedCompare::AddressBorder), Select(state, f32, inside(y, height), red, borderRed), red);
         constexpr std::array<spv::Op, 6> operations{spv::OpFOrdLessThan, spv::OpFOrdEqual, spv::OpFOrdLessThanEqual, spv::OpFOrdGreaterThan, spv::OpFOrdNotEqual, spv::OpFOrdGreaterThanEqual};
@@ -1343,6 +1346,7 @@ void EmitEmulatedCompareSample(SpirvValueEmitContext& ctx, const ImageEmitAccess
             const auto compared = Select(state, f32, Binary(state, operations[index], TypeBool(state), reference, red), one, zero);
             result = Select(state, f32, equal(parameter(0u), index + 1u), compared, result);
         }
+        result = Select(state, f32, equal(parameter(4u), EmulatedCompare::ReferenceZero), zero, result);
         return result;
     };
     const auto scaledU = Binary(state, spv::OpFMul, f32, extract(f32, setup.coord, 0u), Unary(state, spv::OpConvertSToF, f32, width));
@@ -1375,7 +1379,15 @@ void EmitEmulatedCompareSample(SpirvValueEmitContext& ctx, const ImageEmitAccess
         const auto bottom = ext(f32, GLSLstd450FMix, {compareTexel(x0, y1), compareTexel(x1, y1), weightU});
         return ext(f32, GLSLstd450FMix, {top, bottom, weightV});
     });
-    ctx.Define(access.inst, TableResult(ctx, access, ResultVector(ctx, access, result, setup.numericClass, true, false)));
+    const auto channelResult = [&](std::uint32_t channel) {
+        const auto selector = RuntimeImageSwizzle(state, mem.resource, channel);
+        return Select(state, f32, equal(selector, 0u), zero, Select(state, f32, equal(selector, 1u), one, result));
+    };
+    std::uint32_t channels[4] = {};
+    for (std::uint32_t channel = 0; channel < 4u; ++channel) channels[channel] = channelResult(channel);
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), value, channels[0], channels[1], channels[2], channels[3]);
+    ctx.Define(access.inst, TableResult(ctx, access, ResultVector(ctx, access, value, IrTextureNumericClass::Float, false, false)));
 }
 
 void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SampleSetup& setup) {

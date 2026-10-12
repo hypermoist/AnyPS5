@@ -176,6 +176,7 @@ struct ShaderFloatMode {
 inline constexpr std::uint32_t InterpolationQuiet = 1u;
 inline constexpr std::uint32_t InterpolationFlush32 = 2u;
 inline constexpr std::uint32_t InterpolationFlush16 = 4u;
+inline constexpr std::uint32_t InterpolationRound16Shift = 3u;
 
 struct GuestContext {
     std::uint32_t waveSize;
@@ -370,6 +371,7 @@ struct DescriptorBinding {
     std::vector<bool> samplerUnnormalized;
     std::vector<bool> samplerIntegerBorder;
     std::vector<bool> imageUnnormalized;
+    std::vector<bool> imageUnnormalizedBaseLevel;
     std::vector<std::uint32_t> imageSamplers;
     std::vector<bool> bufferRead;
 };

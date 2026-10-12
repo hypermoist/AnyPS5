@@ -200,6 +200,12 @@ int APS5_VABI getpid_nid_postfix(void) {
     return static_cast<int>(pid);
 }
 
+int APS5_VABI getsid_nid_postfix(int pid) {
+    (void)pid;
+    NotImplemented_nid_no_patch("getsid: process sessions");
+    return -1;
+}
+
 int APS5_VABI getppid_nid_postfix(void) {
 #ifdef _WIN32
     const DWORD self = GetCurrentProcessId();
@@ -285,6 +291,13 @@ int APS5_VABI execvp_nid_postfix(const char* file, char* const* arguments) {
     (void)file;
     (void)arguments;
     NotImplemented_nid_no_patch("execvp: executable replacement");
+    return -1;
+}
+
+int APS5_VABI execv_nid_postfix(const char* path, char* const* arguments) {
+    (void)path;
+    (void)arguments;
+    NotImplemented_nid_no_patch("execv: executable replacement");
     return -1;
 }
 

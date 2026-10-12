@@ -103,6 +103,7 @@ struct SpirvEmitterState {
     bool tableIndexNonUniform = true;
     std::uint32_t storageBufferVariable = 0;
     std::uint32_t storageBufferU64Variable = 0;
+    std::uint32_t storageBufferCoherentVariable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;
@@ -146,6 +147,7 @@ struct SpirvEmitterState {
     std::uint32_t ldsBufferBase = 0;
     std::uint32_t numWorkgroupsVariable = 0;
     std::array<std::uint32_t, 2> scratchVariable {};
+    std::array<std::uint32_t, 2> vectorWindowVariable {};
     std::array<std::uint32_t, ImageBindingCount> imageVariables {};
     std::uint32_t samplerVariable = 0;
     std::uint32_t mainFunc = 0;

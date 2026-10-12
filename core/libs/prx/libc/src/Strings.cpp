@@ -9,6 +9,7 @@
 #include <string>
 
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/SonyCrt.hpp"
 
 namespace {
 
@@ -175,7 +176,7 @@ long double APS5_VABI strtold_nid_postfix(const char* str, char** endptr) {
 }
 
 int APS5_VABI atoi_nid_postfix(const char* str) {
-    return std::atoi(str);
+    return static_cast<int>(strtol_nid_postfix(str, nullptr, 10));
 }
 
 std::int64_t APS5_VABI atol_nid_postfix(const char* str) {
@@ -426,6 +427,25 @@ size_t APS5_VABI wcsspn_nid_postfix(const char16_t* s, const char16_t* accept) {
     return count;
 }
 
+char16_t* APS5_VABI wcstok_nid_postfix(char16_t* text, const char16_t* delimiters, char16_t** last) {
+    if (text == nullptr) text = *last;
+    if (text == nullptr) return nullptr;
+    while (*text != 0 && Contains(delimiters, *text)) ++text;
+    if (*text == 0) {
+        *last = nullptr;
+        return nullptr;
+    }
+    char16_t* end = text;
+    while (*end != 0 && !Contains(delimiters, *end)) ++end;
+    if (*end == 0) {
+        *last = nullptr;
+    } else {
+        *end = 0;
+        *last = end + 1;
+    }
+    return text;
+}
+
 char16_t* APS5_VABI wmemset_nid_postfix(char16_t* s, char16_t c, size_t n) {
     for (size_t index = 0; index < n; ++index) s[index] = c;
     return s;
@@ -478,6 +498,10 @@ size_t APS5_VABI wcsxfrm_nid_postfix(char16_t* destination, const char16_t* sour
 
 size_t APS5_VABI strxfrm_nid_postfix(char* destination, const char* source, size_t count) {
     return std::strxfrm(destination, source, count);
+}
+
+char* APS5_VABI strtok_s_nid_postfix(char* str, const char* delim, char** context) {
+    return SonyStrtokS(str, delim, context);
 }
 
 }

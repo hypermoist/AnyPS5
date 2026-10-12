@@ -160,10 +160,11 @@ const char* UnnormalizedUseReason(std::uint32_t uses) {
 struct UnnormalizedProof {
     std::vector<bool> samplers;
     std::vector<bool> images;
+    std::vector<bool> imagesAtBaseLevel;
 };
 
 UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapshot& snapshot) {
-    UnnormalizedProof proof{std::vector<bool>(info.samplers.size()), std::vector<bool>(info.images.size())};
+    UnnormalizedProof proof{std::vector<bool>(info.samplers.size()), std::vector<bool>(info.images.size()), std::vector<bool>(info.images.size())};
     for (std::uint32_t r = 0; r < info.samplers.size(); r++) {
         if (snapshot.samplers.at(r).dwordCount != 4u) fail("sampler descriptor must contain four dwords");
         const auto& sampler = info.samplers[r];
@@ -173,7 +174,7 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
             }
             continue;
         }
-        const std::uint32_t unsupported = sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset);
+        const std::uint32_t unsupported = sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod | SamplerUseOffset | SamplerUseNonZeroLod);
         if (unsupported != 0u) {
             failUnnormalized(UnnormalizedUseReason(unsupported));
         }
@@ -193,6 +194,16 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
             proof.images[pair.image] = true;
         }
         proof.samplers[r] = true;
+    }
+    for (std::uint32_t resource = 0; resource < info.images.size(); resource++) {
+        bool exact = proof.images[resource];
+        for (const auto& pair : info.sampledPairs) {
+            if (!exact) break;
+            if (pair.image != resource) continue;
+            const auto& words = snapshot.samplers.at(pair.sampler).dwords;
+            exact = proof.samplers[pair.sampler] && info.samplers.at(pair.sampler).uses == SamplerUseExplicitLod && (words[1] & 0xfffu) == 0u && (words[2] & 0x3fffu) == 0u;
+        }
+        proof.imagesAtBaseLevel[resource] = exact;
     }
     return proof;
 }
@@ -391,6 +402,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 physical.imageDepthCompare.push_back(mode.depthCompare);
                 physical.imageAtomic.push_back(image.atomic);
                 physical.imageUnnormalized.push_back(unnormalized.images.at(resource));
+                physical.imageUnnormalizedBaseLevel.push_back(unnormalized.imagesAtBaseLevel.at(resource));
                 physical.imageSamplers.push_back(0u);
                 physical.imageAtomic64.push_back(image.atomic64);
                 if (layout.runtimeImageCount == 0u || image.indirectRoot == ImageResource::NoIndirectImage) continue;

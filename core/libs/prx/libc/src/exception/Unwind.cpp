@@ -1,22 +1,19 @@
 #include "prx/libc/include/exceptions/Unwind.hpp"
+#include "prx/libc/include/exceptions/Runtime.hpp"
 #include "prx/libc/include/specifics/linux/ElfTypes.hpp"
 #include "prx/libc/src/specifics/x86_64/RegisterContext.cpp"
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <algorithm>
-#include <memory>
+#include <array>
+#include <map>
 #include <mutex>
-#include <unordered_map>
 #include <utility>
 #include <vector>
-#endif
-#if defined(__linux__) && defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 35))
-#define LIBC_UNWIND_FIND_OBJECT 1
-#include <dlfcn.h>
-#include <mutex>
-#include <unordered_map>
-#include <utility>
 #endif
 #ifdef __APPLE__
 #include <dlfcn.h>
@@ -48,8 +45,6 @@ _Unwind_Reason_Code CallPersonality(Word personality, _Unwind_Action actions, _U
 struct Lookup { Word pc; const Byte* fde {}; Word text {}; Word data {}; };
 
 #if defined(__linux__) || defined(__APPLE__)
-void SearchHeader(const Byte* header, Lookup& query);
-
 int FindFrame(dl_phdr_info* info, std::size_t, void* argument) {
     auto& query = *static_cast<Lookup*>(argument);
     const Byte* header = nullptr;
@@ -63,15 +58,10 @@ int FindFrame(dl_phdr_info* info, std::size_t, void* argument) {
         if (ph.p_type == PT_LOAD && (ph.p_flags & PF_W)) query.data = start;
     }
     if (!contains || !header || header[0] != 1) return 0;
-    SearchHeader(header, query);
-    return 1;
-}
-
-void SearchHeader(const Byte* header, Lookup& query) {
     const Byte* p = header + 4;
     Encoded(p, header[1], Word(header));
     Word count = Encoded(p, header[2]);
-    if (header[3] == 255) return;
+    if (header[3] == 255) return 1;
     unsigned width = EncodingSize(header[3]);
     const Byte* table = p;
     Word lo = 0, hi = count;
@@ -85,34 +75,8 @@ void SearchHeader(const Byte* header, Lookup& query) {
         p = table + (lo - 1) * width * 2 + width;
         query.fde = reinterpret_cast<const Byte*>(Encoded(p, header[3], Word(header)));
     }
+    return 1;
 }
-
-#ifdef LIBC_UNWIND_FIND_OBJECT
-// _dl_find_object maps a PC to its object without the loader lock; dl_iterate_phdr walked every
-// loaded object under it for each frame, twice per throw, ~5 ms a throw in the AGC driver's queues.
-// The text and data bases come from one walk per object (pointer encodings rarely use them).
-bool FindFrameFast(Lookup& query) {
-    dl_find_object object {};
-    if (_dl_find_object(reinterpret_cast<void*>(query.pc), &object) != 0 || object.dlfo_eh_frame == nullptr) return false;
-    const auto* header = static_cast<const Byte*>(object.dlfo_eh_frame);
-    if (header[0] != 1) return false;
-    static std::mutex mutex;
-    static std::unordered_map<const Byte*, std::pair<Word, Word>> bases;
-    {
-        std::lock_guard lock(mutex);
-        auto found = bases.find(header);
-        if (found == bases.end()) {
-            Lookup probe {query.pc};
-            dl_iterate_phdr(FindFrame, &probe);
-            found = bases.emplace(header, std::pair {probe.text, probe.data}).first;
-        }
-        query.text = found->second.first;
-        query.data = found->second.second;
-    }
-    SearchHeader(header, query);
-    return true;
-}
-#endif
 
 #endif
 
@@ -128,9 +92,9 @@ struct Frame {
     bool signal {};
 };
 
-bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query) {
+bool DecodeRange(Frame& frame, const Lookup& query, const Byte*& p, const char*& augmentation, Byte& lsdaEncoding) {
     if (!query.fde) return false;
-    const Byte* p = query.fde;
+    p = query.fde;
     auto length = Read<std::uint32_t>(p);
     if (!length || length == 0xffffffff) return false;
     frame.end = p + length;
@@ -143,7 +107,7 @@ bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query
     if (Read<std::uint32_t>(c) != 0) return false;
     Byte version = *c++;
     if (version != 1 && version != 3 && version != 4) return false;
-    const char* augmentation = reinterpret_cast<const char*>(c);
+    augmentation = reinterpret_cast<const char*>(c);
     while (*c++) {}
     if (version == 4 && (*c++ != sizeof(Word) || *c++ != 0)) return false;
     frame.codeAlign = Uleb(c);
@@ -154,7 +118,8 @@ bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query
 #else
     if (frame.returnRegister >= 17) return false;
 #endif
-    Byte pointerEncoding = 0, lsdaEncoding = 255;
+    Byte pointerEncoding = 0;
+    lsdaEncoding = 255;
     if (*augmentation == 'z') {
         Word size = Uleb(c);
         const Byte* end = c + size;
@@ -172,6 +137,14 @@ bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query
     frame.cieBegin = c;
     frame.start = Encoded(p, pointerEncoding, query.data, 0, query.text);
     frame.length = Encoded(p, pointerEncoding & 15);
+    return true;
+}
+
+bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query) {
+    const Byte* p;
+    const char* augmentation;
+    Byte lsdaEncoding;
+    if (!DecodeRange(frame, query, p, augmentation, lsdaEncoding)) return false;
     if (query.pc < frame.start || query.pc - frame.start >= frame.length) return false;
     if (*augmentation == 'z') {
         Word size = Uleb(p);
@@ -190,14 +163,15 @@ bool DecodeCandidate(_Unwind_Context& context, Frame& frame, const Lookup& query
 
 #ifdef _WIN32
 using FrameIndex = std::vector<std::pair<Word, const Byte*>>;
+using ImageKey = std::array<Word, 6>;
 
-const FrameIndex& IndexFrames(const Byte* begin, const Byte* end) {
+const FrameIndex& IndexFrames(const ImageKey& key, const Byte* begin, const Byte* end) {
     static std::mutex mutex;
-    static std::unordered_map<const Byte*, std::unique_ptr<FrameIndex>> indexes;
+    static std::map<ImageKey, FrameIndex> indexes;
     std::lock_guard lock(mutex);
-    auto& index = indexes[begin];
-    if (index) return *index;
-    index = std::make_unique<FrameIndex>();
+    const auto [entry, inserted] = indexes.try_emplace(key);
+    auto& index = entry->second;
+    if (!inserted) return index;
     const Byte* p = begin;
     while (end - p >= 8) {
         const Byte* record = p;
@@ -206,26 +180,24 @@ const FrameIndex& IndexFrames(const Byte* begin, const Byte* end) {
         if (length == 0xffffffff || length < 4 || Word(end - p) < length) break;
         const Byte* next = p + length;
         if (Read<std::uint32_t>(p)) {
-            _Unwind_Context scratch {};
             Frame candidate {};
-            const Lookup query {0, record};
-            DecodeCandidate(scratch, candidate, query);
-            if (candidate.length) index->emplace_back(candidate.start, record);
+            const Byte* cursor;
+            const char* augmentation;
+            Byte lsdaEncoding;
+            if (DecodeRange(candidate, Lookup {0, record}, cursor, augmentation, lsdaEncoding))
+                index.emplace_back(candidate.start, record);
         }
         p = next;
     }
-    std::sort(index->begin(), index->end());
-    return *index;
+    std::sort(index.begin(), index.end());
+    return index;
 }
 #endif
 
 bool DecodeFrame(_Unwind_Context& context, Frame& frame) {
     Lookup query {context.registers[16] - !context.signalFrame};
 #if defined(__linux__) || defined(__APPLE__)
-#ifdef LIBC_UNWIND_FIND_OBJECT
-    if (!FindFrameFast(query))
-#endif
-        dl_iterate_phdr(FindFrame, &query);
+    dl_iterate_phdr(FindFrame, &query);
 #ifdef __APPLE__
     if (!query.fde) {
         Dl_info image {};
@@ -253,12 +225,7 @@ bool DecodeFrame(_Unwind_Context& context, Frame& frame) {
     return DecodeCandidate(context, frame, query);
 #else
     void* image = nullptr;
-    if (!RtlPcToFileHeader(reinterpret_cast<void*>(query.pc), &image) || !image) {
-        MEMORY_BASIC_INFORMATION memory{};
-        if (!VirtualQuery(reinterpret_cast<void*>(query.pc), &memory, sizeof(memory)) || memory.Type != MEM_IMAGE)
-            return false;
-        image = memory.AllocationBase;
-    }
+    if (!RtlPcToFileHeader(reinterpret_cast<void*>(query.pc), &image) || !image) return false;
     const auto* base = static_cast<const Byte*>(image);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
@@ -290,7 +257,8 @@ bool DecodeFrame(_Unwind_Context& context, Frame& frame) {
         }
         if (std::memcmp(section.Name, ".ehfram", 8) != 0) continue;
         const Byte* frames = base + section.VirtualAddress;
-        const auto& index = IndexFrames(frames, frames + section.Misc.VirtualSize);
+        const ImageKey key {Word(base), nt->FileHeader.TimeDateStamp, nt->OptionalHeader.CheckSum, nt->OptionalHeader.SizeOfImage, section.VirtualAddress, section.Misc.VirtualSize};
+        const auto& index = IndexFrames(key, frames, frames + section.Misc.VirtualSize);
         auto found = std::upper_bound(index.begin(), index.end(), query.pc, [](Word pc, const std::pair<Word, const Byte*>& entry) { return pc < entry.first; });
         if (found == index.begin()) continue;
         query.fde = std::prev(found)->second;
@@ -538,6 +506,14 @@ _Unwind_Reason_Code APS5_VABI _Unwind_RaiseException_nid_postfix(_Unwind_Excepti
 }
 
 [[noreturn]] void APS5_VABI _Unwind_Resume_nid_postfix(_Unwind_Exception* exception) {
+#if defined(__linux__)
+    if (!LibcException::Native(exception->exception_class) && !exception->private_1) {
+        using Resume = void (*)(_Unwind_Exception*);
+        const auto resume = reinterpret_cast<Resume>(dlsym(RTLD_NEXT, "_Unwind_Resume"));
+        if (!resume) std::abort();
+        resume(exception);
+    }
+#endif
     _Unwind_Context context;
     LibcCaptureRegisters(context.registers);
     if (!LibcUnwind::Step(context)) std::abort();

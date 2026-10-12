@@ -119,6 +119,38 @@ void importSpanTests(const Context& context) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void importWindowTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = 2 * piece;
+    void* block = ::operator new(4 * piece, std::align_val_t{window});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(window);
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    for (std::size_t index = 0; index < 3; ++index) change(guest + index * piece, true);
+    const auto* low = HostImportFor(importing, first + piece - 16, 32);
+    Require(low != nullptr && low->base == first && low->bytes == window, "adjacent ranges inside one window were not imported as one span");
+    const auto lowBuffer = low->buffer;
+    const auto* high = HostImportFor(importing, first + window, piece);
+    Require(high != nullptr && high->base == first + window && high->bytes == piece, "a span crossed the import window");
+    Require(HostImportFor(importing, first + window - 16, 32) == nullptr, "a view crossing the import window was imported");
+    change(guest + 3 * piece, true);
+    const auto* grown = HostImportFor(importing, first + window, window);
+    Require(grown != nullptr && grown->base == first + window && grown->bytes == window, "the next window did not grow into the new range");
+    const auto* kept = HostImportFor(importing, first, 16);
+    Require(kept != nullptr && kept->buffer == lowBuffer, "growth in one window re-imported another");
+    for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, false);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{window});
+}
+
 ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
 }
@@ -714,6 +746,42 @@ void sparseHeapTests(const Context& context, const BdaTestAccess& access) {
     releaseSparse(block, reserved);
 }
 
+void hostWriteWatchExclusionTests() {
+#ifdef _WIN32
+    if (AgcDriver::GuestMemory::WriteWatched()) {
+        std::uintptr_t arena = 0;
+        std::size_t arenaBytes = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&arena, &arenaBytes);
+        bool found = false;
+        for (auto cursor = arena; cursor < arena + arenaBytes;) {
+            MEMORY_BASIC_INFORMATION info{};
+            Require(VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) == sizeof(info), "cannot enumerate arena host holes");
+            if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(cursor, 1)) {
+                Require(!AgcDriver::GuestMemory::Watched(cursor, 1), "an arena host hole was reported as write-watched");
+                Require(AgcDriver::GuestMemory::CollectWritesUncached(cursor, 1) == 0, "an arena host hole returned a write generation");
+                Require(!AgcDriver::GuestMemory::UnchangedSince(cursor, 1, 1), "an arena host hole passed an unchanged proof");
+                const std::array queries{AgcDriver::GuestMemory::UnchangedQuery{cursor, 1, 1}};
+                Require(!AgcDriver::GuestMemory::UnchangedSinceAll(queries), "an arena host hole passed a bulk unchanged proof");
+                found = true;
+                break;
+            }
+            const auto next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+            Require(next > cursor, "arena enumeration did not advance");
+            cursor = next;
+        }
+        Require(found, "write-watched arena contained no host exclusion to test");
+    }
+    std::vector<std::uint8_t> host(64, 0x31);
+    const auto address = reinterpret_cast<std::uintptr_t>(host.data());
+    Require(!AgcDriver::GuestMemory::Watched(address, host.size()), "ordinary host heap memory was reported as write-watched");
+    Require(AgcDriver::GuestMemory::CollectWritesUncached(address, host.size()) == 0, "ordinary host heap memory returned a guest write generation");
+    Require(!AgcDriver::GuestMemory::UnchangedSince(address, host.size(), 1), "ordinary host heap memory was proven unchanged");
+    const std::array queries{AgcDriver::GuestMemory::UnchangedQuery{address, host.size(), 1}};
+    Require(!AgcDriver::GuestMemory::UnchangedSinceAll(queries), "a host heap range passed a bulk unchanged proof");
+    Require(std::all_of(host.begin(), host.end(), [](std::uint8_t value) { return value == 0x31; }), "write-watch eligibility changed host bytes");
+#endif
+}
+
 void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) {
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
@@ -1037,6 +1105,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     importCrossingTests(context, access);
     importSpanTests(context);
+    importWindowTests(context);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();
@@ -1044,6 +1113,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     gpuMappingTests(context);
     stridedOverhangTests(context, access);
     sparseHeapTests(context, access);
+    hostWriteWatchExclusionTests();
     sparseHeapMirrorTests(context, access);
     Require(AddressCopyOverflow({{0x1000, 0x3000, 0x2000, "uncommitted pages"}}, 0x2000).empty(), "copies within the limit were refused");
     const auto copies = AddressCopyOverflow({{0x1000, 0x2000, 0x1000, "not mirrored"}, {0x10000, 0x30000, 0x18000, "uncommitted pages"}}, 0x2000);
