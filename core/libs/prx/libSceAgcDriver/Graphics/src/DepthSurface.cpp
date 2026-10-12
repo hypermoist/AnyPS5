@@ -131,6 +131,17 @@ public:
     std::uint32_t writerLayer = 0;
     std::weak_ptr<StorageTexture> stencilWriter;
     const StorageTexture* stencilSeeded = nullptr;
+    // The tracker generation when the game last bound the surface as a depth target (or its writes
+    // were taken back): memory stored over since, by the CPU or by other GPU work, belongs to a
+    // resource the game placed there after the surface died, so reads at its address are not of it.
+    std::uint64_t boundGeneration = 0;
+
+    bool Overwritten() const {
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto storedOver = [&](std::uint64_t address, std::uint64_t bytes) { return GuestMemory::StoresTracked(address, bytes) && GuestMemory::StoredOver(address, bytes, boundGeneration); };
+        if (storedOver(target.address, DepthSliceBytes(target.extent, d16 ? 2u : 4u))) return true;
+        return target.stencilAddress != 0 && target.stencilAddress != target.address && storedOver(target.stencilAddress, DepthSliceBytes(target.extent, 1u));
+    }
 
     void Transfer(StorageTexture& storage, bool into, std::uint32_t layer, VkImageAspectFlagBits aspect = VK_IMAGE_ASPECT_DEPTH_BIT) {
         const auto& descriptor = storage.Descriptor();
@@ -206,6 +217,7 @@ public:
         stencilWriter.reset();
         stencilSeeded = nullptr;
         if (stencilStorage != nullptr) Transfer(*stencilStorage, false, 0, VK_IMAGE_ASPECT_STENCIL_BIT);
+        if (storage != nullptr || stencilStorage != nullptr) boundGeneration = GuestMemory::TrackerGeneration();
     }
 
     const Context context;
@@ -419,11 +431,13 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         if (cleared) surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
         surface->ApplyFastClear();
         surface->TakeWrites();
+        surface->boundGeneration = GuestMemory::TrackerGeneration();
         return surface->view;
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
     surfaces().back()->clearDepth = target.clearDepth;
     surfaces().back()->clearStencil = target.clearStencil;
+    surfaces().back()->boundGeneration = GuestMemory::TrackerGeneration();
     return surfaces().back()->view;
 }
 
@@ -478,6 +492,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     if (stencil && BytesPerElement(resource.format) != 1u) return nullptr;
     (*found)->ApplyFastClear();
     (*found)->TakeWrites();
+    if ((*found)->Overwritten()) return nullptr;
     const bool cube = resource.dimension == TextureDimension::kCube;
     const bool layered = cube || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray != 0);
     if (stencil || (!layered && !integer)) return (*found)->Sampled(words, resource, components);
@@ -524,6 +539,7 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
         if (surface.seeded == storage.get() && surface.writerLayer == layer && surface.writer.lock() == storage) continue;
         surface.ApplyFastClear();
         surface.TakeWrites();
+        if (surface.Overwritten()) continue;
         surface.Transfer(*storage, true, layer);
         surface.writer = storage;
         surface.seeded = storage.get();
@@ -542,6 +558,7 @@ void SeedStorageFromStencil(const Context& context, const std::shared_ptr<Storag
     if (surface.stencilSeeded == storage.get() && surface.stencilWriter.lock() == storage) return;
     surface.ApplyFastClear();
     surface.TakeWrites();
+    if (surface.Overwritten()) return;
     surface.Transfer(*storage, true, 0, VK_IMAGE_ASPECT_STENCIL_BIT);
     surface.stencilWriter = storage;
     surface.stencilSeeded = storage.get();
@@ -581,17 +598,17 @@ bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resou
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
         return surface->context.device == context.device && (surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address));
     });
-    return found != list.rend() && (*found)->Holds(texture);
+    return found != list.rend() && (*found)->Holds(texture) && !(*found)->Overwritten();
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {
     std::lock_guard lock(surfacesMutex());
-    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.address == address || surface->target.stencilAddress == address; });
+    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return (surface->target.address == address || surface->target.stencilAddress == address) && !surface->Overwritten(); });
 }
 
 bool DepthStencilPlaneAt(std::uint64_t address) {
     std::lock_guard lock(surfacesMutex());
-    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.stencilAddress != 0 && surface->target.stencilAddress == address && surface->target.address != address; });
+    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.stencilAddress != 0 && surface->target.stencilAddress == address && surface->target.address != address && !surface->Overwritten(); });
 }
 
 }

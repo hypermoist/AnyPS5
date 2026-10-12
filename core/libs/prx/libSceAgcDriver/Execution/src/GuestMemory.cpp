@@ -1302,6 +1302,13 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     return tracker.generation;
 }
 
+bool StoresTracked(std::uint64_t address, std::size_t bytes) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    return tracker.watched && bytes != 0 && tracker.covers(address, bytes);
+}
+
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
