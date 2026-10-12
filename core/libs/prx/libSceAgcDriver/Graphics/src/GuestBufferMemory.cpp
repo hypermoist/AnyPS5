@@ -2308,6 +2308,51 @@ void GuestBufferMemory::addCopiedRange(const CopiedRange& range) {
     regions.push_back(std::move(region));
 }
 
+namespace {
+
+// APS5_PROFILE_DRAW: how a range partially overlapping an address space's regions sits against
+// them (the dissolves' shapes), printed every 10 s.
+template <typename Regions>
+void noteDissolveShape(const Regions& base, std::uint64_t begin, std::uint64_t end, const char* site) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::mutex mutex;
+    static std::map<std::string, std::uint64_t> shapes;
+    static std::map<std::string, std::uint64_t> examples;
+    static auto reportedAt = std::chrono::steady_clock::now();
+    const auto first = std::upper_bound(base.begin(), base.end(), begin, [](std::uint64_t value, const auto& region) { return value < region.begin; });
+    const bool startsInside = first != base.begin() && begin < std::prev(first)->end;
+    std::size_t touched = startsInside ? 1 : 0;
+    std::uint64_t gaps = 0;
+    std::uint64_t cursor = startsInside ? std::prev(first)->end : begin;
+    for (auto it = first; it != base.end() && it->begin < end; ++it) {
+        if (it->begin > cursor) gaps += it->begin - cursor;
+        cursor = std::max(cursor, it->end);
+        ++touched;
+    }
+    if (cursor < end) gaps += end - cursor;
+    char key[160];
+    std::snprintf(key, sizeof(key), "%s %s, %s regions, %s", site, startsInside ? "starts inside" : "starts outside", touched <= 1 ? "1" : touched == 2 ? "2" : ">2", gaps == 0 ? "no gap" : gaps <= 4096 ? "gap <=4K" : gaps <= 65536 ? "gap <=64K" : "gap >64K");
+    std::lock_guard lock(mutex);
+    ++shapes[key];
+    if (examples.size() < 12 && !examples.contains(key)) {
+        const auto& near = startsInside ? *std::prev(first) : (first != base.end() ? *first : base.back());
+        char example[200];
+        std::snprintf(example, sizeof(example), "%s: [0x%llx, 0x%llx) vs region [0x%llx, 0x%llx)", key, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(near.begin), static_cast<unsigned long long>(near.end));
+        examples.emplace(example, 0);
+        std::fprintf(stderr, "[dissolve] example %s\n", example);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reportedAt < std::chrono::seconds(10)) return;
+    reportedAt = now;
+    std::string text;
+    for (const auto& [shape, count] : shapes) text += " " + shape + " x" + std::to_string(count) + ";";
+    std::fprintf(stderr, "[dissolve] shapes (10 s, %zu base regions):%s\n", base.size(), text.c_str());
+    shapes.clear();
+}
+
+}
+
 GuestBufferMemory::BaseOverlap GuestBufferMemory::baseOverlap(std::uint64_t begin, std::uint64_t end, const Region** owner) const {
     if (space == nullptr || space->base.empty()) return BaseOverlap::None;
     const auto& base = space->base;
@@ -2368,12 +2413,14 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     switch (baseOverlap(begin, end, &inside)) {
         case BaseOverlap::Inside:
             if (!servesView(*inside, begin)) {
+                noteDissolveShape(space->base, begin, end, "beyond mirror view");
                 dissolveSpace(false);
                 break;
             }
             return;
         case BaseOverlap::Partial:
             Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
+            noteDissolveShape(space->base, begin, end, "descriptor");
             dissolveSpace(false);
             break;
         case BaseOverlap::None:
@@ -2459,6 +2506,7 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
     const Region* owner = nullptr;
     if (baseOverlap(snapshot.address, end, &owner) == BaseOverlap::Partial) {
         Spaces().dissolvedOverlap.fetch_add(1, std::memory_order_relaxed);
+        noteDissolveShape(space->base, snapshot.address, end, "snapshot");
         dissolveSpace(false);
     }
     if (owner == nullptr && regionsSorted) {
