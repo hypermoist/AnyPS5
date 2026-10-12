@@ -87,6 +87,8 @@ extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader) try {
     AgcDriver::RegisterShader(shader);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
+} catch (const std::exception& error) {
+    if (!AgcDriver::DriverDetail::Driver::SkipFailedShaderCall("shader registration", error)) throw;
 }
 
 extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
@@ -127,15 +129,21 @@ extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std:
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
+} catch (const std::exception& error) {
+    if (!AgcDriver::DriverDetail::Driver::SkipFailedShaderCall("shader ABI", error)) throw;
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
+} catch (const std::exception& error) {
+    if (!AgcDriver::DriverDetail::Driver::SkipFailedShaderCall("graphics ABI", error)) throw;
 }
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
+} catch (const std::exception& error) {
+    if (!AgcDriver::DriverDetail::Driver::SkipFailedShaderCall("graphics stages ABI", error)) throw;
 }

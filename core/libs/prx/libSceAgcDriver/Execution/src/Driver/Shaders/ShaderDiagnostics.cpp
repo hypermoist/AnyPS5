@@ -8,6 +8,12 @@
 
 namespace AgcDriver::DriverDetail {
 
+bool Driver::SkipFailedShaderCall(const char* kind, const std::exception& error) {
+    if (!skipFailedWork()) return false;
+    reportSkip(kind, error.what());
+    return true;
+}
+
 bool Driver::skipFailedWork() {
     static const bool skip = std::getenv("APS5_SKIP_FAILED_WORK") != nullptr;
     return skip;

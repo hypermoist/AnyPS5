@@ -142,6 +142,12 @@ private:
     static std::size_t& writeCursor();
     static void dumpPackets(std::span<const std::uint32_t> commands, const std::uint32_t* guest = nullptr);
     static void validate(const Submission& submission, const std::uint32_t* guest = nullptr);
+public:
+    // APS5_SKIP_FAILED_WORK=1 (local debug aid): a shader the guest registers or resolves an ABI for
+    // whose preparation throws is reported and left unprepared instead of failing the guest call.
+    static bool SkipFailedShaderCall(const char* kind, const std::exception& error);
+
+private:
     static bool skipFailedWork();
     static void reportSkip(const char* kind, const std::string& what);
     static bool matchesFillKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute);
