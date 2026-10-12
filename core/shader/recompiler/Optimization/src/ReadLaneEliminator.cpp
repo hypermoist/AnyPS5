@@ -1,5 +1,6 @@
 #include "Optimization/ReadLaneEliminator.hpp"
 #include <algorithm>
+#include <list>
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
@@ -9,18 +10,131 @@
 namespace ShaderRecompiler {
 namespace {
 
+// `write`: what wrote the lane (a WriteLane, or the window load whose stores agree on it), and
+// `scalar` the value the lane holds; `cycle`: the chain came back to a window load whose lane is
+// being resolved (a loop around the spill), which carries what entered it.
 struct ChainResult {
     IrValue* value = nullptr;
     IrValue* write = nullptr;
+    IrValue* scalar = nullptr;
+    bool cycle = false;
 };
+
+ChainResult searchChain(IrValue* value, std::uint32_t lane, std::uint32_t waveSize);
 
 bool isImmediateU32(const IrValue& value) {
     return value.HasImmediate() && value.Type() == IrType::U32;
 }
 
+// A relative-addressing window register (v_movrel) is array storage, not SSA: a spill into one is
+// WriteLane(s, L, LoadVectorWindow k) stored back with StoreVectorWindow k. Lane L of a load of slot
+// k with an immediate index is found at the last store to k before it: in its block, else on every
+// path through its predecessors, which must all give lane L the same value (each path then passes a
+// WriteLane of it, so that value dominates the load). A path that comes back to a block already on
+// the walk without storing k (a loop's back edge) carries what entered that block and agrees with
+// any value. Unknown when a store with a computed index (which may write k) comes first on some
+// path, a path reaches the entry without a store, a store's lane L is not a lane write, or the walk
+// grows past a bound.
+struct WindowLane {
+    IrValue* value = nullptr;
+    bool known = false;
+};
+
+WindowLane windowLaneBefore(const IrBlock* block, std::list<IrValue*>::const_iterator it, std::uint32_t slot, std::uint32_t lane, std::uint32_t waveSize, std::unordered_set<const IrBlock*>& path, std::size_t& budget) {
+    while (it != block->Instructions().begin()) {
+        IrValue* inst = *--it;
+        if (inst->Opcode() != IrOpcode::StoreVectorWindow) {
+            continue;
+        }
+        IrValue* stored = inst->Argument(0)->Resolve();
+        if (!isImmediateU32(*stored) || budget == 0u) {
+            return {};
+        }
+        if (stored->ImmediateU32() != slot) {
+            continue;
+        }
+        --budget;
+        const ChainResult chain = searchChain(inst->Argument(1), lane, waveSize);
+        if (chain.cycle) {
+            return {nullptr, true};
+        }
+        if (chain.write == nullptr) {
+            return {};
+        }
+        return {chain.scalar, true};
+    }
+    if (block->Predecessors().empty()) {
+        return {};
+    }
+    WindowLane reaching {nullptr, true};
+    for (const IrBlock* predecessor : block->Predecessors()) {
+        if (path.contains(predecessor)) {
+            continue;
+        }
+        if (budget == 0u) {
+            return {};
+        }
+        --budget;
+        path.insert(predecessor);
+        const WindowLane found = windowLaneBefore(predecessor, predecessor->Instructions().end(), slot, lane, waveSize, path, budget);
+        path.erase(predecessor);
+        if (!found.known) {
+            return {};
+        }
+        if (found.value == nullptr) {
+            continue;
+        }
+        if (reaching.value != nullptr && found.value->Resolve() != reaching.value->Resolve()) {
+            return {};
+        }
+        reaching.value = found.value;
+    }
+    return reaching;
+}
+
+// One walk per top-level read: the loads being resolved and the bound are shared by the nested
+// walks a store's own window loads start.
+struct WindowWalk {
+    std::unordered_set<IrValue*> resolving;
+    std::size_t budget = 0;
+    std::uint32_t depth = 0;
+};
+
+thread_local WindowWalk windowWalk;
+
+WindowLane windowLane(IrValue* load, std::uint32_t lane, std::uint32_t waveSize) {
+    IrValue* index = load->Argument(0)->Resolve();
+    if (!isImmediateU32(*index) || load->Parent() == nullptr) {
+        return {};
+    }
+    auto& walk = windowWalk;
+    if (walk.depth == 0u) {
+        walk.resolving.clear();
+        walk.budget = 1024u;
+    }
+    if (!walk.resolving.insert(load).second) {
+        return {nullptr, true};
+    }
+    ++walk.depth;
+    const IrBlock* block = load->Parent();
+    const auto& instructions = block->Instructions();
+    std::unordered_set<const IrBlock*> path {block};
+    const WindowLane found = windowLaneBefore(block, std::find(instructions.begin(), instructions.end(), load), index->ImmediateU32(), lane, waveSize, path, walk.budget);
+    --walk.depth;
+    walk.resolving.erase(load);
+    return found;
+}
+
 ChainResult searchChain(IrValue* value, std::uint32_t lane, std::uint32_t waveSize) {
     for (;;) {
         value = value->Resolve();
+        if (value->Opcode() == IrOpcode::LoadVectorWindow) {
+            const WindowLane found = windowLane(value, lane, waveSize);
+            if (found.known && found.value != nullptr) {
+                return ChainResult {value, value, found.value};
+            }
+            return ChainResult {value, nullptr, nullptr, found.known};
+        }
         if (value->Opcode() != IrOpcode::WriteLane) {
             return ChainResult {value, nullptr};
         }
@@ -29,7 +143,7 @@ ChainResult searchChain(IrValue* value, std::uint32_t lane, std::uint32_t waveSi
             return ChainResult {value, nullptr};
         }
         if (selector->ImmediateU32() % waveSize == lane) {
-            return ChainResult {value, value};
+            return ChainResult {value, value, value->Argument(0)};
         }
         value = value->Argument(2);
     }
@@ -65,7 +179,7 @@ using PhiMap = std::unordered_map<IrValue*, IrValue*>;
 IrValue* getRealValue(IrProgram& program, PhiMap& phiMap, IrValue* source, std::uint32_t lane, std::uint32_t waveSize) {
     const ChainResult chain = searchChain(source, lane, waveSize);
     if (chain.write != nullptr) {
-        return chain.write->Argument(0);
+        return chain.scalar;
     }
 
     IrValue* inst = chain.value;
@@ -204,7 +318,7 @@ ReadLaneEliminationStats ReadLaneEliminator::Eliminate(IrProgram& program, std::
             const std::uint32_t lane = selector->ImmediateU32() % waveSize;
             const ChainResult chain = searchChain(inst->Argument(0), lane, waveSize);
             if (chain.write != nullptr) {
-                inst->ReplaceUsesWith(chain.write->Argument(0), true);
+                inst->ReplaceUsesWith(chain.scalar, true);
                 stats.rewrittenReads++;
                 continue;
             }
