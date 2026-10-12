@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -11,6 +12,7 @@ namespace AgcDriver::DriverDetail {
 bool Driver::SkipFailedShaderCall(const char* kind, const std::exception& error) {
     if (!skipFailedWork()) return false;
     reportSkip(kind, error.what());
+    ShaderPreparationTransaction::ForgiveNestedFailure();
     return true;
 }
 
