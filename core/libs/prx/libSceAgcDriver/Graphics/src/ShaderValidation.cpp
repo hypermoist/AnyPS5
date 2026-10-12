@@ -112,7 +112,8 @@ struct Module {
             return;
         }
         if (value == spv::BuiltInClipDistance && !input && (vertex || stage == Stage::TessellationEvaluation)) {
-            Require(!clipDistance && Signature(type) == "f32[1]", "invalid or duplicate clip distance output");
+            const auto signature = Signature(type);
+            Require(!clipDistance && signature.starts_with("f32[") && signature.size() == 6 && signature[4] >= '1' && signature[4] <= '8', "invalid or duplicate clip or cull distance output");
             clipDistance = true;
             return;
         }

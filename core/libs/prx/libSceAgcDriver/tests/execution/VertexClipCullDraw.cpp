@@ -212,9 +212,11 @@ int main(int argc, char** argv) {
             Check(step, colors);
         }
         std::puts(noKey ? "vertex clip and cull distance draws passed without the draw key" : "vertex clip and cull distance draws passed");
+        AgcDriverShutdown_nid_postfix();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
+        AgcDriverShutdown_nid_postfix();
         return 1;
     }
 }

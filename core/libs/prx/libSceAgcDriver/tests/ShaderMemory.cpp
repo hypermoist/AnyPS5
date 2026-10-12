@@ -1709,7 +1709,7 @@ std::string encodeBase64(const std::vector<std::uint8_t>& bytes) {
     return text;
 }
 
-void verifyVertexInfoVersion12() {
+void verifyVertexInfoVersion17() {
     using namespace ShaderRecompiler;
     const std::array<std::uint32_t, 1> code{0xbf810000u};
     const RequestSerializer serializer;
@@ -1725,14 +1725,14 @@ void verifyVertexInfoVersion12() {
     require(plain.size() == flagged.size(), "PA_CL_VS_OUT_CNTL changed the request size");
     std::size_t offset = 0;
     while (offset < plain.size() && plain[offset] == flagged[offset]) ++offset;
-    require(offset + 4u <= plain.size() && flagged[offset] == 0xefu && flagged[offset + 1u] == 0xcdu && flagged[offset + 2u] == 0xabu && flagged[offset + 3u] == 0x89u, "PA_CL_VS_OUT_CNTL is not the four bytes the version 13 vertex info adds");
+    require(offset + 4u <= plain.size() && flagged[offset] == 0xefu && flagged[offset + 1u] == 0xcdu && flagged[offset + 2u] == 0xabu && flagged[offset + 3u] == 0x89u, "PA_CL_VS_OUT_CNTL is not the four bytes the version 18 vertex info adds");
     require(std::equal(plain.begin() + offset + 4u, plain.end(), flagged.begin() + offset + 4u), "PA_CL_VS_OUT_CNTL moved the fields after it");
     auto legacy = plain;
     legacy.erase(legacy.begin() + offset, legacy.begin() + offset + 4u);
-    legacy[4] = 12u;
+    legacy[4] = 17u;
     const auto replay = serializer.Deserialize(encodeBase64(legacy));
-    require(replay.request.context.vertex.has_value() && replay.request.context.vertex->paClVsOutCntl == 0u, "a version 12 vertex info read a PA_CL_VS_OUT_CNTL word");
-    require(serializer.Serialize(replay.request) == unmarked, "a version 12 vertex info misread the fields after it");
+    require(replay.request.context.vertex.has_value() && replay.request.context.vertex->paClVsOutCntl == 0u, "a version 17 vertex info read a PA_CL_VS_OUT_CNTL word");
+    require(serializer.Serialize(replay.request) == unmarked, "a version 17 vertex info misread the fields after it");
 }
 
 void verifyLegacyPixelRequests() {
@@ -3197,7 +3197,7 @@ int main(int argc, char** argv) {
         verifyMeshConfiguration();
         verifyPixelInputs();
         verifyPixelRequestSerialization();
-        verifyVertexInfoVersion12();
+        verifyVertexInfoVersion17();
         verifyPositionExportComponents();
         verifyLegacyPixelRequests();
         verifyPixelExportReplay();
