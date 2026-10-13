@@ -532,9 +532,10 @@ std::uint64_t storageBudget(const Context& context) {
         const char* text = std::getenv("APS5_STORAGE_CACHE_MIB");
         return text != nullptr ? std::strtoull(text, nullptr, 10) << 20u : 0u;
     }();
-    if (storageForced != 0) return storageForced;
     const auto forced = forcedCacheBudget();
-    return forced != 0 ? forced : TextureCacheBudget(context.memory);
+    const auto budget = storageForced != 0 ? storageForced : forced != 0 ? forced : TextureCacheBudget(context.memory);
+    // After out-of-memory failures the cache gives back up to half its budget (see DeviceMemoryPressure).
+    return budget - std::min(DeviceMemoryPressure(), budget / 2u);
 }
 
 std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {

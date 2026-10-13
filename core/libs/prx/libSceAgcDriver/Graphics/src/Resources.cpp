@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <cstdio>
+#include <atomic>
 #include <algorithm>
 #include <exception>
 
@@ -151,6 +153,26 @@ void Buffer::Invalidate() {
     Check(context.Function<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges")(context.device, 1, &range), "vkInvalidateMappedMemoryRanges");
 }
 
+namespace {
+
+// A host-visible type outside device-local memory (on NVIDIA the first host-visible type can be
+// the device-local BAR window, which is out of memory too).
+std::uint32_t hostMemoryType(const Context& context, std::uint32_t mask) {
+    for (std::uint32_t i = 0; i < context.memory.memoryTypeCount; ++i) {
+        const auto flags = context.memory.memoryTypes[i].propertyFlags;
+        if ((mask & (1u << i)) != 0 && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) return i;
+    }
+    return context.MemoryType(mask, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+}
+
+void noteHostFallback(VkDeviceSize bytes) {
+    static std::atomic<std::uint64_t> count{0};
+    const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || n % 256 == 0) std::fprintf(stderr, "[gpu] device buffer of %llu KiB placed in host memory: the device is out of memory (%llu so far)\n", static_cast<unsigned long long>(bytes >> 10u), static_cast<unsigned long long>(n));
+}
+
+}
+
 DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
     Require(size != 0, "zero-sized device buffer");
     cache = GetBufferPool(context);
@@ -182,7 +204,15 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.allocationSize = ClassAllocationBytes(requirements, capacity);
         allocationBytes = allocation.allocationSize;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+        memory = cache->TryAllocateMemory(allocation, "vkAllocateMemory device buffer");
+        if (memory == VK_NULL_HANDLE) {
+            // The device is out of memory even after reclaiming: the buffer lives in host memory the
+            // device reads over the bus (slower, but the work runs). It is freed instead of pooled.
+            allocation.memoryTypeIndex = hostMemoryType(context, requirements.memoryTypeBits);
+            memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer in host memory");
+            hostFallback = true;
+            noteHostFallback(allocation.allocationSize);
+        }
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();
@@ -195,7 +225,7 @@ DeviceBuffer::~DeviceBuffer() {
 }
 
 void DeviceBuffer::release() noexcept {
-    if (buffer && memory && cache) {
+    if (buffer && memory && cache && !hostFallback) {
         cache->Put({buffer, memory, nullptr, 0, allocationBytes, capacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false, size});
         return;
     }

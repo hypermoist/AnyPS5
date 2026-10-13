@@ -32,8 +32,9 @@ namespace {
 std::atomic<DeviceMemoryReclaimer> reclaimer{nullptr};
 std::atomic<std::uint64_t> pressure{0};
 std::atomic<std::uint64_t> reclaims{0};
+std::atomic<std::int64_t> lastStep{0};
 
-// Each failure keeps another 256 MiB (at least the failed size) free, up to 4 GiB.
+// Each failure (at most one a second) keeps another 256 MiB (at least the failed size) free, up to 4 GiB.
 constexpr std::uint64_t PressureStep = 256ull << 20u;
 constexpr std::uint64_t PressureLimit = 4096ull << 20u;
 
@@ -45,8 +46,13 @@ void SetDeviceMemoryReclaimer(DeviceMemoryReclaimer function) {
 
 std::uint64_t ReclaimDeviceMemory(std::uint64_t wanted) {
     const auto step = std::max(PressureStep, wanted);
-    auto current = pressure.load(std::memory_order_relaxed);
-    while (current < PressureLimit && !pressure.compare_exchange_weak(current, std::min(PressureLimit, current + step), std::memory_order_relaxed)) {}
+    // One step per second: a burst of failures within one shortage counts once.
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastStep.load(std::memory_order_relaxed);
+    if ((last == 0 || now - last >= 1000) && lastStep.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        auto current = pressure.load(std::memory_order_relaxed);
+        while (current < PressureLimit && !pressure.compare_exchange_weak(current, std::min(PressureLimit, current + step), std::memory_order_relaxed)) {}
+    }
     const auto function = reclaimer.load(std::memory_order_acquire);
     const auto freed = function != nullptr ? function(step) : 0u;
     const auto count = reclaims.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -84,6 +90,14 @@ BufferPool::~BufferPool() {
 }
 
 VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation) {
+    return allocateMemoryOrThrow(allocation, operation, true);
+}
+
+VkDeviceMemory BufferPool::TryAllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation) {
+    return allocateMemoryOrThrow(allocation, operation, false);
+}
+
+VkDeviceMemory BufferPool::allocateMemoryOrThrow(const VkMemoryAllocateInfo& allocation, const char* operation, bool throwOnOutOfMemory) {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     auto result = allocateMemory(device, &allocation, nullptr, &memory);
     const auto initialResult = result;
@@ -110,6 +124,7 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         if (attempts >= 2) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<int>(initialResult), attempts);
         return memory;
     }
+    if (!throwOnOutOfMemory && result == VK_ERROR_OUT_OF_DEVICE_MEMORY) return VK_NULL_HANDLE;
     char details[512];
     std::snprintf(details, sizeof(details), "%s: allocation=%llu memoryType=%u reclaimed=%llu initialResult=%d attempts=%u", operation, static_cast<unsigned long long>(allocation.allocationSize), allocation.memoryTypeIndex, static_cast<unsigned long long>(reclaimed), static_cast<int>(initialResult), attempts);
     Check(result, details);

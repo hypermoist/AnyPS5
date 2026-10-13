@@ -3340,9 +3340,10 @@ void deviceMemoryPressureTests() {
     Require(DeviceMemoryPressure() == pressure + 256 * MiB, "an out-of-memory failure does not keep 256 MiB more free");
     Require(SampledTextureBudget(memory, &reported, 5 * GiB) == before - 256 * MiB, "the sampled texture budget does not shrink by the pressure");
     ReclaimDeviceMemory(512 * MiB);
-    Require(reclaimRequested == 512 * MiB && DeviceMemoryPressure() == pressure + 768 * MiB, "a failure larger than 256 MiB does not count its own size");
-    for (int failure = 0; failure < 32; ++failure) ReclaimDeviceMemory(512 * MiB);
-    Require(DeviceMemoryPressure() == 4 * GiB, "the pressure is not held at 4 GiB");
+    Require(reclaimRequested == 512 * MiB && DeviceMemoryPressure() == pressure + 256 * MiB, "a second failure within a second raised the pressure again");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ReclaimDeviceMemory(512 * MiB);
+    Require(DeviceMemoryPressure() == pressure + 768 * MiB, "a failure larger than 256 MiB a second later does not count its own size");
     SetDeviceMemoryReclaimer(nullptr);
     Require(ReclaimDeviceMemory(16 * MiB) == 0, "without a reclaimer something was reported freed");
 }

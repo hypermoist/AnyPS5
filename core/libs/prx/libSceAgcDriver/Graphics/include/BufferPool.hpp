@@ -77,6 +77,9 @@ public:
     static std::size_t Capacity(std::size_t bytes, VkMemoryPropertyFlags properties);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation);
+    // As AllocateMemory, but returns VK_NULL_HANDLE when the device is still out of memory after the
+    // pool trim and the reclaimer.
+    VkDeviceMemory TryAllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation);
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void Put(const BufferAllocation& allocation) noexcept;
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
@@ -147,6 +150,7 @@ private:
     PFN_vkDestroyBuffer destroyBuffer;
     PFN_vkFreeMemory freeMemory;
     PFN_vkAllocateMemory allocateMemory;
+    VkDeviceMemory allocateMemoryOrThrow(const VkMemoryAllocateInfo& allocation, const char* operation, bool throwOnOutOfMemory);
     PFN_vkMapMemory mapMemory;
     std::mutex mutex;
     // Not `small`/`large`: <rpcndr.h> (via <windows.h>) defines `small` as a macro.
