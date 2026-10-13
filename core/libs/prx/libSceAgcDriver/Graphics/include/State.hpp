@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <vector>
 #include <array>
@@ -58,6 +59,7 @@ struct ColorTarget {
     std::uint64_t arrayAddress = 0;
     std::uint32_t arrayLastSlice = 0;
     std::uint32_t arraySlice = 0;
+    std::uint32_t layers = 1;
     std::uint32_t exportIndex = 0;
     bool uintExport = false;
     std::uint32_t pipeBankXor = 0;
@@ -102,6 +104,8 @@ struct State {
     bool rectList = false;
     bool dualSourceBlend = false;
     VkExtent2D renderExtent;
+    std::uint32_t renderLayers = 1;
+    std::uint32_t layerExports = 0;
     VkPrimitiveTopology topology;
     bool primitiveRestart = false;
     VkViewport viewport;
@@ -119,7 +123,12 @@ struct State {
     std::uint32_t paClVsOutCntl = 0;
     std::array<std::uint8_t, 8> sampleLocations{};
     bool customSampleLocations = false;
+    std::uint32_t paClVsOutCntl = 0;
 };
+
+// PA_CL_VS_OUT_CNTL bits that place position exports (clip and cull distances, the misc and the two
+// distance vectors); a vertex program's artifact depends on them.
+inline constexpr std::uint32_t PositionExportLayoutBits = 0xffffu | (1u << 21u) | (1u << 22u) | (1u << 23u);
 
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
 State DecodeState(const QueueState& queue, bool vertexWorkgroup = false);
@@ -129,6 +138,7 @@ std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& 
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
+GuestTextureResource SurfaceForTarget(const ColorTarget& color);
 
 struct ColorMetadataPass {
     enum class Mode { EliminateFastClear, DccDecompress, Resolve };
