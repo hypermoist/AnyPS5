@@ -1,6 +1,7 @@
 #include "Optimization/ReadLaneEliminator.hpp"
 #include <algorithm>
 #include <list>
+#include <optional>
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
@@ -290,6 +291,8 @@ IrValue* getRealValue(IrProgram& program, PhiMap& phiMap, IrValue* source, std::
 // per-lane exec selects and loop phis. Lane `lane` of such a vector can only hold what some WriteLane
 // stored to that lane, so the read is collected as the set of those stored values; operands that
 // enter through a phi without any lane write (the spill slot's initial contents) are never read back.
+// The one stored value replaces the read only where it dominates it: written on some paths only, it
+// is not defined on the others, and the read is left for the resource tracker to evaluate.
 struct LaneValues {
     std::unordered_set<IrValue*> values;
     std::unordered_set<IrValue*> visited;
@@ -346,6 +349,54 @@ bool dependsOn(IrValue* value, IrValue* target) {
     return false;
 }
 
+// Block dominators over the program's blocks, for the rewrites that pick a value written on some
+// paths only: the value must still dominate the read it replaces.
+class BlockDominators {
+public:
+    explicit BlockDominators(IrProgram& program) : order(program.BlockOrder()) {
+        for (std::size_t index = 0; index < order.size(); index++) indices.emplace(order[index], index);
+        sets.assign(order.size(), std::vector<bool>(order.size(), true));
+        if (!order.empty()) {
+            sets[0].assign(order.size(), false);
+            sets[0][0] = true;
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (std::size_t index = 1; index < order.size(); index++) {
+                std::vector<bool> next(order.size(), true);
+                for (const IrBlock* predecessor : order[index]->Predecessors()) {
+                    const auto& from = sets[indices.at(predecessor)];
+                    for (std::size_t candidate = 0; candidate < next.size(); candidate++) next[candidate] = next[candidate] && from[candidate];
+                }
+                next[index] = true;
+                if (next != sets[index]) {
+                    sets[index] = std::move(next);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    bool Dominates(const IrValue* definition, const IrValue* use) const {
+        const IrBlock* defined = definition->Parent();
+        const IrBlock* used = use->Parent();
+        if (defined == nullptr || used == nullptr) return defined == nullptr;
+        if (defined == used) {
+            for (const IrValue* inst : used->Instructions()) {
+                if (inst == definition) return true;
+                if (inst == use) return false;
+            }
+            return false;
+        }
+        return sets[indices.at(used)][indices.at(defined)];
+    }
+
+private:
+    std::vector<IrBlock*>& order;
+    std::unordered_map<const IrBlock*, std::size_t> indices;
+    std::vector<std::vector<bool>> sets;
+};
+
 // A scalar phi whose operands are all `read` itself or members of `candidates` adds nothing new.
 IrValue* uniqueLaneValue(IrValue* read, std::unordered_set<IrValue*> candidates) {
     std::unordered_set<IrValue*> expanded;
@@ -385,6 +436,7 @@ ReadLaneEliminationStats ReadLaneEliminator::Eliminate(IrProgram& program, std::
         ~FlowScope() { windowFlows = nullptr; }
     } flowScope;
     windowFlows = &flows;
+    std::optional<BlockDominators> dominators;
 
     for (const auto& block : program.Blocks()) {
         for (IrValue* inst : block->Instructions()) {
@@ -407,7 +459,9 @@ ReadLaneEliminationStats ReadLaneEliminator::Eliminate(IrProgram& program, std::
                 LaneValues values;
                 collectLaneValues(inst->Argument(0), lane, waveSize, false, values);
                 if (values.failed || values.values.empty()) continue;
-                if (IrValue* unique = uniqueLaneValue(inst, values.values); unique != nullptr && !dependsOn(unique, inst)) {
+                IrValue* unique = uniqueLaneValue(inst, values.values);
+                if (unique != nullptr && unique->Resolve()->Parent() != nullptr && !dominators) dominators.emplace(program);
+                if (unique != nullptr && !dependsOn(unique, inst) && (unique->Resolve()->Parent() == nullptr || dominators->Dominates(unique->Resolve(), inst))) {
                     inst->ReplaceUsesWith(unique, true);
                     stats.rewrittenReads++;
                 }
