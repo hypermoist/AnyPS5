@@ -193,10 +193,13 @@ void StoreBackCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, std:
     RunPlane(device, raise, ScaleDepthCode, output, bits(0.375f), "third depth dispatch, its program's second");
     RequireRow(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}), "depth test against the third dispatch's depth");
 
-    // Fork: storage access to the stencil plane stays refused (PPSA08427's hub load stalls on it).
     const auto add = PlaneProgram(device, AddStencilCode, output, stencil, Format8Uint, 0.0f);
-    ExpectRefusal([&] { device.Dispatch(add, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(AddStencilCode.data())); }, "stencil plane is not implemented", "a storage view of the stencil plane");
-    RequireRow(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}), "depth test after the refused stencil dispatch");
+    RunPlane(device, add, AddStencilCode, output, 5u, "first stencil dispatch");
+    RequireRow(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = StencilEqual(9u)}), "stencil test against the first dispatch's stencil");
+    RunPlane(device, add, AddStencilCode, output, 9u, "second stencil dispatch");
+    RequireRow(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = StencilEqual(13u)}), "stencil test against the second dispatch's stencil");
+    Require(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = StencilEqual(5u)}) == Covered - Threads, "a stencil dispatch changed stencil values it did not store");
+    RequireRow(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}), "depth test after the stencil dispatches");
 
     AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(depth), Width * Height * sizeof(float), nullptr, "test");
     device.WaitIdle();
@@ -204,6 +207,11 @@ void StoreBackCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, std:
         float texel = 0.0f;
         std::memcpy(&texel, depth + x * sizeof(float), sizeof(texel));
         Require(texel == (x < Threads ? 0.5625f : 0.5f), "guest depth texel " + std::to_string(x) + " is " + std::to_string(texel) + " after the flush");
+    }
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(stencil), Width * Height, nullptr, "test");
+    device.WaitIdle();
+    for (std::uint32_t x = 0; x < Width; ++x) {
+        Require(stencil[x] == (x < Threads ? 13u : 5u), "guest stencil texel " + std::to_string(x) + " is " + std::to_string(stencil[x]) + " after the flush");
     }
 }
 

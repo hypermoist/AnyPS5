@@ -127,10 +127,6 @@ public:
         if (const auto found = textures.find(key); found != textures.end()) return found->second;
         Require(target.samples == 1, "sampling a multisampled depth surface is not implemented");
         const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
-        // PPSA08427's hub load runs a compute pass over the stencil plane whose results, served from
-        // the plane copy, drive later work into unaligned BDA faults and invalid CMASK codes until the
-        // load stalls; the stencil plane stays refused as before upstream's plane copies.
-        Require(!stencil, "storage access to a depth surface's stencil plane is not implemented");
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
         const auto format = ResolveTextureFormat(resource.format);
