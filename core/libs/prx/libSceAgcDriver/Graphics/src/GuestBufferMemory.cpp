@@ -147,6 +147,11 @@ struct ImportFailure {
     std::uint64_t base;
     std::uint64_t bytes;
     GuestAllocations::Mapped ranges;
+    // Nonzero when some page was not accessible yet (a heap committed after it was mapped): the
+    // registry generation of the refusal. Such a base is retried once the registry changed (a
+    // commit or protection change bumps it), so a range checked mid-commit is not copied per use
+    // for good.
+    std::uint64_t inaccessibleAt = 0;
 };
 
 // Imports persist across draws, keyed by allocation base, and are dropped when their allocation leaves
@@ -686,7 +691,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return nullptr;
     if (const auto failed = state.failed.find(base); failed != state.failed.end()) {
-        if (sameRun(failed->second, run)) return nullptr;
+        if (sameRun(failed->second, run) && (failed->second.inaccessibleAt == 0 || failed->second.inaccessibleAt == GuestAllocations::GuestAllocationsGeneration_nid_postfix())) return nullptr;
         state.failed.erase(failed);
     }
     // Pinned imports count against the driver's system memory budget; past it ordinary host
@@ -720,7 +725,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-            state.failed.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
+            state.failed.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end()), GuestAllocations::GuestAllocationsGeneration_nid_postfix()});
             return nullptr;
         }
         const auto protection = info.Protect & 0xffu;
@@ -751,7 +756,9 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
 #else
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) {
-        state.failed.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end())});
+        state.failed.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(entry.ranges.begin(), entry.ranges.end()), GuestAllocations::GuestAllocationsGeneration_nid_postfix()});
+        static std::uint64_t refusals = 0;
+        if (++refusals <= 16) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx deferred: not every page is accessible yet\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
         return nullptr;
     }
 #endif
