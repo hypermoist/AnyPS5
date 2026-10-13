@@ -193,13 +193,10 @@ void StoreBackCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, std:
     RunPlane(device, raise, ScaleDepthCode, output, bits(0.375f), "third depth dispatch, its program's second");
     RequireRow(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}), "depth test against the third dispatch's depth");
 
+    // Fork: storage access to the stencil plane stays refused (PPSA08427's hub load stalls on it).
     const auto add = PlaneProgram(device, AddStencilCode, output, stencil, Format8Uint, 0.0f);
-    RunPlane(device, add, AddStencilCode, output, 5u, "first stencil dispatch");
-    RequireRow(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = StencilEqual(9u)}), "stencil test against the first dispatch's stencil");
-    RunPlane(device, add, AddStencilCode, output, 9u, "second stencil dispatch");
-    RequireRow(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = StencilEqual(13u)}), "stencil test against the second dispatch's stencil");
-    Require(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = StencilEqual(5u)}) == Covered - Threads, "a stencil dispatch changed stencil values it did not store");
-    RequireRow(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}), "depth test after the stencil dispatches");
+    ExpectRefusal([&] { device.Dispatch(add, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(AddStencilCode.data())); }, "stencil plane is not implemented", "a storage view of the stencil plane");
+    RequireRow(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}), "depth test after the refused stencil dispatch");
 
     AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(depth), Width * Height * sizeof(float), nullptr, "test");
     device.WaitIdle();
@@ -207,11 +204,6 @@ void StoreBackCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, std:
         float texel = 0.0f;
         std::memcpy(&texel, depth + x * sizeof(float), sizeof(texel));
         Require(texel == (x < Threads ? 0.5625f : 0.5f), "guest depth texel " + std::to_string(x) + " is " + std::to_string(texel) + " after the flush");
-    }
-    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(stencil), Width * Height, nullptr, "test");
-    device.WaitIdle();
-    for (std::uint32_t x = 0; x < Width; ++x) {
-        Require(stencil[x] == (x < Threads ? 13u : 5u), "guest stencil texel " + std::to_string(x) + " is " + std::to_string(stencil[x]) + " after the flush");
     }
 }
 
@@ -221,7 +213,17 @@ void ArrayViewCase(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     userData[14] = std::bit_cast<std::uint32_t>(1.0f / 64.0f);
     const auto program = Compile(device, StoreLayerCode, userData);
-    ExpectRefusal([&] { device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(StoreLayerCode.data())); }, "storage image access to depth/stencil surface", "a one-layer 2D array storage view of the depth plane");
+    // A one-layer array view is the plane itself (PPSA08427 binds its depth so): the store reaches it.
+    device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(StoreLayerCode.data()));
+    device.WaitIdle();
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(block), Width * Height * sizeof(float), nullptr, "test");
+    device.WaitIdle();
+    for (std::uint32_t x = 0; x < Width; ++x) {
+        float texel = 0.0f;
+        std::memcpy(&texel, block + x * sizeof(float), sizeof(texel));
+        const float expected = x < Threads ? static_cast<float>(x) / 64.0f : 0.5f;
+        Require(texel == expected, "a one-layer 2D array storage view of the depth plane: guest depth texel " + std::to_string(x) + " is " + std::to_string(texel) + ", expected " + std::to_string(expected));
+    }
 }
 
 void MultisampledCase(AgcDriver::VulkanDevice& device, const Shaders& compiled, std::uint8_t* block) {

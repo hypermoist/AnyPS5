@@ -127,6 +127,10 @@ public:
         if (const auto found = textures.find(key); found != textures.end()) return found->second;
         Require(target.samples == 1, "sampling a multisampled depth surface is not implemented");
         const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
+        // PPSA08427's hub load runs a compute pass over the stencil plane whose results, served from
+        // the plane copy, drive later work into unaligned BDA faults and invalid CMASK codes until the
+        // load stalls; the stencil plane stays refused as before upstream's plane copies.
+        Require(!stencil, "storage access to a depth surface's stencil plane is not implemented");
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
         const auto format = ResolveTextureFormat(resource.format);
@@ -174,9 +178,11 @@ public:
         const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
         const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
         if (ResolveTextureFormat(resource.format) != expected && !depthBits) return nullptr;
-        if (resource.dimension != TextureDimension::k2D) {
+        // A one-layer array view is the plane itself: the copies address layer 0.
+        const bool singleLayer = resource.dimension == TextureDimension::k2D || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray == 0);
+        if (!singleLayer) {
             char text[256];
-            std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth/stencil surface 0x%llx is not implemented (storage=%ux%u guest format=%u mip=%u dimension=%d tile=%d)", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, mip, static_cast<int>(resource.dimension), static_cast<int>(resource.tileMode));
+            std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth/stencil surface 0x%llx is not implemented (storage=%ux%u guest format=%u mip=%u dimension=%d last layer=%u tile=%d)", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, mip, static_cast<int>(resource.dimension), resource.depthOrLastArray, static_cast<int>(resource.tileMode));
             throw std::runtime_error(text);
         }
         Require(target.samples == 1, "storage image access to a multisampled depth surface is not implemented");
