@@ -62,7 +62,7 @@ void RemoveFree(Arena& arena, std::map<std::uintptr_t, Chunk>::iterator chunk) {
 void* Allocate(Arena* arena, std::size_t size, std::size_t alignment) {
     if (!arena) return nullptr;
     alignment = std::max<std::size_t>(alignment, MinimumAlignment);
-    const auto needed = AlignUp(std::max<std::size_t>(size, 1), Granule);
+    const auto needed = AlignUp(std::max<std::size_t>(size, 1), MinimumAlignment);
     if (needed < size || needed > std::numeric_limits<std::uintptr_t>::max() - alignment) {
         Error(12);
         return nullptr;
@@ -216,7 +216,7 @@ void* APS5_VABI sceLibcMspaceRealloc_nid_postfix(void* handle, void* pointer, st
     std::map<std::uintptr_t, Chunk>::iterator chunk;
     if (!FindUsed(arena, pointer, chunk)) return nullptr;
     if (!size) { Release(*arena, chunk); return nullptr; }
-    const auto needed = AlignUp(size, Granule);
+    const auto needed = AlignUp(size, MinimumAlignment);
     if (needed < size) { Error(12); return nullptr; }
     const auto start = chunk->first;
     const auto capacity = chunk->second.end - start;

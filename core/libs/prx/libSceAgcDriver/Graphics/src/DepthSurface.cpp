@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -15,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -30,19 +32,19 @@ Recorder* RecorderFor(const Context& context) {
 
 class DepthSurface {
 public:
-    DepthSurface(const Context& context, const DepthTarget& target) : context(context), target(target) {
+    DepthSurface(const Context& context, const DepthTarget& target) : context(context), target(target), hostFormat(HostDepthFormat(context, target.format)) {
         this->context.bufferPool.reset();
         VkFormatProperties properties{};
-        context.formatProperties(context.physical, target.format, &properties);
-        Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0, "depth/stencil format " + std::to_string(target.format) + " cannot be an attachment on this device");
-        Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0, "depth/stencil format " + std::to_string(target.format) + " cannot be sampled on this device");
+        context.formatProperties(context.physical, hostFormat, &properties);
+        Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0, "depth/stencil format " + std::to_string(hostFormat) + " cannot be an attachment on this device");
+        Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0, "depth/stencil format " + std::to_string(hostFormat) + " cannot be sampled on this device");
         Require(target.extent.width <= context.limits.maxFramebufferWidth && target.extent.height <= context.limits.maxFramebufferHeight, "depth target exceeds framebuffer limits");
         const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         try {
             VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-            if (SampleLocationsCompatibleDepth(context, target.format, target.samples)) info.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+            if (SampleLocationsCompatibleDepth(context, hostFormat, target.samples)) info.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
             info.imageType = VK_IMAGE_TYPE_2D;
-            info.format = target.format;
+            info.format = hostFormat;
             info.extent = {target.extent.width, target.extent.height, 1};
             info.mipLevels = 1;
             info.arrayLayers = 1;
@@ -62,7 +64,7 @@ public:
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = image;
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            viewInfo.format = target.format;
+            viewInfo.format = hostFormat;
             viewInfo.subresourceRange = {aspects, 0, 1, 0, 1};
             Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth");
             auto* recorder = RecorderFor(context);
@@ -117,7 +119,7 @@ public:
             throw std::runtime_error(text);
         }
         const auto viewType = resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-        auto texture = std::make_shared<Texture>(context, image, target.format, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components, viewType);
+        auto texture = std::make_shared<Texture>(context, image, hostFormat, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components, viewType);
         textures.emplace(key, texture);
         return texture;
     }
@@ -211,6 +213,7 @@ public:
 
     const Context context;
     const DepthTarget target;
+    const VkFormat hostFormat;
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -409,6 +412,32 @@ bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std
     return (properties.sampleCounts & samples) != 0;
 }
 
+VkFormat HostDepthFormat(const Context& context, VkFormat format) {
+    if (format != VK_FORMAT_D16_UNORM_S8_UINT) return format;
+    static std::mutex mutex;
+    static std::map<VkPhysicalDevice, VkFormat> chosen;
+    std::lock_guard lock(mutex);
+    if (const auto found = chosen.find(context.physical); found != chosen.end()) return found->second;
+    constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    auto host = format;
+    for (const auto candidate : {VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
+        VkFormatProperties properties{};
+        context.formatProperties(context.physical, candidate, &properties);
+        if ((properties.optimalTilingFeatures & required) != required) continue;
+        host = candidate;
+        break;
+    }
+    chosen.emplace(context.physical, host);
+    return host;
+}
+
+float HostDepthBiasConstant(const Context& context, VkFormat format, float constant) {
+    const auto host = HostDepthFormat(context, format);
+    if (constant == 0.0f || host == format) return constant;
+    Require(host == VK_FORMAT_D24_UNORM_S8_UINT, "a constant depth bias on a 16-bit depth target with stencil that the device stores as 32-bit float depth is not implemented");
+    return constant * 256.0f;
+}
+
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
@@ -436,6 +465,31 @@ std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::s
     if (code.size() < htileMaskKernel.size() || !std::equal(htileMaskKernel.begin(), htileMaskKernel.end(), code.begin())) return 0;
     if ((userData[5] & 0xfu) != 0 || (userData[4] & 0xfu) != 0) return 0;
     return userData[2] | (static_cast<std::uint64_t>(userData[3]) << 32u);
+}
+
+std::optional<MemoryValueFill> MatchMemoryValueFill(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups) {
+    static constexpr std::array<std::uint32_t, 9> kernel{0xd7460000u, 0x04010c08u, 0xf4201a82u, 0xfa000000u, 0xbf8cc07fu, 0x7e02026au, 0xe0102000u, 0x80000100u, 0xbf810000u};
+    if (userData.size() < 8 || numThreads != std::array<std::uint32_t, 3>{64u, 1u, 1u} || groups[1] != 1u || groups[2] != 1u) return std::nullopt;
+    if (code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
+    const auto stride = (userData[1] >> 16u) & 0x3fffu;
+    const bool swizzled = ((userData[1] >> 31u) & 1u) != 0;
+    const bool addTid = ((userData[3] >> 23u) & 1u) != 0;
+    const auto type = userData[3] >> 30u;
+    const auto format = (userData[3] >> 12u) & 0x7fu;
+    const auto valueStride = (userData[5] >> 16u) & 0x3fffu;
+    const auto valueBytes = valueStride == 0 ? static_cast<std::uint64_t>(userData[6]) : static_cast<std::uint64_t>(userData[6]) * valueStride;
+    if (type != 0 || stride != 4 || swizzled || addTid || format < 20u || format > 22u || valueBytes < 4u) return std::nullopt;
+    const auto dwords = std::min<std::uint64_t>(static_cast<std::uint64_t>(groups[0]) * 64u, userData[2]);
+    const auto address = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+    const auto valueAddress = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
+    if (dwords == 0 || valueAddress == 0 || (valueAddress & 3u) != 0) return std::nullopt;
+    return MemoryValueFill{address, static_cast<std::size_t>(dwords * 4u), valueAddress};
+}
+
+void NoteMemoryValueFill(const MemoryValueFill& fill) {
+    std::uint32_t value = 0;
+    GuestMemory::Read(fill.valueAddress, std::as_writable_bytes(std::span(&value, 1)), 4);
+    NoteDepthMetadataFill(fill.address, fill.bytes, value);
 }
 
 void NoteHtileDepthClear(std::uint64_t htileAddress) {
@@ -485,9 +539,10 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     const bool cube = resource.dimension == TextureDimension::kCube;
     const bool layered = cube || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray != 0);
     if (stencil || (!layered && !integer)) return (*found)->Sampled(words, resource, components);
+    Require((*found)->hostFormat == base.format, "sampling several slices or an integer view of a depth plane that the device stores in another depth format is not implemented");
     const auto copyFormat = integer ? VK_FORMAT_R16_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
     const auto layers = cube ? 6u : layered ? resource.depthOrLastArray + 1u : 1u;
-    if (format != copyFormat || resource.width != base.extent.width || resource.height != base.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || resource.baseArray != 0 || (cube && resource.depthOrLastArray != 0 && resource.depthOrLastArray != 5) || (resource.dimension != TextureDimension::k2D && resource.dimension != TextureDimension::k2DArray && !cube)) {
+    if ((format != copyFormat && !depthBits) || resource.width != base.extent.width || resource.height != base.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || resource.baseArray != 0 || (cube && resource.depthOrLastArray != 0 && resource.depthOrLastArray != 5) || (resource.dimension != TextureDimension::k2D && resource.dimension != TextureDimension::k2DArray && !cube)) {
         char text[320];
         std::snprintf(text, sizeof(text), "AGC graphics: sampling the depth planes of depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u texture of guest format %u (vk %d), dimension %d, %u slices, levels %u-%u, base slice %u is not implemented", static_cast<unsigned long long>(base.address), base.extent.width, base.extent.height, static_cast<int>(base.format), resource.width, resource.height, resource.format, static_cast<int>(format), static_cast<int>(resource.dimension), layers, resource.baseLevel, resource.lastLevel, resource.baseArray);
         throw std::runtime_error(text);
@@ -571,6 +626,22 @@ bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resou
         return surface->context.device == context.device && (surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address));
     });
     return found != list.rend() && (*found)->Holds(texture) && !(*found)->Overwritten();
+}
+
+bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource) {
+    std::lock_guard lock(surfacesMutex());
+    const auto& list = surfaces();
+    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
+        return surface->context.device == context.device && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
+    });
+    if (found == list.rend() || (*found)->Overwritten()) return false;
+    const auto& target = (*found)->target;
+    if (resource.width != target.extent.width || resource.height != target.extent.height) return false;
+    const bool stencil = target.stencilAddress != 0 && target.stencilAddress == resource.baseAddress;
+    const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+    const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
+    const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
+    return ResolveTextureFormat(resource.format) == expected || depthBits;
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {

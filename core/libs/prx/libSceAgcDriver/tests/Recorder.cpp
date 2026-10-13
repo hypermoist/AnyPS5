@@ -2626,6 +2626,71 @@ void hostImportUnmapTests(const Device& device, Recorder& recorder) {
     std::cout << "host import unmap lifetime: ok\n";
 }
 
+void parkedImportUnmapTests(const Device& device) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: parked import unmap not tested\n";
+        return;
+    }
+    const auto alignment = static_cast<std::size_t>(std::max<VkDeviceSize>(65536u, context.hostImportAlignment));
+    const auto bytes = alignment * 4u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(alignment, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the parked import unmap block");
+    const auto release = [&] {
+#ifdef _WIN32
+        VirtualFree(block, 0, MEM_RELEASE);
+#else
+        std::free(block);
+#endif
+    };
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    std::unique_ptr<Device> replacement;
+    bool imported = false;
+    {
+        std::lock_guard gpu(GpuMutex());
+        imported = HostImportFor(context, address, bytes) != nullptr;
+    }
+    if (imported) {
+        replacement = std::make_unique<Device>();
+        std::lock_guard gpu(GpuMutex());
+        imported = HostImportFor(replacement->GetContext(), address, bytes) != nullptr;
+    }
+    if (!imported) {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        if (replacement) ClearHostImports(replacement->GetContext().device);
+        release();
+        std::cout << "host import refused: parked import unmap not tested\n";
+        return;
+    }
+    bool unmapped = false;
+    try {
+        GuestAllocations::Mutation mutation;
+        mutation.Unmap(block, bytes, [&](const void*, std::size_t, const void*, bool) { unmapped = true; });
+    } catch (const std::exception& error) {
+        ClearHostImports(replacement->GetContext().device);
+        ClearHostImports(context.device);
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+        release();
+        throw std::runtime_error(std::string("guest unmap after a device replacement: ") + error.what());
+    }
+    ClearHostImports(replacement->GetContext().device);
+    ClearImageMirrors(replacement->GetContext().device);
+    replacement.reset();
+    release();
+    Require(unmapped, "guest unmap of a range a replaced device imported did not run");
+    std::cout << "parked import unmap: ok\n";
+}
+
 void importWatchTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
@@ -5228,6 +5293,21 @@ void keysFillTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+void integerClearTests(const Device& device) {
+    const auto& context = device.GetContext();
+    std::size_t tested = 0;
+    for (const std::uint32_t format : {5u, 11u, 20u}) {
+        if (!StorageFormatAvailable(context, format)) continue;
+        ++tested;
+        Require(StorageClearAvailable(context, format, DccKeys::Clear0000), "an integer storage format refused the 0000 clear");
+        for (const auto keys : {DccKeys::Clear0001, DccKeys::Clear1111, DccKeys::ClearRegister, DccKeys::Uncompressed}) {
+            Require(!StorageClearAvailable(context, format, keys), "an integer storage format took a clear code other than 0000");
+        }
+    }
+    Require(tested == 3, "an integer storage format has no storage form");
+    std::cout << "integer storage clears: " << tested << " formats ok\n";
+}
+
 void denormalClearTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -5471,6 +5551,10 @@ int main(int argc, char** argv) {
             unchangedCpuStampTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--integer-clear-only") {
+            integerClearTests(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--settled-baseline-only") {
             settledBaselineTests(device, recorder);
             return 0;
@@ -5488,6 +5572,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-unmap-only") {
             gpu.unlock();
             hostImportUnmapTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--parked-import-unmap-only") {
+            gpu.unlock();
+            parkedImportUnmapTests(device);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unit-shadow-only") {
@@ -5557,6 +5646,7 @@ int main(int argc, char** argv) {
         movedMetadataTests(device, recorder);
         viewPastLastMipTests(device, recorder);
         keysFillTests(device, recorder);
+        integerClearTests(device);
         denormalClearTests(device, recorder);
         unitShadowTests(device, recorder);
         storageRefreshTests(device, recorder, false);

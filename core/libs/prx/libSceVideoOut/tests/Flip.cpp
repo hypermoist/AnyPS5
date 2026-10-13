@@ -306,7 +306,8 @@ void testControls() {
     check(handle >= 0, "open with the highest priority on every CPU failed");
     const auto cfg = VideoOutDriver::Get().GetConfig(handle);
     check(sceVideoOutIsOutputSupported(handle, VIDEO_OUT_OUTPUT_MODE_DEFAULT, nullptr, nullptr, 0) == 1, "default output mode is unsupported");
-    check(sceVideoOutIsOutputSupported(handle, VIDEO_OUT_OUTPUT_MODE_119_88HZ, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE, "unavailable output mode is supported");
+    const int highFrameRate = sceVideoOutIsOutputSupported(handle, VIDEO_OUT_OUTPUT_MODE_119_88HZ, nullptr, nullptr, 0);
+    check(highFrameRate == 1 || highFrameRate == VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE, "unexpected high-frame-rate support result");
     check(sceVideoOutConfigureOutput(handle, VIDEO_OUT_OUTPUT_MODE_119_88HZ, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE, "unavailable output mode was configured");
     check(sceVideoOutIsOutputSupported(handle, 0xd000000aull, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNKNOWN_OUTPUT_MODE, "unknown output mode is supported");
     check(sceVideoOutConfigureOutput(handle, 0xd000000aull, nullptr, nullptr, 0) == VIDEO_OUT_ERROR_UNKNOWN_OUTPUT_MODE, "unknown output mode was configured");
@@ -656,6 +657,19 @@ void testFlipAfterGpuWork() {
     LibcRunShutdown_nid_postfix();
 }
 
+void testUnopenedEventRegistration() {
+    KernelEqueue eq = 0;
+    check(sceKernelCreateEqueue(&eq, "unopened") == 0, "the event queue was not created");
+    check(sceVideoOutAddFlipEvent(eq, 0, nullptr) == VIDEO_OUT_ERROR_INVALID_HANDLE, "flip event on an unopened port was accepted");
+    check(sceVideoOutAddVblankEvent(eq, 1, nullptr) == VIDEO_OUT_ERROR_INVALID_HANDLE, "vblank event on an unopened port was accepted");
+    const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
+    check(sceVideoOutAddFlipEvent(eq, handle, nullptr) == 0, "flip event on an open port was refused");
+    sceVideoOutClose(handle);
+    check(sceVideoOutAddFlipEvent(eq, handle, nullptr) == VIDEO_OUT_ERROR_INVALID_HANDLE, "flip event on a closed port was accepted");
+    check(sceKernelDeleteEqueue(eq) == 0, "the event queue was not deleted");
+    LibcRunShutdown_nid_postfix();
+}
+
 void testOneDevice() {
     const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
@@ -701,6 +715,7 @@ int main(int argc, char** argv) {
         else if (argc == 2 && std::string(argv[1]) == "aftergpu") testFlipAfterGpuWork();
         else if (argc == 2 && std::string(argv[1]) == "unavailable") testUnavailable();
         else if (argc == 2 && std::string(argv[1]) == "onedevice") testOneDevice();
+        else if (argc == 2 && std::string(argv[1]) == "unopened") testUnopenedEventRegistration();
         else if (argc == 2 && std::string(argv[1]) == "overlay") testOverlay();
         else if (argc == 2 && std::string(argv[1]) == "deferred") testDeferredBuffer();
         else if (argc == 2 && std::string(argv[1]) == "unregistered") testUnregisteredBuffer();

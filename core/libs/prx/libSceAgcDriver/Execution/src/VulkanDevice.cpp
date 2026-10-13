@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubgroupClock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderDeviceProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
@@ -43,6 +44,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <map>
+#include <ctime>
 #include <mutex>
 #include <SDL_loadso.h>
 #include <SDL_error.h>
@@ -263,6 +265,7 @@ struct VulkanDevice::State {
     VkExtent2D extent{};
     std::vector<VkImage> images;
     VkFence acquireFence = VK_NULL_HANDLE;
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     struct RetiredSwapchain {
         VkSwapchainKHR swapchain = VK_NULL_HANDLE;
         std::vector<VkSemaphore> rendered;
@@ -275,6 +278,9 @@ struct VulkanDevice::State {
     void* uploadMapping = nullptr;
     VkDeviceSize uploadSize = 0;
     VkPhysicalDeviceProperties properties{};
+    std::string driverInfo;
+    PFN_vkGetCalibratedTimestampsKHR calibratedTimestamps = nullptr;
+    VkTimeDomainKHR hostTimeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     std::vector<std::uint32_t> capabilities{1};
     std::vector<std::string_view> spirvExtensions;
@@ -614,13 +620,19 @@ struct VulkanDevice::State {
 
     void WriteFrameDump(const PresentSlot& slot) {
         require(slot.dumpBuffer != nullptr, "frame dump was not recorded");
-        std::vector<std::byte> full(slot.dumpBuffer->Bytes().begin(), slot.dumpBuffer->Bytes().end());
+        const auto full = slot.dumpBuffer->Bytes();
         const auto index = slot.dumpIndex;
-        const auto width = slot.dumpWidth;
-        const auto height = slot.dumpHeight;
+        const auto scale = slot.dumpScale;
+        require(scale != 0 && full.size() == static_cast<std::size_t>(slot.dumpWidth) * slot.dumpHeight * 4, "invalid frame dump pixels");
+        const auto width = (slot.dumpWidth + scale - 1) / scale;
+        const auto height = (slot.dumpHeight + scale - 1) / scale;
+        std::vector<std::byte> pixels(static_cast<std::size_t>(width) * height * 4);
+        for (std::uint32_t y = 0; y < height; ++y) {
+            for (std::uint32_t x = 0; x < width; ++x) std::memcpy(pixels.data() + (static_cast<std::size_t>(y) * width + x) * 4, full.data() + (static_cast<std::size_t>(y) * scale * slot.dumpWidth + static_cast<std::size_t>(x) * scale) * 4, 4);
+        }
         static const auto start = std::chrono::steady_clock::now();
-        std::fprintf(stderr, "[gpu] frame_%03d.bmp: %ux%u display read back on the GPU at %.1f s\n", index, width, height, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
-        dumpWriter.Enqueue(index, width, height, slot.dumpScale, std::move(full));
+        std::fprintf(stderr, "[gpu] frame_%03d.bmp: %ux%u display read back on the GPU at %.1f s\n", index, slot.dumpWidth, slot.dumpHeight, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        dumpWriter.Enqueue(index, width, height, 1, std::move(pixels));
     }
 
     // Blocks on the fence, or polls it every 50 us with APS5_PRESENT_POLL_FENCE=1 (the difference
@@ -1053,6 +1065,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     std::vector<VkExtensionProperties> availableExtensions(extensionCount);
     check(enumerateDeviceExtensions(selected, nullptr, &extensionCount, availableExtensions.data()), "vkEnumerateDeviceExtensionProperties");
     const auto hasExtension = [&](const char* name) { return std::any_of(availableExtensions.begin(), availableExtensions.end(), [&](const auto& item) { return std::strcmp(item.extensionName, name) == 0; }); };
+    if (hasExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 driverProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &driverProperties);
+        state->driverInfo = std::string(driver.driverName) + " " + driver.driverInfo;
+    }
     auto byteFeatures = QueryBdaByteFeatures(selected, state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), availableExtensions);
     auto bdaFeatures = QueryBdaFeatures(selected, state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), availableExtensions);
     require(hasExtension(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME), "VK_KHR_shader_float_controls is unavailable");
@@ -1116,6 +1134,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceExtensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentShaderPixelInterlockEXT);
         state->spirvExtensions.push_back("SPV_EXT_fragment_shader_interlock");
+    }
+    if (hasExtension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME)) {
+        deviceExtensions.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityStencilExportEXT);
+        state->spirvExtensions.push_back("SPV_EXT_shader_stencil_export");
     }
     if (state->shaderClock) {
         deviceExtensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
@@ -1188,6 +1211,16 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             }
         }
         if (state->sampleLocationSampleCounts != 0) deviceExtensions.push_back(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+    }
+    const char* fifoLatestReadyExtension = hasExtension(VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME) ? VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME : hasExtension("VK_EXT_present_mode_fifo_latest_ready") ? "VK_EXT_present_mode_fifo_latest_ready" : nullptr;
+    const char* requestedPresentMode = std::getenv("ANYPS5_PRESENT_MODE");
+    VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR fifoLatestReadyFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR};
+    bool fifoLatestReady = false;
+    if (requestedPresentMode != nullptr && std::strcmp(requestedPresentMode, "fifo_latest_ready") == 0 && fifoLatestReadyExtension != nullptr) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fifoLatestReadyFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        fifoLatestReady = fifoLatestReadyFeatures.presentModeFifoLatestReady == VK_TRUE;
+        if (fifoLatestReady) deviceExtensions.push_back(fifoLatestReadyExtension);
     }
     // Guest dispatches cover whole thread groups past the edge of small images; robust image access
     // drops those writes instead of faulting the device.
@@ -1435,6 +1468,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->samplerAnisotropy = true;
     state->textureCompressionBC = true;
     deviceInfo.pEnabledFeatures = &enabled;
+    const char* calibratedTimestamps = !PerformanceTrace::Configured() ? nullptr : hasExtension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : hasExtension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : nullptr;
+    if (calibratedTimestamps != nullptr) deviceExtensions.push_back(calibratedTimestamps);
     deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
     deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     if (state->meshShader) {
@@ -1460,6 +1495,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->imageViewMinLod) {
         minLodFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &minLodFeatures;
+    }
+    fifoLatestReadyFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR};
+    fifoLatestReadyFeatures.presentModeFifoLatestReady = VK_TRUE;
+    if (fifoLatestReady) {
+        fifoLatestReadyFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
+        deviceInfo.pNext = &fifoLatestReadyFeatures;
     }
     if (state->maintenance8) {
         maintenance8Features.pNext = const_cast<void*>(deviceInfo.pNext);
@@ -1580,6 +1621,25 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->shaderProfile = std::move(shaderProfile);
     if (compileOnly) return;
+    if (calibratedTimestamps != nullptr) {
+        const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
+        const auto domains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(state->instanceProc(state->instance, khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
+        std::uint32_t domainCount = 0;
+        std::vector<VkTimeDomainKHR> available;
+        if (domains != nullptr && domains(selected, &domainCount, nullptr) == VK_SUCCESS) {
+            available.resize(domainCount);
+            if (domains(selected, &domainCount, available.data()) != VK_SUCCESS) available.clear();
+        }
+#ifdef _WIN32
+        const auto host = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+        const auto host = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+        if (std::ranges::find(available, VK_TIME_DOMAIN_DEVICE_KHR) != available.end() && std::ranges::find(available, host) != available.end()) {
+            state->hostTimeDomain = host;
+            state->calibratedTimestamps = state->DeviceFunction<PFN_vkGetCalibratedTimestampsKHR>(khr ? "vkGetCalibratedTimestampsKHR" : "vkGetCalibratedTimestampsEXT");
+        }
+    }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1637,6 +1697,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         check(getFormats(selected, state->surface, &formatCount, formats.data()), "vkGetPhysicalDeviceSurfaceFormatsKHR");
         require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
+        std::uint32_t presentModeCount = 0;
+        auto getPresentModes = state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR");
+        check(getPresentModes(selected, state->surface, &presentModeCount, nullptr), "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        std::vector<VkPresentModeKHR> presentModes(presentModeCount);
+        check(getPresentModes(selected, state->surface, &presentModeCount, presentModes.data()), "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        presentModes.resize(presentModeCount);
+        state->presentMode = SelectPresentMode(std::getenv("ANYPS5_PRESENT_MODE"), presentModes);
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
         swapchain.minImageCount = surface.minImageCount;
@@ -1648,7 +1715,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         swapchain.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         swapchain.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         swapchain.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        swapchain.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        swapchain.presentMode = state->presentMode;
         swapchain.clipped = VK_FALSE;
         check(state->DeviceFunction<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR")(state->device, &swapchain, nullptr, &state->swapchain), "vkCreateSwapchainKHR");
         std::uint32_t imageCount = 0;
@@ -2328,7 +2395,7 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    create.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    create.presentMode = state->presentMode;
     create.oldSwapchain = state->swapchain;
     state->retiredSwapchains.reserve(state->retiredSwapchains.size() + 1);
     VkSwapchainKHR replacement = VK_NULL_HANDLE;
@@ -2533,6 +2600,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     }
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
+    else Graphics::StorageTexture::FlushDumpSelected("flip");
     if (buffer.tilingMode == 1) {
         const auto pixels = ReadDisplayBuffer(buffer);
         return present(buffer.width, buffer.height, true, pixels);
@@ -2951,6 +3019,34 @@ std::string VulkanDevice::DeviceName() const {
     return state->properties.deviceName;
 }
 
+std::string VulkanDevice::DriverInfo() const {
+    return state->driverInfo.empty() ? std::to_string(state->properties.driverVersion) : state->driverInfo;
+}
+
+bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const {
+    if (state->calibratedTimestamps == nullptr) return false;
+    const std::array<VkCalibratedTimestampInfoKHR, 2> domains{VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR}, VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, state->hostTimeDomain}};
+    std::array<std::uint64_t, 2> stamps{};
+    std::uint64_t deviation = 0;
+    if (state->calibratedTimestamps(state->device, static_cast<std::uint32_t>(domains.size()), domains.data(), stamps.data(), &deviation) != VK_SUCCESS) return false;
+#ifdef _WIN32
+    LARGE_INTEGER counter{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceCounter(&counter);
+    const auto now = std::chrono::steady_clock::now();
+    QueryPerformanceFrequency(&frequency);
+    const double sinceNs = static_cast<double>(static_cast<std::uint64_t>(counter.QuadPart) - stamps[1]) * 1e9 / static_cast<double>(frequency.QuadPart);
+#else
+    timespec monotonic{};
+    clock_gettime(CLOCK_MONOTONIC, &monotonic);
+    const auto now = std::chrono::steady_clock::now();
+    const double sinceNs = static_cast<double>(static_cast<std::uint64_t>(monotonic.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(monotonic.tv_nsec) - stamps[1]);
+#endif
+    gpuNs = static_cast<double>(stamps[0]) * state->properties.limits.timestampPeriod;
+    cpu = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::nano>(sinceNs));
+    return true;
+}
+
 const std::uint32_t* VulkanDevice::WorkGroupCountLimit() const {
     return state->properties.limits.maxComputeWorkGroupCount;
 }
@@ -2974,7 +3070,9 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.fixedPushSlots = state->graphicsPipelineLibrary;
     static const bool relaxedFloat = std::getenv("APS5_RELAXED_FLOAT") != nullptr;
     target.relaxedFloat = relaxedFloat;
+    target.registrationModules = state->graphicsPipelineLibrary;
     target.srgbDecodeFormats = state->srgbDecodeFormats;
+    target.vertexSubgroups = (state->subgroup.supportedStages & VK_SHADER_STAGE_VERTEX_BIT) != 0;
     if (state->meshShader) {
         const auto& mesh = state->meshLimits;
         target.mesh = ShaderRecompiler::MeshTargetLimits{{mesh.maxMeshWorkGroupSize[0], mesh.maxMeshWorkGroupSize[1], mesh.maxMeshWorkGroupSize[2]}, mesh.maxMeshWorkGroupInvocations, std::min(mesh.maxMeshSharedMemorySize, mesh.maxMeshPayloadAndSharedMemorySize), mesh.maxMeshOutputVertices, mesh.maxMeshOutputPrimitives, mesh.maxMeshOutputComponents, std::min(mesh.maxMeshOutputMemorySize, mesh.maxMeshPayloadAndOutputMemorySize), mesh.meshOutputPerVertexGranularity, mesh.meshOutputPerPrimitiveGranularity};
@@ -3104,6 +3202,44 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
+}
+
+bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders) {
+    PerformanceTimer timing("Vulkan.GraphicsPipelinePrebuild");
+    const auto context = graphicsContext();
+    if (!context.graphicsPipelineLibrary || context.descriptorCache == nullptr) return false;
+    Graphics::State state{};
+    state.stages = stages;
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.color.exportIndex = 0;
+    state.colors.push_back(state.color);
+    state.hasColorTarget = true;
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    state.renderExtent = {1, 1};
+    std::vector<Graphics::CompiledShader> group(shaders.begin(), shaders.end());
+    if (group.size() == 1u) {
+        const bool vertex = group.front().stage == ShaderRecompiler::ShaderStage::Fragment;
+        static const auto stub = [](bool vertexStub) {
+            auto result = std::make_shared<ShaderRecompiler::RecompileResult>();
+            const std::uint32_t model = vertexStub ? 0u : 4u;
+            std::vector<std::uint32_t> words{0x07230203u, 0x00010000u, 0u, 6u, 0u, 0x00020011u, 1u, 0x0003000eu, 0u, 1u, 0x0005000fu, model, 4u, 0x6e69616du, 0u};
+            if (!vertexStub) words.insert(words.end(), {0x00030010u, 4u, 7u});
+            words.insert(words.end(), {0x00020013u, 2u, 0x00030021u, 3u, 2u, 0x00050036u, 2u, 4u, 0u, 3u, 0x000200f8u, 5u, 0x000100fdu, 0x00010038u});
+            result->spirv = std::move(words);
+            result->variantId = vertexStub ? ~std::uint64_t{0} - 1u : ~std::uint64_t{0} - 2u;
+            result->runtimeAbiVersion = ShaderRecompiler::RuntimeAbi::Version;
+            return result;
+        };
+        static const auto vertexStub = stub(true);
+        static const auto fragmentStub = stub(false);
+        if (vertex) group.insert(group.begin(), {ShaderRecompiler::ShaderStage::Vertex, vertexStub.get(), 0u});
+        else group.push_back({ShaderRecompiler::ShaderStage::Fragment, fragmentStub.get(), Graphics::PipelinePushSlotBytes});
+    }
+    const auto layouts = Graphics::DescribeSetLayouts(context, group);
+    return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {

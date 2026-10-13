@@ -1128,6 +1128,24 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
+        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
+        if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
+            const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
+            if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
+                GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
+                GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
+                highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
+                import = nullptr;
+                copy = DrawInputCopy{};
+                copy.buffer = std::move(clamped);
+                if (!highest) {
+                    inputs.nothing = true;
+                    return inputs;
+                }
+            }
+        }
         Require(*highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         Require(!fanGeometry || !state.primitiveRestart || *highest != (draw.indexSize == 2 ? 0xffffu : 0xffffffffu), "primitive restart in a triangle fan geometry draw is unsupported");
         inputs.maxIndex = *highest;
@@ -1777,7 +1795,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
-        context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
+        const auto fragmentSet = drawBindings->fragmentAllocation.set;
+        if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
+        if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
     } else {
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
@@ -1963,11 +1983,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
-        Require(!color.mipTail, "rendering into a packed mip tail needs the resident image of its surface");
+        Require(!color.mipTail || binding.gpuTiling, "rendering into a packed mip tail requires the GPU tiled fallback");
         Require(color.depth == 1, "rendering into a 3D color target needs the resident image of its surface");
         Require(color.arraySlice == 0 || !ColorTileModeIsXor(color.tileMode), "rendering into a slice of a 2D array color target with an XOR tile mode needs the resident image of its array");
         if (binding.gpuTiling) {
-            binding.mip = ColorTargetMip(color, colorLayout);
+            binding.mip = color.mipTail ? ComputeColorTargetMipLayout(color.tileMode, color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount, color.mip) : ColorTargetMip(color, colorLayout);
             binding.tiled = std::make_unique<Buffer>(context, colorLayout.Bytes(), copies);
             binding.tiledDevice = std::make_unique<DeviceBuffer>(context, colorLayout.Bytes(), copies | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             binding.linearDevice = std::make_unique<DeviceBuffer>(context, colorLayout.LinearBytes(), copies | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -2130,6 +2150,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
     }
     const State& pipelineState = masked.has_value() ? *masked : state;
+    static const bool verifySetLayouts = std::getenv("APS5_VERIFY_SET_LAYOUTS") != nullptr;
+    if (verifySetLayouts && context.descriptorCache != nullptr) {
+        const auto described = DescribeSetLayouts(context, shaders);
+        const auto built = resources->SetLayouts();
+        Require(described.layouts.main == built.main && described.layouts.fragment == built.fragment && described.layouts.split == built.split && std::ranges::equal(described.mainKey, built.mainKey) && std::ranges::equal(described.fragmentKey, built.fragmentKey), "set layouts described from the shaders differ from the draw's");
+    }
     auto pipeline = CachedPipeline(context, pipelineState, inputs.vertexInput, *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.

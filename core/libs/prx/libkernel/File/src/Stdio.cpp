@@ -6,17 +6,21 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/File/include/KernelStatfs.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
+#include "prx/libkernel/File/include/DescriptorControl.hpp"
 #include "prx/libkernel/File/include/FileLock.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <cstdarg>
@@ -222,6 +226,7 @@ static std::int64_t NativePwrite(int descriptor, const void* buf, std::size_t nb
 }
 #else
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/time.h>
@@ -386,7 +391,7 @@ static int NativeFstatfs(int descriptor, KernelStatfs* fs) {
     constexpr long PipeFilesystem = 0x50495045;
     struct stat file{};
     if (::fstat(descriptor, &file) != 0) return SceErrorFromErrno(errno) & 0xffff;
-    if (S_ISSOCK(file.st_mode)) return GUEST_EINVAL;
+    if (S_ISSOCK(file.st_mode) && (::fcntl(descriptor, F_GETFL) & O_PATH) == 0) return GUEST_EINVAL;
     if (S_ISFIFO(file.st_mode)) {
         struct statfs kind{};
         if (::fstatfs(descriptor, &kind) == 0 && static_cast<long>(kind.f_type) == PipeFilesystem) return GUEST_EINVAL;
@@ -419,6 +424,8 @@ extern "C" int APS5_VABI pipe_nid_postfix(int* descriptors) {
     const int result = ::pipe(native);
 #endif
     if (result != 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
+    File::RememberDescriptor(native[0], 0);
+    File::RememberDescriptor(native[1], 0);
     std::memcpy(descriptors, native, sizeof(native));
     return 0;
 }
@@ -431,10 +438,6 @@ static int PathError(const char* path) {
 #ifdef _WIN32
 bool DescriptorIsOpen_nid_no_patch(int descriptor) {
     return descriptor >= 0 && WithoutParameterHandler([descriptor] { return ::_get_osfhandle(descriptor) == -1 ? -1 : 0; }) == 0;
-}
-static void RejectDirectoryDuplicate(int descriptor, const char* function) {
-    if (File::DirectoryDescriptorPath(descriptor))
-        throw std::runtime_error(std::string(function) + ": duplicating a directory descriptor is not supported on Windows");
 }
 #else
 bool DescriptorIsOpen_nid_no_patch(int descriptor) {
@@ -455,6 +458,28 @@ static bool HasNonDirectoryPrefix(const std::filesystem::path& native) {
     return false;
 }
 
+extern "C" int APS5_VABI dup_nid_postfix(int d);
+extern "C" int APS5_VABI close_nid_postfix(int d);
+
+int File::DuplicateFrom(int fd, int start) {
+#ifdef _WIN32
+    std::vector<int> below;
+    int duplicate;
+    while ((duplicate = dup_nid_postfix(fd)) >= 0 && duplicate < start) below.push_back(duplicate);
+    const int error = *__error_nid_postfix();
+    for (const int descriptor : below) close_nid_postfix(descriptor);
+    return duplicate < 0 ? PosixFailure(error) : duplicate;
+#else
+    const int duplicate = ::fcntl(fd, F_DUPFD, start);
+    if (duplicate < 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
+    if (duplicate >= GuestSockets::FirstDescriptor)
+        throw std::runtime_error("fcntl: host descriptor reached the guest socket range");
+    if (File::IsRandomDevice(fd)) File::RememberRandomDevice(duplicate);
+    File::ShareDescriptor(fd, duplicate);
+    return duplicate;
+#endif
+}
+
 extern "C" {
 
 int APS5_VABI chmod_nid_postfix(const char* path, int mode) {
@@ -473,7 +498,10 @@ int APS5_VABI close_nid_postfix(int d) {
         *__error_nid_postfix() = socketError;
         return -1;
     }
+    EqueueDescriptorClosed(d);
     File::ForgetRandomDevice(d);
+    File::ForgetDescriptor(d);
+    ForgetJitSharedMemory(d);
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);
     File::ForgetFileLock(d);
@@ -487,12 +515,43 @@ int APS5_VABI _close_nid_postfix(int descriptor) {
     return close_nid_postfix(descriptor);
 }
 
+}
+
+namespace {
+std::atomic<int> g_hostStandardError{-1};
+
+void PreserveHostStandardError() {
+    if (g_hostStandardError.load() >= 0) return;
+#ifdef _WIN32
+    const int saved = WithoutParameterHandler([] { return ::_dup(2); });
+#else
+    const int saved = ::dup(2);
+#endif
+    if (saved < 0) throw std::runtime_error("dup2: cannot keep the host standard error");
+    int expected = -1;
+    if (!g_hostStandardError.compare_exchange_strong(expected, saved)) {
+#ifdef _WIN32
+        _close(saved);
+#else
+        ::close(saved);
+#endif
+    }
+}
+}
+
+int File::HostStandardError() {
+    return g_hostStandardError.load();
+}
+
+extern "C" {
+
 int APS5_VABI dup_nid_postfix(int d) {
     if (d >= GuestSockets::FirstDescriptor) return GuestSockets::Duplicate(d);
     if (d < 0) return PosixFailure(GUEST_EBADF);
+    if (IsKqueueDescriptor(d)) throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
 #ifdef _WIN32
-    RejectDirectoryDuplicate(d, __func__);
     const int duplicate = WithoutParameterHandler([d] { return ::_dup(d); });
+    if (duplicate >= 0) File::DuplicateDirectoryDescriptor(d, duplicate);
 #else
     const int duplicate = ::dup(d);
 #endif
@@ -500,6 +559,8 @@ int APS5_VABI dup_nid_postfix(int d) {
     if (duplicate >= GuestSockets::FirstDescriptor)
         throw std::runtime_error(std::string(__func__) + ": host descriptor reached the guest socket range");
     if (File::IsRandomDevice(d)) File::RememberRandomDevice(duplicate);
+    File::ShareDescriptor(d, duplicate);
+    DuplicateJitSharedMemory(d, duplicate);
     return duplicate;
 }
 
@@ -515,25 +576,34 @@ int APS5_VABI dup2_nid_postfix(int from, int to) {
     if (socketTo)
         throw std::runtime_error(std::string(__func__) + ": moving host descriptor " + std::to_string(from) + " into the guest socket range is not supported");
     const bool sourceIsRandom = File::IsRandomDevice(from);
+    if (from != to && IsKqueueDescriptor(from)) throw std::runtime_error(std::string(__func__) + ": duplicating a kqueue descriptor is not supported");
 #ifdef _WIN32
     if (WithoutParameterHandler([from] { return ::_get_osfhandle(from) == -1 ? -1 : 0; }) != 0) return PosixFailure(GUEST_EBADF);
     if (from == to) return to;
-    RejectDirectoryDuplicate(from, __func__);
+    if (to == 2) PreserveHostStandardError();
     if (WithoutParameterHandler([from, to] { return ::_dup2(from, to); }) != 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
+    EqueueDescriptorClosed(to);
     File::ForgetDirectoryDescriptor(to);
+    File::DuplicateDirectoryDescriptor(from, to);
     File::ForgetFileLock(to);
     File::ForgetRandomDevice(to);
     if (sourceIsRandom) File::RememberRandomDevice(to);
+    File::ShareDescriptor(from, to);
+    DuplicateJitSharedMemory(from, to);
     return to;
 #else
     if (from == to) {
         if (::fcntl(from, F_GETFL) < 0) return PosixFailure(GUEST_EBADF);
         return to;
     }
+    if (to == 2) PreserveHostStandardError();
     const int result = ::dup2(from, to);
     if (result < 0) return PosixFailure(SceErrorFromErrno(errno) & 0xffff);
+    EqueueDescriptorClosed(to);
     File::ForgetRandomDevice(to);
     if (sourceIsRandom) File::RememberRandomDevice(to);
+    File::ShareDescriptor(from, to);
+    DuplicateJitSharedMemory(from, to);
     return result;
 #endif
 }
@@ -1056,6 +1126,7 @@ int APS5_VABI sceKernelRmdir(const char* path) {
     std::filesystem::path native;
     if (const int error = ResolvePathError_nid_no_patch(path, native)) return SceKernelError(error);
     std::error_code error;
+    if (std::filesystem::is_symlink(native, error)) return SceErrorFromErrno(GUEST_ENOTDIR);
     if (!std::filesystem::is_directory(native, error)) {
         const bool blockedByFile = HasNonDirectoryPrefix(native) || std::filesystem::exists(WithoutTrailingSeparator(native), error);
         return SceErrorFromErrno(blockedByFile ? GUEST_ENOTDIR : GUEST_ENOENT);

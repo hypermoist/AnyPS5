@@ -19,6 +19,7 @@ public:
     void Update();
 
 private:
+    explicit PadInput(Pad::InputConfiguration configuration);
     void publish();
     static double autoCrossPeriod();
     void setMouseMode(bool enabled);
@@ -30,6 +31,7 @@ private:
     void enableSensors();
 
     std::vector<Pad::InputBinding> bindings;
+    Pad::InputSettings settings;
     std::vector<bool> pressed;
     std::vector<std::chrono::steady_clock::time_point> wheelReleaseTimes;
     std::array<std::uint8_t, 2> mouseStick{128, 128};
