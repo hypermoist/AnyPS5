@@ -630,8 +630,6 @@ ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address)
 ImportRun extentRun(const GuestAllocations::Lease& lease, std::uint64_t address, std::uint64_t end) {
     auto run = importRun(lease, address);
     if (run.ranges.empty()) return {};
-    // An import never crosses the import window (SetHostImportWindow), so neither does a span.
-    if (const auto window = importWindow.load(std::memory_order_relaxed); window != 0 && run.base / window != (end - 1) / window) return {};
     while (run.base + run.bytes < end) {
         auto next = importRun(lease, run.base + run.bytes);
         if (next.ranges.empty() || next.base != run.base + run.bytes || !continuesRun(*run.ranges.back(), *next.ranges.front())) return {};
