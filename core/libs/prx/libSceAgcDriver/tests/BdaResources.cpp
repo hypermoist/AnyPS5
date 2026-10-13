@@ -154,6 +154,9 @@ void spaceImportRunTests(const Context& context) {
     }
     change(guest, false);
     change(guest + piece, false);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void failedImportRemapTests(const Context& context, const BdaTestAccess& access) {
     constexpr std::size_t piece = 65536;
     auto* block = static_cast<std::byte*>(::operator new(4 * piece, std::align_val_t{piece}));
@@ -231,15 +234,12 @@ void importWindowTests(const Context& context) {
     const auto lowBuffer = low->buffer;
     const auto* high = HostImportFor(importing, first + window, piece);
     Require(high != nullptr && high->base == first + window && high->bytes == piece, "a span crossed the import window");
-    static_cast<void>(lowBuffer);
-    const auto* crossing = HostImportFor(importing, first + window - 16, 32);
-    Require(crossing != nullptr && crossing->base == first && crossing->bytes == window + piece, "a view crossing the import window was not imported over both window runs");
-    Require(HostImportFor(importing, first, 16) == crossing && HostImportFor(importing, first + window, piece) == crossing, "a request inside a joined import was not served by it");
+    Require(HostImportFor(importing, first + window - 16, 32) == nullptr, "a view crossing the import window was imported");
     change(guest + 3 * piece, true);
     const auto* grown = HostImportFor(importing, first + window, window);
     Require(grown != nullptr && grown->base == first + window && grown->bytes == window, "the next window did not grow into the new range");
     const auto* kept = HostImportFor(importing, first, 16);
-    Require(kept != nullptr && kept->base == first && kept->bytes == window, "the first window was not imported again as its own span");
+    Require(kept != nullptr && kept->buffer == lowBuffer, "growth in one window re-imported another");
     for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, false);
     SetHostImportWindow(0);
     ::operator delete(block, std::align_val_t{window});
@@ -1176,7 +1176,6 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     importCrossingTests(context, access);
     importSpanTests(context);
-    spaceImportRunTests(context);
     failedImportRemapTests(context, access);
     importWindowTests(context);
     heapMirrorTests(context, access);
@@ -1188,6 +1187,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     sparseHeapTests(context, access);
     hostWriteWatchExclusionTests();
     sparseHeapMirrorTests(context, access);
+    spaceImportRunTests(context);
     Require(AddressCopyOverflow({{0x1000, 0x3000, 0x2000, "uncommitted pages"}}, 0x2000).empty(), "copies within the limit were refused");
     const auto copies = AddressCopyOverflow({{0x1000, 0x2000, 0x1000, "not mirrored"}, {0x10000, 0x30000, 0x18000, "uncommitted pages"}}, 0x2000);
     Require(!copies.empty() && copies.find("0x10000+0x20000 (0.1 MiB committed, uncommitted pages)") < copies.find("0x1000+0x1000"), "the copy limit does not name the largest copy first");

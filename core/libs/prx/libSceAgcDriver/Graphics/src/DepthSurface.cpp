@@ -143,12 +143,22 @@ public:
         return target.stencilAddress != 0 && target.stencilAddress != target.address && storedOver(target.stencilAddress, DepthSliceBytes(target.extent, 1u));
     }
 
-    void Transfer(StorageTexture& storage, bool into, std::uint32_t layer) {
+    // Whether a storage image views this depth plane texel for texel: one depth-sized element per
+    // texel over the surface's extent. Any other image at the address reads the memory's own bytes,
+    // which the game has reused (as DepthSurfaceAt decides for its words).
+    bool Fits(const StorageTexture& storage, std::uint32_t layer) const {
         const auto& descriptor = storage.Descriptor();
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto storageFormat = storage.StorageFormat();
         const bool sized = d16 ? (storageFormat == VK_FORMAT_R16_UINT || storageFormat == VK_FORMAT_R16_UNORM || storageFormat == VK_FORMAT_R16_SINT || storageFormat == VK_FORMAT_R16_SNORM || storageFormat == VK_FORMAT_R16_SFLOAT) : (storageFormat == VK_FORMAT_R32_SFLOAT || storageFormat == VK_FORMAT_R32_UINT || storageFormat == VK_FORMAT_R32_SINT);
-        if (!sized || descriptor.width != target.extent.width || descriptor.height != target.extent.height || descriptor.mipCount != 1 || (descriptor.dimension != TextureDimension::k2D && descriptor.dimension != TextureDimension::k2DArray) || (layer != 0 && layer > descriptor.depthOrLastArray)) {
+        return sized && descriptor.width == target.extent.width && descriptor.height == target.extent.height && descriptor.mipCount == 1 && (descriptor.dimension == TextureDimension::k2D || descriptor.dimension == TextureDimension::k2DArray) && (layer == 0 || layer <= descriptor.depthOrLastArray);
+    }
+
+    void Transfer(StorageTexture& storage, bool into, std::uint32_t layer) {
+        const auto& descriptor = storage.Descriptor();
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto storageFormat = storage.StorageFormat();
+        if (!Fits(storage, layer)) {
             char text[256];
             std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u image of vk format %d, dimension %d, %u mips is not implemented", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), descriptor.width, descriptor.height, static_cast<int>(storageFormat), static_cast<int>(descriptor.dimension), descriptor.mipCount);
             throw std::runtime_error(text);
@@ -581,6 +591,7 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
         if (slice == list.rend()) continue;
         auto& surface = **slice;
         if (surface.seeded == storage.get() && surface.writerLayer == layer && surface.writer.lock() == storage) continue;
+        if (!surface.Fits(*storage, layer)) continue;
         surface.ApplyFastClear();
         surface.TakeWrites();
         if (surface.Overwritten()) continue;

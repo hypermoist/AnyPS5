@@ -36,9 +36,10 @@ struct Registry {
     std::map<std::uint64_t, std::shared_ptr<const Range>> ranges;
     bool mainImageRegistered = false;
     std::map<std::uintptr_t, std::uintptr_t> registeredImages;
-    // AcquireShared's snapshot; dropped when a mutation begins, so it never pins a range a mutation
-    // checks (RequireUnpinned counts references).
-    std::shared_ptr<const Lease> readable;
+    // AcquireShared's snapshot, held weakly: it lives while a caller holds it (a cached address
+    // space does most of the time), so references to a range are only its real holders'. Dropped
+    // when a mutation begins.
+    std::weak_ptr<const Lease> readable;
     // Mutations begun and not ended (RequireUnpinned releases the lock while it waits): none caches.
     int mutating = 0;
 };
@@ -506,7 +507,7 @@ Lease GuestAllocationsAcquire_nid_postfix() {
 std::shared_ptr<const Lease> GuestAllocationsAcquireShared_nid_postfix() {
     std::lock_guard lock(registry().mutex);
     auto& state = registry();
-    if (state.readable != nullptr) return state.readable;
+    if (auto cached = state.readable.lock()) return cached;
     auto snapshot = std::make_shared<Lease>();
     snapshot->reserve(state.ranges.size());
     for (const auto& [address, range] : state.ranges) {

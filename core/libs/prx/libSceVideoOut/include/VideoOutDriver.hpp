@@ -223,7 +223,7 @@ public:
 
 private:
     bool close(int handle);
-    void presentLoop(std::stop_token token);
+    void presentLoop(std::stop_token token, std::promise<void>& started);
     void vblankLoop(std::stop_token token);
     void vblankEnd(std::uint64_t tick);
     void updateDisplayRefreshRate();

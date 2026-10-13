@@ -1825,12 +1825,12 @@ void verifyPixelRequestSerialization() {
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRIAAAA=", "new requests did not use serialization version 18");
+    require(requestPrefix(encoded, 8u) == "NVNQQRQAAAA=", "new requests did not use serialization version 20");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
     for (std::size_t bytes = 0; bytes < 19u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage or stencil reference export flag was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRMAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRUAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
 }
@@ -1908,14 +1908,16 @@ void verifyVertexInfoVersion17() {
     require(plain.size() == flagged.size(), "PA_CL_VS_OUT_CNTL changed the request size");
     std::size_t offset = 0;
     while (offset < plain.size() && plain[offset] == flagged[offset]) ++offset;
-    require(offset + 4u <= plain.size() && flagged[offset] == 0xefu && flagged[offset + 1u] == 0xcdu && flagged[offset + 2u] == 0xabu && flagged[offset + 3u] == 0x89u, "PA_CL_VS_OUT_CNTL is not the four bytes the version 18 vertex info adds");
+    require(offset + 4u <= plain.size() && flagged[offset] == 0xefu && flagged[offset + 1u] == 0xcdu && flagged[offset + 2u] == 0xabu && flagged[offset + 3u] == 0x89u, "PA_CL_VS_OUT_CNTL is not the four bytes the version 19 vertex info adds");
     require(std::equal(plain.begin() + offset + 4u, plain.end(), flagged.begin() + offset + 4u), "PA_CL_VS_OUT_CNTL moved the fields after it");
     auto legacy = plain;
     legacy.erase(legacy.begin() + offset, legacy.begin() + offset + 4u);
-    legacy[4] = 17u;
-    const auto replay = serializer.Deserialize(encodeBase64(legacy));
-    require(replay.request.context.vertex.has_value() && replay.request.context.vertex->paClVsOutCntl == 0u, "a version 17 vertex info read a PA_CL_VS_OUT_CNTL word");
-    require(serializer.Serialize(replay.request) == unmarked, "a version 17 vertex info misread the fields after it");
+    for (const auto version : {16u, 17u, 18u}) {
+        legacy[4] = static_cast<std::uint8_t>(version);
+        const auto replay = serializer.Deserialize(encodeBase64(legacy));
+        require(replay.request.context.vertex.has_value() && replay.request.context.vertex->paClVsOutCntl == 0u, "a legacy vertex info read a PA_CL_VS_OUT_CNTL word");
+        require(serializer.Serialize(replay.request) == unmarked, "a legacy vertex info misread the fields after it");
+    }
 }
 
 void verifyLegacyPixelRequests() {
