@@ -27,102 +27,176 @@ bool isImmediateU32(const IrValue& value) {
 }
 
 // A relative-addressing window register (v_movrel) is array storage, not SSA: a spill into one is
-// WriteLane(s, L, LoadVectorWindow k) stored back with StoreVectorWindow k. Lane L of a load of slot
-// k with an immediate index is found at the last store to k before it: in its block, else on every
-// path through its predecessors, which must all give lane L the same value (each path then passes a
-// WriteLane of it, so that value dominates the load). A path that comes back to a block already on
-// the walk without storing k (a loop's back edge) carries what entered that block and agrees with
-// any value. Unknown when a store with a computed index (which may write k) comes first on some
-// path, a path reaches the entry without a store, a store's lane L is not a lane write, or the walk
-// grows past a bound.
+// WriteLane(s, L, LoadVectorWindow k) stored back with StoreVectorWindow k. What lane L of slot k
+// holds at a load is a forward dataflow over the blocks, computed once per slot and lane: a block's
+// exit holds the lane of its last store to k (or what entered it), a block's entry the value every
+// predecessor agrees on (a predecessor not yet reached, such as a loop's back edge on the first
+// pass, agrees with any value), and the entry block starts unknown. A store's lane is read through
+// its WriteLane chain down to a window load, whose lane is the flow's value at that load. Unknown
+// when a store with a computed index may write k, a store's lane is not a lane write, predecessors
+// disagree, or the flow does not settle within a bound.
+//
+// A store with a computed index is passed over for a lane-spill slot: one whose every store is a
+// lane write into its own load and whose every load is only read lane by lane (ReadLane, or the
+// chain of a WriteLane stored back). The guest compiler keeps its SGPR spill registers out of the
+// array a v_movreld indexes, so a well-formed shader's indexed stores never land on them.
 struct WindowLane {
     IrValue* value = nullptr;
     bool known = false;
 };
 
-WindowLane windowLaneBefore(const IrBlock* block, std::list<IrValue*>::const_iterator it, std::uint32_t slot, std::uint32_t lane, std::uint32_t waveSize, std::unordered_set<const IrBlock*>& path, std::size_t& budget) {
-    while (it != block->Instructions().begin()) {
-        IrValue* inst = *--it;
-        if (inst->Opcode() != IrOpcode::StoreVectorWindow) {
-            continue;
-        }
-        IrValue* stored = inst->Argument(0)->Resolve();
-        if (!isImmediateU32(*stored) || budget == 0u) {
-            return {};
-        }
-        if (stored->ImmediateU32() != slot) {
-            continue;
-        }
-        --budget;
-        const ChainResult chain = searchChain(inst->Argument(1), lane, waveSize);
-        if (chain.cycle) {
-            return {nullptr, true};
-        }
-        if (chain.write == nullptr) {
-            return {};
-        }
-        return {chain.scalar, true};
-    }
-    if (block->Predecessors().empty()) {
-        return {};
-    }
-    WindowLane reaching {nullptr, true};
-    for (const IrBlock* predecessor : block->Predecessors()) {
-        if (path.contains(predecessor)) {
-            continue;
-        }
-        if (budget == 0u) {
-            return {};
-        }
-        --budget;
-        path.insert(predecessor);
-        const WindowLane found = windowLaneBefore(predecessor, predecessor->Instructions().end(), slot, lane, waveSize, path, budget);
-        path.erase(predecessor);
-        if (!found.known) {
-            return {};
-        }
-        if (found.value == nullptr) {
-            continue;
-        }
-        if (reaching.value != nullptr && found.value->Resolve() != reaching.value->Resolve()) {
-            return {};
-        }
-        reaching.value = found.value;
-    }
-    return reaching;
-}
+struct LaneState {
+    enum class Kind : std::uint8_t { Unreached, Known, Unknown };
+    Kind kind = Kind::Unreached;
+    IrValue* value = nullptr;
 
-// One walk per top-level read: the loads being resolved and the bound are shared by the nested
-// walks a store's own window loads start.
-struct WindowWalk {
-    std::unordered_set<IrValue*> resolving;
-    std::size_t budget = 0;
-    std::uint32_t depth = 0;
+    bool operator==(const LaneState& other) const {
+        return kind == other.kind && (kind != Kind::Known || value->Resolve() == other.value->Resolve());
+    }
 };
 
-thread_local WindowWalk windowWalk;
+LaneState meetLanes(const LaneState& left, const LaneState& right) {
+    if (left.kind == LaneState::Kind::Unreached) return right;
+    if (right.kind == LaneState::Kind::Unreached) return left;
+    if (left.kind == LaneState::Kind::Unknown || right.kind == LaneState::Kind::Unknown) return {LaneState::Kind::Unknown, nullptr};
+    return left.value->Resolve() == right.value->Resolve() ? left : LaneState{LaneState::Kind::Unknown, nullptr};
+}
+
+struct LaneFlow {
+    std::unordered_map<const IrBlock*, LaneState> exits;
+    std::unordered_map<const IrValue*, LaneState> loads;
+};
+
+struct WindowFlows {
+    const IrProgram* program = nullptr;
+    std::unordered_set<std::uint32_t> spillSlots;
+    std::unordered_map<std::uint64_t, LaneFlow> flows;
+    std::unordered_set<std::uint64_t> computing;
+};
+
+thread_local WindowFlows* windowFlows = nullptr;
+
+std::unordered_set<std::uint32_t> collectLaneSpillSlots(const IrProgram& program) {
+    std::unordered_set<std::uint32_t> candidates;
+    std::unordered_set<std::uint32_t> rejected;
+    const auto immediateSlot = [](const IrValue& inst, std::uint32_t& slot) {
+        const IrValue* index = inst.Argument(0)->Resolve();
+        if (!isImmediateU32(*index)) return false;
+        slot = index->ImmediateU32();
+        return true;
+    };
+    for (const auto& block : program.Blocks()) {
+        for (const IrValue* inst : block->Instructions()) {
+            std::uint32_t slot = 0;
+            if (inst->Opcode() == IrOpcode::StoreVectorWindow) {
+                if (!immediateSlot(*inst, slot)) continue;
+                candidates.insert(slot);
+                if (inst->Argument(1)->Resolve()->Opcode() != IrOpcode::WriteLane) rejected.insert(slot);
+            } else if (inst->Opcode() == IrOpcode::LoadVectorWindow) {
+                if (!immediateSlot(*inst, slot)) continue;
+                candidates.insert(slot);
+                for (const IrUse& use : inst->OperandUses()) {
+                    const bool laneRead = use.user->Opcode() == IrOpcode::ReadLane && use.operand == 0u;
+                    const bool chained = use.user->Opcode() == IrOpcode::WriteLane && use.operand == 2u;
+                    if (!laneRead && !chained) rejected.insert(slot);
+                }
+            }
+        }
+    }
+    for (const auto slot : rejected) candidates.erase(slot);
+    return candidates;
+}
+
+LaneState windowLoadLane(const IrValue* load, std::uint32_t lane, std::uint32_t waveSize);
+
+// The lane a stored value gives slot `slot`: its WriteLane chain down to a window load.
+LaneState storedLane(IrValue* value, std::uint32_t slot, std::uint32_t lane, std::uint32_t waveSize, const LaneFlow& flow) {
+    for (;;) {
+        value = value->Resolve();
+        if (value->Opcode() == IrOpcode::WriteLane) {
+            IrValue* selector = value->Argument(1)->Resolve();
+            if (!isImmediateU32(*selector)) return {LaneState::Kind::Unknown, nullptr};
+            if (selector->ImmediateU32() % waveSize == lane) return {LaneState::Kind::Known, value->Argument(0)};
+            value = value->Argument(2);
+            continue;
+        }
+        if (value->Opcode() != IrOpcode::LoadVectorWindow) return {LaneState::Kind::Unknown, nullptr};
+        const IrValue* index = value->Argument(0)->Resolve();
+        if (!isImmediateU32(*index)) return {LaneState::Kind::Unknown, nullptr};
+        if (index->ImmediateU32() != slot) return windowLoadLane(value, lane, waveSize);
+        const auto found = flow.loads.find(value);
+        return found == flow.loads.end() ? LaneState{} : found->second;
+    }
+}
+
+const LaneFlow* laneFlow(std::uint32_t slot, std::uint32_t lane, std::uint32_t waveSize) {
+    auto& flows = *windowFlows;
+    const auto key = (static_cast<std::uint64_t>(slot) << 32u) | lane;
+    if (const auto found = flows.flows.find(key); found != flows.flows.end()) return &found->second;
+    if (!flows.computing.insert(key).second) return nullptr;
+    LaneFlow flow;
+    const bool spill = flows.spillSlots.contains(slot);
+    const auto& blocks = flows.program->Blocks();
+    constexpr int MaxPasses = 64;
+    bool settled = false;
+    for (int pass = 0; pass < MaxPasses && !settled; ++pass) {
+        settled = true;
+        for (const auto& block : blocks) {
+            LaneState running{};
+            if (block->Predecessors().empty()) {
+                running = {LaneState::Kind::Unknown, nullptr};
+            } else {
+                for (const IrBlock* predecessor : block->Predecessors()) {
+                    const auto exit = flow.exits.find(predecessor);
+                    running = meetLanes(running, exit == flow.exits.end() ? LaneState{} : exit->second);
+                }
+            }
+            for (IrValue* inst : block->Instructions()) {
+                if (inst->Opcode() == IrOpcode::LoadVectorWindow) {
+                    const IrValue* index = inst->Argument(0)->Resolve();
+                    if (!isImmediateU32(*index) || index->ImmediateU32() != slot) continue;
+                    auto& seen = flow.loads[inst];
+                    if (!(seen == running)) {
+                        seen = running;
+                        settled = false;
+                    }
+                } else if (inst->Opcode() == IrOpcode::StoreVectorWindow) {
+                    const IrValue* index = inst->Argument(0)->Resolve();
+                    if (!isImmediateU32(*index)) {
+                        if (!spill) running = {LaneState::Kind::Unknown, nullptr};
+                        continue;
+                    }
+                    if (index->ImmediateU32() != slot) continue;
+                    running = storedLane(inst->Argument(1), slot, lane, waveSize, flow);
+                }
+            }
+            auto& exit = flow.exits[block.get()];
+            if (!(exit == running)) {
+                exit = running;
+                settled = false;
+            }
+        }
+    }
+    flows.computing.erase(key);
+    if (!settled) {
+        for (auto& [load, state] : flow.loads) state = {LaneState::Kind::Unknown, nullptr};
+    }
+    return &(flows.flows[key] = std::move(flow));
+}
+
+LaneState windowLoadLane(const IrValue* load, std::uint32_t lane, std::uint32_t waveSize) {
+    const IrValue* index = load->Argument(0)->Resolve();
+    if (windowFlows == nullptr || !isImmediateU32(*index) || load->Parent() == nullptr) return {LaneState::Kind::Unknown, nullptr};
+    const LaneFlow* flow = laneFlow(index->ImmediateU32(), lane, waveSize);
+    if (flow == nullptr) return {LaneState::Kind::Unknown, nullptr};
+    const auto found = flow->loads.find(load);
+    return found == flow->loads.end() ? LaneState{LaneState::Kind::Unknown, nullptr} : found->second;
+}
 
 WindowLane windowLane(IrValue* load, std::uint32_t lane, std::uint32_t waveSize) {
-    IrValue* index = load->Argument(0)->Resolve();
-    if (!isImmediateU32(*index) || load->Parent() == nullptr) {
-        return {};
-    }
-    auto& walk = windowWalk;
-    if (walk.depth == 0u) {
-        walk.resolving.clear();
-        walk.budget = 1024u;
-    }
-    if (!walk.resolving.insert(load).second) {
-        return {nullptr, true};
-    }
-    ++walk.depth;
-    const IrBlock* block = load->Parent();
-    const auto& instructions = block->Instructions();
-    std::unordered_set<const IrBlock*> path {block};
-    const WindowLane found = windowLaneBefore(block, std::find(instructions.begin(), instructions.end(), load), index->ImmediateU32(), lane, waveSize, path, walk.budget);
-    --walk.depth;
-    walk.resolving.erase(load);
-    return found;
+    const LaneState state = windowLoadLane(load, lane, waveSize);
+    if (state.kind == LaneState::Kind::Known) return {state.value, true};
+    return {};
 }
 
 ChainResult searchChain(IrValue* value, std::uint32_t lane, std::uint32_t waveSize) {
@@ -304,6 +378,13 @@ ReadLaneEliminationStats ReadLaneEliminator::Eliminate(IrProgram& program, std::
     if (waveSize != 32u && waveSize != 64u) {
         return stats;
     }
+    WindowFlows flows;
+    flows.program = &program;
+    flows.spillSlots = collectLaneSpillSlots(program);
+    struct FlowScope {
+        ~FlowScope() { windowFlows = nullptr; }
+    } flowScope;
+    windowFlows = &flows;
 
     for (const auto& block : program.Blocks()) {
         for (IrValue* inst : block->Instructions()) {
