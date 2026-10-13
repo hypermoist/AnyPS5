@@ -5,3 +5,4 @@ Host: CachyOS, Ryzen 5 5600G, RTX 3060 12 GB (NVIDIA 615.78.08).
 
 - `main-8bcd97cd5/`: unmodified upstream `main` 8bcd97cd5 (2026-10-13), relinked with its own relinker.
 - `fork-a5507eea1/`: fork branch `wip/ppsa08427-sync-fix` at a5507eea1.
+- `fork-80c723d49/`: fork branch at 80c723d49 (all hub shaders compile; hub world still black).
