@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -142,9 +143,50 @@ struct TextureCache {
     std::uint64_t erasures = 0;
 };
 
+// Sampled cache locks taken by this thread: the device memory reclaimer (reclaimSampledTextures),
+// called from an allocation, must not take the cache again or edit it under its holder.
+thread_local int sampledCacheHeld = 0;
+
+struct SampledCacheLock {
+    explicit SampledCacheLock(std::mutex& mutex) : lock(mutex) { ++sampledCacheHeld; }
+    ~SampledCacheLock() { --sampledCacheHeld; }
+    std::lock_guard<std::mutex> lock;
+};
+
+void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it);
+
+std::uint64_t reclaimSampledTextures(std::uint64_t wanted);
+
 TextureCache& Textures() {
     static TextureCache cache;
+    static const bool registered = [] {
+        SetDeviceMemoryReclaimer(&reclaimSampledTextures);
+        return true;
+    }();
+    static_cast<void>(registered);
     return cache;
+}
+
+// Drops least recently used sampled textures that only the cache holds (nothing recorded or in
+// flight keeps them, so their memory is freed at once) until about `wanted` bytes are released.
+std::uint64_t reclaimSampledTextures(std::uint64_t wanted) {
+    if (sampledCacheHeld != 0) return 0;
+    auto& cache = Textures();
+    std::unique_lock lock(cache.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return 0;
+    ++sampledCacheHeld;
+    std::uint64_t freed = 0;
+    for (auto it = cache.entries.end(); it != cache.entries.begin() && freed < wanted;) {
+        --it;
+        if (it->accounted == 0 || it->source != nullptr || it->texture.use_count() > 1) continue;
+        freed += it->accounted;
+        const auto erased = it;
+        it = std::next(it);
+        eraseTexture(cache, erased);
+        ++cache.counts.evicted;
+    }
+    --sampledCacheHeld;
+    return freed;
 }
 
 struct UncachedImages {
@@ -656,7 +698,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
-    std::lock_guard lock(cache.mutex);
+    SampledCacheLock lock(cache.mutex);
     dropUncachedViews(cache);
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         if (it->source != nullptr) {
@@ -1041,7 +1083,7 @@ std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memor
     if (reported == nullptr || !heap || reported->heapBudget[*heap] == 0) return TextureCacheBudget(memory);
     const auto budget = reported->heapBudget[*heap];
     const auto usage = reported->heapUsage[*heap];
-    const auto reserved = usage - std::min<std::uint64_t>(usage, textureBytes) + TextureCacheBudget(memory) + budget / 8u;
+    const auto reserved = usage - std::min<std::uint64_t>(usage, textureBytes) + TextureCacheBudget(memory) + budget / 8u + DeviceMemoryPressure();
     return std::max<std::uint64_t>(2048ull << 20u, budget > reserved ? budget - reserved : 0u);
 }
 
@@ -1054,7 +1096,7 @@ TextureCacheUse TextureCacheUsage() {
     TextureCacheUse use;
     {
         auto& sampled = Textures();
-        std::lock_guard lock(sampled.mutex);
+        SampledCacheLock lock(sampled.mutex);
         dropUncachedViews(sampled);
         use.sampledEntries = sampled.entries.size();
         use.sampledBytes = sampled.bytes;
@@ -1065,7 +1107,7 @@ TextureCacheUse TextureCacheUsage() {
 
 std::uint64_t SampledTextureCacheBudget(const Context& context) {
     auto& cache = Textures();
-    std::lock_guard lock(cache.mutex);
+    SampledCacheLock lock(cache.mutex);
     return sampledBudget(context, cache);
 }
 
@@ -1096,7 +1138,7 @@ void ClearCachedTextures(VkDevice device) {
     Require(device != VK_NULL_HANDLE, "cannot clear textures without a Vulkan device");
     auto& sampled = Textures();
     {
-        std::lock_guard lock(sampled.mutex);
+        SampledCacheLock lock(sampled.mutex);
         for (auto it = sampled.entries.begin(); it != sampled.entries.end();) {
             if (it->key.device == device) eraseTexture(sampled, it++);
             else ++it;
@@ -3361,7 +3403,7 @@ bool ShaderResources::precollectImages() {
                     record.components = memo->components;
                     record.keys = TextureClearKeys(record.resource, record.guestBytes);
                     auto& cache = Textures();
-                    std::lock_guard lock(cache.mutex);
+                    SampledCacheLock lock(cache.mutex);
                     if (const auto it = findSampledEntry(cache, context.device, record.words, record.components); it != cache.entries.end()) {
                         record.texture = it->texture;
                         record.source = it->source;
@@ -3423,7 +3465,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     // The entry must still be the cache's, holding this object (an evicted object is not reused: the
     // next lookup would make another), and it takes the stage-A generation like a hit would.
     auto& cache = Textures();
-    std::lock_guard lock(cache.mutex);
+    SampledCacheLock lock(cache.mutex);
     const auto it = findSampledEntry(cache, context.device, record.words, record.components);
     if (it == cache.entries.end() || it->texture != record.texture) return nullptr;
     if (it->source == nullptr) it->generation = record.generation;

@@ -51,6 +51,21 @@ struct SlabSlot {
 // the 256-byte copied-region buffers to fit, and those then missed on every build (81869 misses
 // and 80850 evictions per run, each a Vulkan create or destroy under the pool mutex, 3.5 s per
 // run). APS5_BUFFER_POOL_SHARED=1 keeps one tier as before.
+// Device memory pressure: when an allocation fails with VK_ERROR_OUT_OF_DEVICE_MEMORY, the
+// reclaimer (the sampled texture cache, see ShaderResources.cpp) frees memory nothing in flight
+// holds, and the failure is counted so the adaptive cache budgets leave that much more room. The
+// device-local heap usage VK_EXT_memory_budget reports does not include every allocation the
+// driver makes (on NVIDIA, host imports take device memory too), so a budget derived from it alone
+// can still run the device out.
+using DeviceMemoryReclaimer = std::uint64_t (*)(std::uint64_t wanted);
+void SetDeviceMemoryReclaimer(DeviceMemoryReclaimer reclaimer);
+// Frees up to about `wanted` bytes through the reclaimer and raises DeviceMemoryPressure().
+std::uint64_t ReclaimDeviceMemory(std::uint64_t wanted);
+// Bytes the cache budgets keep free beyond the reported budget, after the out-of-memory failures so far.
+std::uint64_t DeviceMemoryPressure();
+// vkAllocateMemory that reclaims and retries once on VK_ERROR_OUT_OF_DEVICE_MEMORY.
+VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory& memory);
+
 class BufferPool {
 public:
     explicit BufferPool(const Context& context);

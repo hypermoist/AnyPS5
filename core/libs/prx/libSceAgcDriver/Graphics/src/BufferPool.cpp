@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdio>
@@ -24,6 +25,47 @@ bool exactSizes() {
 
 constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
+}
+
+namespace {
+
+std::atomic<DeviceMemoryReclaimer> reclaimer{nullptr};
+std::atomic<std::uint64_t> pressure{0};
+std::atomic<std::uint64_t> reclaims{0};
+
+// Each failure keeps another 256 MiB (at least the failed size) free, up to 4 GiB.
+constexpr std::uint64_t PressureStep = 256ull << 20u;
+constexpr std::uint64_t PressureLimit = 4096ull << 20u;
+
+}
+
+void SetDeviceMemoryReclaimer(DeviceMemoryReclaimer function) {
+    reclaimer.store(function, std::memory_order_release);
+}
+
+std::uint64_t ReclaimDeviceMemory(std::uint64_t wanted) {
+    const auto step = std::max(PressureStep, wanted);
+    auto current = pressure.load(std::memory_order_relaxed);
+    while (current < PressureLimit && !pressure.compare_exchange_weak(current, std::min(PressureLimit, current + step), std::memory_order_relaxed)) {}
+    const auto function = reclaimer.load(std::memory_order_acquire);
+    const auto freed = function != nullptr ? function(step) : 0u;
+    const auto count = reclaims.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 16 || count % 64 == 0) std::fprintf(stderr, "[gpu] out of device memory (%llu so far): reclaimed %llu MiB of %llu MiB wanted; the cache budgets now keep %llu MiB more free\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(freed >> 20u), static_cast<unsigned long long>(step >> 20u), static_cast<unsigned long long>(pressure.load(std::memory_order_relaxed) >> 20u));
+    return freed;
+}
+
+std::uint64_t DeviceMemoryPressure() {
+    return pressure.load(std::memory_order_relaxed);
+}
+
+VkResult AllocateDeviceMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory& memory) {
+    const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+    memory = VK_NULL_HANDLE;
+    auto result = allocate(context.device, &allocation, nullptr, &memory);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY) return result;
+    if (ReclaimDeviceMemory(allocation.allocationSize) == 0) return result;
+    memory = VK_NULL_HANDLE;
+    return allocate(context.device, &allocation, nullptr, &memory);
 }
 
 BufferPool::BufferPool(const Context& context) : device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), allocateMemory(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")), mapMemory(context.Function<PFN_vkMapMemory>("vkMapMemory")), maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))) {
@@ -55,8 +97,17 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
             ++attempts;
         }
     }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        const auto freed = ReclaimDeviceMemory(allocation.allocationSize);
+        reclaimed += freed;
+        if (freed != 0) {
+            memory = VK_NULL_HANDLE;
+            result = allocateMemory(device, &allocation, nullptr, &memory);
+            ++attempts;
+        }
+    }
     if (result == VK_SUCCESS) {
-        if (attempts == 2) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<int>(initialResult), attempts);
+        if (attempts >= 2) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<int>(initialResult), attempts);
         return memory;
     }
     char details[512];

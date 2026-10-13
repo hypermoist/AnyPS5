@@ -3312,6 +3312,41 @@ void sampledTextureBudgetTests() {
     Require(SampledTextureBudget(memory, &reported, 0) == 2 * GiB, "a device without a device-local heap does not keep 2 GiB of sampled textures");
 }
 
+std::uint64_t reclaimRequested = 0;
+
+std::uint64_t testReclaimer(std::uint64_t wanted) {
+    reclaimRequested = wanted;
+    return 64ull << 20u;
+}
+
+void deviceMemoryPressureTests() {
+    using AgcDriver::Graphics::DeviceMemoryPressure;
+    using AgcDriver::Graphics::ReclaimDeviceMemory;
+    using AgcDriver::Graphics::SampledTextureBudget;
+    using AgcDriver::Graphics::SetDeviceMemoryReclaimer;
+    constexpr std::uint64_t GiB = 1ull << 30u;
+    constexpr std::uint64_t MiB = 1ull << 20u;
+    VkPhysicalDeviceMemoryProperties memory{};
+    memory.memoryHeapCount = 1;
+    memory.memoryHeaps[0] = {16 * GiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    reported.heapBudget[0] = 15 * GiB;
+    reported.heapUsage[0] = 9 * GiB;
+    const auto before = SampledTextureBudget(memory, &reported, 5 * GiB);
+    const auto pressure = DeviceMemoryPressure();
+    SetDeviceMemoryReclaimer(&testReclaimer);
+    Require(ReclaimDeviceMemory(16 * MiB) == 64 * MiB, "the reclaimer's freed bytes are not returned");
+    Require(reclaimRequested == 256 * MiB, "an out-of-memory failure smaller than 256 MiB does not ask the reclaimer for 256 MiB");
+    Require(DeviceMemoryPressure() == pressure + 256 * MiB, "an out-of-memory failure does not keep 256 MiB more free");
+    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == before - 256 * MiB, "the sampled texture budget does not shrink by the pressure");
+    ReclaimDeviceMemory(512 * MiB);
+    Require(reclaimRequested == 512 * MiB && DeviceMemoryPressure() == pressure + 768 * MiB, "a failure larger than 256 MiB does not count its own size");
+    for (int failure = 0; failure < 32; ++failure) ReclaimDeviceMemory(512 * MiB);
+    Require(DeviceMemoryPressure() == 4 * GiB, "the pressure is not held at 4 GiB");
+    SetDeviceMemoryReclaimer(nullptr);
+    Require(ReclaimDeviceMemory(16 * MiB) == 0, "without a reclaimer something was reported freed");
+}
+
 void sampledBudgetReportTests() {
     using AgcDriver::Graphics::SampledBudgetReportDue;
     using std::chrono::seconds;
@@ -5506,6 +5541,7 @@ int main(int argc, char** argv) {
         debugBranchTests();
         textureCacheBudgetTests();
         sampledTextureBudgetTests();
+        deviceMemoryPressureTests();
         sampledBudgetReportTests();
         meshArgumentTests();
         meshIndexBufferTests();
