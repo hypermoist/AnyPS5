@@ -29,7 +29,9 @@ void main() {
     uint nibble = ((y / 512u) * push.blocksPerRow + x / 1024u) * 8192u + offset;
     uint byteAddress = push.base + nibble / 2u;
     uint code = (cmask.words[byteAddress / 4u] >> ((byteAddress % 4u) * 8u + (nibble % 2u) * 4u)) & 0xfu;
-    if (code == 0xfu) return;
+    // Inferred (PPSA08427): a title marks tiles it wrote by ORing bits into their codes, so any
+    // code but 0 (fast cleared) holds the tile's own texels, as 0xF (expanded) does.
+    if (code != 0u) return;
     if (code == 0u && push.write != 0u) {
         imageStore(target, ivec2(pixel), uvec4(push.clear0, push.clear1, 0u, 0u));
         return;

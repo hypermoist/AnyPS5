@@ -232,8 +232,8 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
         for (std::uint32_t tileX = 0; tileX < layout.TilesX(); ++tileX) {
             const auto nibble = layout.Nibble(tileX, tileY);
             const auto code = (std::to_integer<std::uint32_t>(mask[nibble / 2u]) >> ((nibble % 2u) * 4u)) & 0xfu;
+            // Any code but 0 holds the tile's own texels (see CmaskClear.comp).
             if (code == 0u) cleared.push_back(tileY * layout.TilesX() + tileX);
-            else Require(code == 0xfu, "CMASK code " + std::to_string(code) + " of color target " + hexAddress(color.address) + " is not a single-sample fast-clear code (0 cleared, 15 expanded)");
         }
     }
     if (cleared.empty()) return CmaskState::Expanded;

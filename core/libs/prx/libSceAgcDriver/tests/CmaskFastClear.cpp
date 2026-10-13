@@ -149,18 +149,7 @@ void invalidCode(AgcDriver::VulkanDevice& device) {
     const auto color = target(ColorTileMode::RenderTarget);
     prepare(color, [](std::uint32_t tileX, std::uint32_t tileY) { return tileX == 2 && tileY == 0; }, 3);
     eliminate(device, color);
-    {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        device.WaitIdle();
-    }
-    prepare(color, [](std::uint32_t, std::uint32_t) { return true; });
-    try {
-        eliminate(device, color);
-    } catch (const std::runtime_error& error) {
-        Require(std::string(error.what()).find("were recorded, which are not a single-sample fast-clear code") != std::string::npos, std::string("unexpected failure: ") + error.what());
-        return;
-    }
-    throw std::runtime_error("a CMASK code 3 read by the GPU pass did not throw");
+    expect(device, color, [](std::uint32_t, std::uint32_t) { return Stale; }, "tiles with CMASK code 3 kept as written");
 }
 
 }
