@@ -116,7 +116,7 @@ void Draw(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const Row& ro
     const auto pixelResult = ShaderRecompiler::Recompile(fragment);
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {ShaderStage::Vertex, &vertexResult, 0},
-        {ShaderStage::Fragment, &pixelResult, vertexPush}
+        {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, device.Target())}
     }};
 
     AgcDriver::Graphics::State state{};

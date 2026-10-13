@@ -123,7 +123,6 @@ struct State {
     std::uint32_t paClVsOutCntl = 0;
     std::array<std::uint8_t, 8> sampleLocations{};
     bool customSampleLocations = false;
-    std::uint32_t paClVsOutCntl = 0;
 };
 
 // PA_CL_VS_OUT_CNTL bits that place position exports (clip and cull distances, the misc and the two
