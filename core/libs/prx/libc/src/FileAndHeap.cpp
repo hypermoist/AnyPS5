@@ -87,6 +87,35 @@ static std::FILE* OpenNative(const std::filesystem::path& path, const std::strin
 #endif
 }
 
+#ifdef _WIN32
+static bool AppendThroughDescriptor(int descriptor) {
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    if (descriptor <= 2 || GetFileType(handle) != FILE_TYPE_DISK) return true;
+    const int translation = ::_setmode(descriptor, _O_BINARY);
+    if (translation == -1 || ::_setmode(descriptor, translation) == -1) return false;
+    HANDLE copy = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &copy, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+        errno = EBADF;
+        return false;
+    }
+    const int appending = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(copy), _O_APPEND | translation);
+    if (appending < 0) {
+        CloseHandle(copy);
+        return false;
+    }
+    const int moved = ::_dup2(appending, descriptor);
+    const int error = errno;
+    ::_close(appending);
+    errno = error;
+    return moved == 0;
+}
+
+static bool IsPipeStream(std::FILE* native) {
+    return GetFileType(reinterpret_cast<HANDLE>(::_get_osfhandle(_fileno(native)))) == FILE_TYPE_PIPE;
+}
+#endif
+
 using GuestCompare = int (APS5_VABI *)(const void*, const void*);
 
 static void SwapElements(unsigned char* left, unsigned char* right, size_t size) {
@@ -196,6 +225,7 @@ FileStream* APS5_VABI fdopen_nid_postfix(int descriptor, const char* mode) {
         const auto release = [](void* pointer) { ::operator delete(pointer); };
         std::unique_ptr<void, decltype(release)> storage(::operator new(sizeof(FileStream)), release);
 #ifdef _WIN32
+        if (parsed->append && !AppendThroughDescriptor(descriptor)) return nullptr;
         auto* native = ::_fdopen(descriptor, nativeMode.c_str());
 #else
         auto* native = ::fdopen(descriptor, nativeMode.c_str());
@@ -345,7 +375,9 @@ size_t APS5_VABI fwrite_nid_postfix(const void* buffer, size_t size, size_t coun
 int APS5_VABI fseeko_nid_postfix(FileStream* stream, std::int64_t offset, int origin) {
     if (origin != SEEK_SET && origin != SEEK_CUR && origin != SEEK_END) { errno = 22; return -1; }
 #ifdef _WIN32
-    const int result = _fseeki64(GetNativeStream(stream), offset, origin);
+    auto* native = GetNativeStream(stream);
+    if (IsPipeStream(native)) { errno = 29; return -1; }
+    const int result = _fseeki64(native, offset, origin);
 #else
     static_assert(sizeof(off_t) == 8);
     const int result = ::fseeko(GetNativeStream(stream), offset, origin);
@@ -358,7 +390,9 @@ int APS5_VABI fseeko_nid_postfix(FileStream* stream, std::int64_t offset, int or
 
 std::int64_t APS5_VABI ftello_nid_postfix(FileStream* stream) {
 #ifdef _WIN32
-    const auto result = _ftelli64(GetNativeStream(stream));
+    auto* native = GetNativeStream(stream);
+    if (IsPipeStream(native)) { errno = 29; return -1; }
+    const auto result = _ftelli64(native);
 #else
     static_assert(sizeof(off_t) == 8);
     const auto result = ::ftello(GetNativeStream(stream));

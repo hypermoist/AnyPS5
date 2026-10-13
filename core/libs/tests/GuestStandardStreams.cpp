@@ -13,7 +13,9 @@
 #include <atomic>
 #include <thread>
 #include <stdexcept>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <fcntl.h>
+#else
 #include <unistd.h>
 #endif
 extern "C" {
@@ -267,18 +269,28 @@ static void CheckRewind() {
     rewind_nid_postfix(&stream);
     Require(feof_nid_postfix(&stream) == 0 && ferror_nid_postfix(&stream) == 0 && fgetc_nid_postfix(&stream) == 'a');
     stream.Close();
-#ifndef _WIN32
     int pipeEnds[2];
+#ifdef _WIN32
+    Require(_pipe(pipeEnds, 4096, _O_BINARY) == 0 && _write(pipeEnds[1], "pq", 2) == 2 && _close(pipeEnds[1]) == 0);
+    FileStream pipe(_fdopen(pipeEnds[0], "rb"));
+#else
     Require(::pipe(pipeEnds) == 0);
-    Require(::write(pipeEnds[1], "p", 1) == 1);
+    Require(::write(pipeEnds[1], "pq", 2) == 2);
     ::close(pipeEnds[1]);
     FileStream pipe(::fdopen(pipeEnds[0], "r"));
-    Require(fgetc_nid_postfix(&pipe) == 'p' && fgetc_nid_postfix(&pipe) == EOF && feof_nid_postfix(&pipe) != 0);
+#endif
+    Require(fgetc_nid_postfix(&pipe) == 'p');
+    for (const int origin : {SEEK_SET, SEEK_CUR, SEEK_END}) {
+        *__error_nid_postfix() = 0;
+        Require(fseeko_nid_postfix(&pipe, 0, origin) == -1 && *__error_nid_postfix() == 29);
+    }
+    *__error_nid_postfix() = 0;
+    Require(ftello_nid_postfix(&pipe) == -1 && *__error_nid_postfix() == 29 && ferror_nid_postfix(&pipe) == 0);
+    Require(fgetc_nid_postfix(&pipe) == 'q' && fgetc_nid_postfix(&pipe) == EOF && feof_nid_postfix(&pipe) != 0);
     *__error_nid_postfix() = 0;
     rewind_nid_postfix(&pipe);
     Require(*__error_nid_postfix() == 29 && feof_nid_postfix(&pipe) == 0 && ferror_nid_postfix(&pipe) == 0);
     pipe.Close();
-#endif
 }
 
 static void CheckFlushWhileReading() {
@@ -392,6 +404,31 @@ static void CheckDescriptorModes(std::FILE* original) {
 #endif
 }
 
+static void CheckDescriptorAppend(std::FILE* original) {
+    std::string expected = "retained";
+    for (const char* mode : {"a", "ab", "a+", "ae"}) {
+        const int descriptor = DuplicateDescriptor(original);
+#ifdef _WIN32
+        Require(descriptor >= 0 && _lseek(descriptor, 2, SEEK_SET) == 2);
+#else
+        Require(descriptor >= 0 && ::lseek(descriptor, 2, SEEK_SET) == 2);
+#endif
+        auto* wrapped = fdopen_nid_postfix(descriptor, mode);
+        Require(wrapped != nullptr && fileno_nid_postfix(wrapped) == descriptor);
+        Require(fputc_nid_postfix('+', wrapped) == '+' && fflush_nid_postfix(wrapped) == 0);
+        Require(fseek_nid_postfix(wrapped, 0, SEEK_SET) == 0 && fputc_nid_postfix('+', wrapped) == '+');
+        Require(fclose_nid_postfix(wrapped) == 0);
+        expected += "++";
+        const int reader = DuplicateDescriptor(original);
+        Require(reader >= 0);
+        auto* written = fdopen_nid_postfix(reader, "r");
+        Require(written != nullptr && fseek_nid_postfix(written, 0, SEEK_SET) == 0);
+        char contents[32]{};
+        Require(fgets_nid_postfix(contents, sizeof(contents), written) == contents && expected == contents);
+        Require(fclose_nid_postfix(written) == 0);
+    }
+}
+
 int main() {
     Require(_Getmbcurmax_nid_postfix() == 1 && _Getmbcurmax_nid_postfix() == ___mb_cur_max_nid_postfix());
     CheckFlushWhileReading();
@@ -421,6 +458,7 @@ int main() {
     Require(::close(descriptor) == -1);
 #endif
     CheckDescriptorModes(original);
+    CheckDescriptorAppend(original);
     Require(std::fclose(original) == 0);
     char stringOutput[256];
     std::memset(stringOutput, '!', sizeof(stringOutput));
