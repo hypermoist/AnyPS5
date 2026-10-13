@@ -7,3 +7,4 @@ Host: CachyOS, Ryzen 5 5600G, RTX 3060 12 GB (NVIDIA 615.78.08).
 - `fork-a5507eea1/`: fork branch `wip/ppsa08427-sync-fix` at a5507eea1.
 - `fork-80c723d49/`: fork branch at 80c723d49 (all hub shaders compile; hub world still black).
 - `fork-d2e0e116c/`: fork branch at d2e0e116c (first hub world render; frames alternate between lit and grey/noisy).
+- `fork-d2e0e116c-no-alias-borrow/`: same build run with `APS5_NO_ALIAS_BORROW=1`; every hub frame is lit (80/80 consecutive frames). `0-before-grey-frame.png` is a typical frame without the switch.
