@@ -952,7 +952,12 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto view = read(cx, 0x31b + stride);
     Require((view & ~0x3fffffffu) == 0, "reserved CB_COLOR_VIEW bits are set");
     const auto slice = view & 0x1fffu;
-    Require(slice == ((view >> 13u) & 0x1fffu), "color views of several array slices are unsupported");
+    if (slice != ((view >> 13u) & 0x1fffu)) {
+        const auto layout = read(cx, 0x3b8 + slot);
+        char text[192];
+        std::snprintf(text, sizeof(text), "AGC graphics: color views of several array slices are unsupported (slices %u-%u of a %s surface of %u)", slice, (view >> 13u) & 0x1fffu, ((layout >> 24u) & 3u) == 2u ? "3D" : "2D array", (layout & 0x1fffu) + 1u);
+        throw std::runtime_error(text);
+    }
     const auto viewMip = (view >> 26u) & 0xfu;
     const auto attrib2 = read(cx, 0x3b0 + slot);
     const auto maxMip = attrib2 >> 28u;
