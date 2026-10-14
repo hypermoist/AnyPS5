@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvSpecialization.hpp"
 #include <array>
 #include <cstdio>
+#include <exception>
 #include <map>
 #include <set>
 #include <string>
@@ -327,9 +328,22 @@ void testLoopContinuePatchingAndEmissionRanges() {
     }
 }
 
+void testIdsBeyondTheBoundAreRejected() {
+    auto words = foldedSwitchModule(13u, {1u, 1u, 1u});
+    words[3] = 12u;
+    bool rejected = false;
+    try {
+        static_cast<void>(ShaderRecompiler::SpecializeSpirv(words));
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    check(rejected, "a module whose ids reach its bound was specialized");
+}
+
 int main() {
     testFoldingLeavesNoDeadBlocksOrConstants();
     testLoopContinuePatchingAndEmissionRanges();
+    testIdsBeyondTheBoundAreRejected();
     testStructExtractsAreNotShuffled();
     testRepeatedTypesShareOneId();
     testOperandShapesDoNotCollide();

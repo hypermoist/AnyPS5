@@ -18,7 +18,7 @@ namespace {
 template<typename TFloat>
 std::int64_t RoundToInt64(TFloat value) {
     const TFloat rounded = std::round(value);
-    if (!(rounded >= static_cast<TFloat>(INT64_MIN) && rounded < static_cast<TFloat>(INT64_MAX))) {
+    if (!(rounded >= static_cast<TFloat>(INT64_MIN) && rounded < -static_cast<TFloat>(INT64_MIN))) {
         std::feraiseexcept(FE_INVALID);
         return INT64_MIN;
     }
@@ -77,6 +77,44 @@ float SinhfExp(float x) {
     const float y = 1.0f - ((low - (x * c) / (2.0f - c)) - high);
     if (k == 128) return y * 2.0f * 0x1p127f;
     return y * std::bit_cast<float>(static_cast<std::uint32_t>(0x7f + k) << 23);
+}
+
+float AtanhfLog1p(float x) {
+    constexpr float Ln2High = 6.9313812256e-01f, Ln2Low = 9.0580006145e-06f;
+    constexpr float Lp1 = 6.6666668653e-01f, Lp2 = 4.0000000596e-01f, Lp3 = 2.8571429849e-01f, Lp4 = 2.2222198546e-01f;
+    constexpr float Lp5 = 1.8183572590e-01f, Lp6 = 1.5313838422e-01f, Lp7 = 1.4798198640e-01f;
+    const std::uint32_t bits = std::bit_cast<std::uint32_t>(x);
+    if (bits < 0x38000000u) return bits < 0x33800000u ? x : x - x * x * 0.5f;
+    int k = 0;
+    float f = x;
+    float c = 0.0f;
+    std::uint32_t mantissa = 1;
+    if (bits >= 0x3ed413d0u) {
+        const float u = 1.0f + x;
+        const std::uint32_t uBits = std::bit_cast<std::uint32_t>(u);
+        k = static_cast<int>(uBits >> 23) - 127;
+        c = (k > 0 ? 1.0f - (u - x) : x - (u - 1.0f)) / u;
+        mantissa = uBits & 0x007fffffu;
+        if (mantissa < 0x3504f4u) {
+            f = std::bit_cast<float>(mantissa | 0x3f800000u) - 1.0f;
+        } else {
+            ++k;
+            f = std::bit_cast<float>(mantissa | 0x3f000000u) - 1.0f;
+            mantissa = (0x00800000u - mantissa) >> 2;
+        }
+    }
+    const float halfSquare = 0.5f * f * f;
+    const float kFloat = static_cast<float>(k);
+    if (mantissa == 0) {
+        if (f == 0.0f) return kFloat * Ln2High + (c + kFloat * Ln2Low);
+        const float r = halfSquare * (1.0f - 0.66666666666666666f * f);
+        return kFloat * Ln2High - ((r - (kFloat * Ln2Low + c)) - f);
+    }
+    const float s = f / (2.0f + f);
+    const float z = s * s;
+    const float r = z * (Lp1 + z * (Lp2 + z * (Lp3 + z * (Lp4 + z * (Lp5 + z * (Lp6 + z * Lp7))))));
+    if (k == 0) return f - (halfSquare - s * (halfSquare + r));
+    return kFloat * Ln2High - ((halfSquare - (s * (halfSquare + r) + (kFloat * Ln2Low + c))) - f);
 }
 
 static_assert(std::numeric_limits<long double>::digits == 64, "guest long double is the x87 80-bit format");
@@ -144,7 +182,18 @@ float APS5_VABI asinf_nid_postfix(float x) {
     errno = saved_errno;
     return result;
 }
-float APS5_VABI acosf_nid_postfix(float x) { return std::acos(x); }
+float APS5_VABI acosf_nid_postfix(float x) {
+    if (std::isnan(x)) {
+        return std::bit_cast<float>(std::bit_cast<std::uint32_t>(x) | 0x00400000u);
+    }
+    if (std::fabs(x) > 1.0f) {
+        return std::bit_cast<float>(0xffc00000u);
+    }
+    const int saved_errno = errno;
+    const float result = std::acos(x);
+    errno = saved_errno;
+    return result;
+}
 float APS5_VABI atan2f_nid_postfix(float y, float x) { return std::atan2(y, x); }
 float APS5_VABI hypotf_nid_postfix(float x, float y) { return static_cast<float>(std::hypot(static_cast<double>(x), static_cast<double>(y))); }
 double APS5_VABI hypot_nid_postfix(double x, double y) {
@@ -200,6 +249,10 @@ double APS5_VABI fabs_nid_postfix(double x) { return std::fabs(x); }
 int APS5_VABI abs_nid_postfix(int x) { return x < 0 ? static_cast<int>(0u - static_cast<unsigned>(x)) : x; }
 double APS5_VABI trunc_nid_postfix(double x) { return std::trunc(x); }
 double APS5_VABI ceil_nid_postfix(double x) { return std::ceil(x); }
+double APS5_VABI floor_nid_postfix(double x) { return std::floor(x); }
+float APS5_VABI truncf_nid_postfix(float x) { return std::trunc(x); }
+float APS5_VABI ceilf_nid_postfix(float x) { return std::ceil(x); }
+float APS5_VABI floorf_nid_postfix(float x) { return std::floor(x); }
 double APS5_VABI fma_nid_postfix(double x, double y, double z) { return std::fma(x, y, z); }
 long double APS5_VABI acosl_nid_postfix(long double x) { return std::acos(x); }
 
@@ -289,6 +342,25 @@ double APS5_VABI acosh_nid_postfix(double x) { return std::acosh(x); }
 float APS5_VABI acoshf_nid_postfix(float x) { return std::acosh(x); }
 double APS5_VABI atanh_nid_postfix(double x) { return std::atanh(x); }
 
+float APS5_VABI atanhf_nid_postfix(float x) {
+    const std::uint32_t magnitude = std::bit_cast<std::uint32_t>(x) & 0x7fffffffu;
+    if (magnitude > 0x3f800000u) {
+        std::feraiseexcept(FE_INVALID);
+        errno = EDOM;
+        return (x - x) / (x - x);
+    }
+    if (magnitude == 0x3f800000u) {
+        errno = ERANGE;
+        return x / 0.0f;
+    }
+    if (magnitude < 0x31800000u && 1.0e30f + x > 0.0f) return x;
+    const float absolute = std::fabs(x);
+    const float twice = absolute + absolute;
+    const float t = magnitude < 0x3f000000u ? 0.5f * AtanhfLog1p(twice + twice * absolute / (1.0f - absolute))
+                                            : 0.5f * AtanhfLog1p(twice / (1.0f - absolute));
+    return std::signbit(x) ? -t : t;
+}
+
 void APS5_VABI sincos_nid_postfix(double x, double* sinp, double* cosp) {
     *sinp = std::sin(x);
     *cosp = std::cos(x);
@@ -312,6 +384,18 @@ float APS5_VABI __powisf2_nid_postfix(float base, int exponent) {
         base *= base;
     }
     return reciprocal ? 1.0f / result : result;
+}
+double APS5_VABI __powidf2_nid_postfix(double base, int exponent) {
+    const bool reciprocal = exponent < 0;
+    double result = 1.0;
+    unsigned int magnitude = reciprocal ? 0u - static_cast<unsigned int>(exponent) : static_cast<unsigned int>(exponent);
+    while (magnitude != 0u) {
+        if ((magnitude & 1u) != 0u) result *= base;
+        magnitude >>= 1u;
+        if (magnitude == 0u) break;
+        base *= base;
+    }
+    return reciprocal ? 1.0 / result : result;
 }
 float APS5_VABI expf_nid_postfix(float x) { return std::exp(x); }
 float APS5_VABI exp2f_nid_postfix(float x) { return std::exp2(x); }
@@ -381,8 +465,23 @@ short APS5_VABI _FDtest_nid_postfix(const float* value) {
     if (exponent == 0) return fraction != 0 ? Denormal : Zero;
     return Finite;
 }
+
+short APS5_VABI _Dtest_nid_postfix(const double* value) {
+    constexpr short Denormal = -2, Finite = -1, Zero = 0, Infinite = 1, NotANumber = 2;
+    if (value == nullptr) throw std::invalid_argument("_Dtest: null value");
+    std::uint64_t bits;
+    std::memcpy(&bits, value, sizeof(bits));
+    const auto exponent = bits & 0x7ff0000000000000u;
+    const auto fraction = bits & 0x000fffffffffffffu;
+    if (exponent == 0x7ff0000000000000u) return fraction != 0 ? NotANumber : Infinite;
+    if (exponent == 0) return fraction != 0 ? Denormal : Zero;
+    return Finite;
+}
+
 int APS5_VABI __isnanf_nid_postfix(float x) { return std::isnan(x) ? 1 : 0; }
 int APS5_VABI isnanf_nid_postfix(float x) { return __isnanf_nid_postfix(x); }
+int APS5_VABI isnan_nid_postfix(double x) { return __isnan_nid_postfix(x); }
+int APS5_VABI isinf_nid_postfix(double x) { return __isinf_nid_postfix(x); }
 int APS5_VABI __fpclassifyf_nid_postfix(float x) {
     constexpr int Infinite = 0x01, NotANumber = 0x02, Normal = 0x04, Subnormal = 0x08, Zero = 0x10;
     std::uint32_t bits;
@@ -440,4 +539,13 @@ int APS5_VABI _Fltrounds_nid_postfix(void) {
     return SonyFltrounds();
 }
 
+union SonyDconst {
+    unsigned short _Word[8];
+    float _Float;
+    double _Double;
+    long double _Long_double;
+};
+
+static_assert(std::endian::native == std::endian::little);
+SonyDconst _Inf_nid_postfix {{0, 0, 0, 0x7ff0, 0, 0, 0, 0}};
 }

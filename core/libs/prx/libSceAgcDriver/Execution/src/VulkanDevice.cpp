@@ -116,7 +116,7 @@ bool CoreVulkanCapability(std::uint32_t capability) {
     }
 }
 
-void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline) {
+void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.flags = flags;
     info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -129,6 +129,7 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     subgroup.requiredSubgroupSize = subgroupSize;
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
+    auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
 }
 
@@ -295,6 +296,7 @@ struct VulkanDevice::State {
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool float16DenormPreserve = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
@@ -1195,6 +1197,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->capabilities.push_back(spv::CapabilityRoundingModeRTE);
         state->capabilities.push_back(spv::CapabilityDenormPreserve);
     }
+    state->float16DenormPreserve = floatControls.shaderDenormPreserveFloat16 == VK_TRUE &&
+        floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+    if (state->float16DenormPreserve && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormPreserve)) == state->capabilities.end()) state->capabilities.push_back(spv::CapabilityDenormPreserve);
     deviceExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     deviceExtensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
     state->capabilities.push_back(4448);
@@ -2194,7 +2199,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // a completion-deferred label): it lands only when that batch is reaped, whatever its fence.
     const auto completionStoreOverlaps = [&](std::uint64_t address) {
         if (alwaysSync || state->CopiedWriterOverlaps(address, bytes)) return true;
-        return Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes);
+        return Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes);
     };
     // The CPU decision (see the header): pure queries, in the order that makes the first failing
     // test the reason; a signaled writer of the source is fine (its in-place stores are final in
@@ -2606,9 +2611,23 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
+    auto& dumps = Dumps();
     if (buffer.tilingMode == 1) {
         const auto pixels = ReadDisplayBuffer(buffer);
-        return present(buffer.width, buffer.height, true, pixels);
+        bool dumpFrame = false;
+        if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+            if (dumps.cpu) {
+                WriteFrameBmp(dumps.dumped++, buffer.width, buffer.height, pixels, DumpScale());
+            } else {
+                state->nextDumpIndex = dumps.dumped++;
+                dumpFrame = true;
+            }
+        }
+        if (!present(buffer.width, buffer.height, true, pixels, nullptr, nullptr, VK_FILTER_LINEAR, dumpFrame)) {
+            if (dumpFrame) --dumps.dumped;
+            return false;
+        }
+        return true;
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // The display buffer is usually a resident render target whose results are still on the GPU: it
@@ -2648,7 +2667,6 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         }
     }
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
-    auto& dumps = Dumps();
     bool dumpFrame = false;
     if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
         if (dumps.cpu) {
@@ -2691,9 +2709,13 @@ bool VulkanDevice::AcquireImage() {
     std::uint32_t index = 0;
     timing.Mark("fence_reset");
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
-    const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 5'000'000'000ULL, VK_NULL_HANDLE, state->acquireFence, &index);
+    const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 0, VK_NULL_HANDLE, state->acquireFence, &index);
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
         state->extent = {0, 0};
+        return false;
+    }
+    if (acquired == VK_NOT_READY || acquired == VK_TIMEOUT) {
+        ++presentCounters.acquireDrops;
         return false;
     }
     if (acquired != VK_SUBOPTIMAL_KHR) check(acquired, "vkAcquireNextImageKHR");
@@ -3072,6 +3094,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
+    target.float16DenormPreserve = state->float16DenormPreserve;
     target.fixedPushSlots = state->graphicsPipelineLibrary;
     static const bool relaxedFloat = std::getenv("APS5_RELAXED_FLOAT") != nullptr;
     target.relaxedFloat = relaxedFloat;
@@ -3155,6 +3178,7 @@ Graphics::Context VulkanDevice::buildContext() const {
         state->depthClamp,
         state->hostImportAlignment
     };
+    context.pipelineCacheSynchronization = state->pipelineCache ? &state->pipelineCache->Synchronization() : nullptr;
     context.dmaBufImport = state->dmaBufImport;
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
@@ -3182,11 +3206,11 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.imageInt64Atomics = state->imageInt64Atomics;
     context.geometryShader = state->geometryShader;
     context.sampleRateShading = state->sampleRateShading;
+    context.shaderClipDistance = state->shaderClipDistance;
+    context.shaderCullDistance = state->shaderCullDistance;
     context.nullDescriptors = state->shaderProfile != nullptr && state->shaderProfile->NullDescriptors();
     context.bufferInt64Atomics = state->bufferInt64Atomics;
     context.placeholderImages = state->placeholderImages.get();
-    context.clipDistance = state->shaderClipDistance;
-    context.cullDistance = state->shaderCullDistance;
     context.viewportIndexLayer = state->viewportIndexLayer;
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
@@ -4368,7 +4392,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             std::fprintf(stderr, "[compute-capture] %s\n", path.string().c_str());
         }
         if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
-        CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline);
+        CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization);
         objects->destroyModule(objects->device, objects->module, nullptr);
         objects->module = VK_NULL_HANDLE;
         Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);

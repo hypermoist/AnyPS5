@@ -141,6 +141,7 @@ bool RawGraphicsDrawn() {
 namespace {
 
 void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
+    if (prepared.pending) PrioritizeRegistrationPreparation(prepared);
     prepared.settled.wait(lock, [&] { return !prepared.pending; });
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
 }
@@ -165,6 +166,23 @@ bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset
     });
     if (codeOffset == 0) snapshot.workgroupUse->store(used ? Used : Unused, std::memory_order_release);
     return used;
+}
+
+std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl) {
+    constexpr std::uint8_t Unknown = 0, Unused = 1, Used = 2;
+    const auto bits = paClVsOutCntl & Graphics::PositionExportLayoutBits;
+    if (bits == 0) return 0;
+    const bool cached = snapshot != nullptr && codeOffset == 0;
+    if (cached) {
+        const auto use = snapshot->positionVectorUse->load(std::memory_order_acquire);
+        if (use != Unknown) return use == Used ? bits : 0;
+    }
+    const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+    const bool used = std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto& instruction) {
+        return instruction.family == ShaderRecompiler::RdnaInstructionFamily::EXP && instruction.exportTarget >= 0x0du && instruction.exportTarget <= 0x0fu && instruction.exportEnableMask != 0;
+    });
+    if (cached) snapshot->positionVectorUse->store(used ? Used : Unused, std::memory_order_release);
+    return used ? bits : 0;
 }
 
 
@@ -687,7 +705,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     if (stage != Stage::Compute && stage != Stage::Fragment && snapshot.type != 6) {
         vertex = Graphics::DecodeVertexStageInfo(snapshot.header, snapshot.headerAddress, plan->userData, nullptr, true, 8u - firstUser);
         const auto outputs = state.context.find(0x207u);
-        if (vertex && outputs != state.context.end()) vertex->paClVsOutCntl = outputs->second & Graphics::PositionExportLayoutBits;
+        if (vertex && outputs != state.context.end()) vertex->paClVsOutCntl = PositionExportLayout(&snapshot, codeOffset, std::span(snapshot.code).subspan(codeOffset), outputs->second);
     }
     plan->swappc = {vertex.has_value(), firstUser, userCount};
     if (deferred != nullptr) {
@@ -700,6 +718,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     plan->memory = {{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
     auto& request = plan->request.emplace(ShaderRecompiler::RecompileRequest{{stage, address, code, snapshot.headerAddress, snapshot.header}, {wave, firstUser, plan->userData, compute, pixel, vertex, plan->memory, RegisteredFloatMode(snapshot)}, stage == Stage::Compute ? device.ComputeTarget(wave) : device.Target(), {0, 0, 0, 128}, graphics});
     if (graphics && graphics->mesh) request.layout.pushConstantSizeBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;
+    if (graphics && graphics->tessellation) request.layout.pushConstantSizeBytes = ShaderRecompiler::TessellationLevelPushOffsetBytes;
     if (pixel && device.GraphicsPipelineLibraries()) request.layout.pushConstantOffsetBytes = Graphics::FixedPushOffset(Stage::Fragment);
     return plan;
 }
@@ -750,8 +769,16 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
 class RegistrationPreparePool {
 public:
     static RegistrationPreparePool& Instance() {
-        static auto* pool = new RegistrationPreparePool(std::max(2u, std::thread::hardware_concurrency() / 2u));
+        static auto* pool = [] {
+            auto* created = new RegistrationPreparePool(std::max(2u, std::thread::hardware_concurrency() / 2u));
+            PreparationSlot().store(created);
+            return created;
+        }();
         return *pool;
+    }
+
+    static RegistrationPreparePool* Existing() {
+        return PreparationSlot().load();
     }
 
     static RegistrationPreparePool& Prebuild() {
@@ -769,6 +796,11 @@ public:
     }
 
 private:
+    static std::atomic<RegistrationPreparePool*>& PreparationSlot() {
+        static std::atomic<RegistrationPreparePool*> slot{nullptr};
+        return slot;
+    }
+
     static std::atomic<RegistrationPreparePool*>& PrebuildSlot() {
         static std::atomic<RegistrationPreparePool*> slot{nullptr};
         return slot;
@@ -776,17 +808,26 @@ private:
 
 public:
 
-    void Submit(std::function<void()> task) {
+    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr) {
         {
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
-                tasks.push_back(std::move(task));
+                if (prepared != nullptr && prepared->demanded.load()) tasks.push_front({std::move(task), prepared});
+                else tasks.push_back({std::move(task), prepared});
                 lock.unlock();
                 ready.notify_one();
                 return;
             }
         }
         task();
+    }
+
+    void Prioritize(const PreparedShaders& prepared) {
+        std::lock_guard lock(mutex);
+        const auto found = std::ranges::find_if(tasks, [&](const auto& task) { return task.prepared == &prepared; });
+        if (found == tasks.end()) return;
+        if (std::getenv("APS5_TRACE_PREPARATION_WAIT") != nullptr) std::fprintf(stderr, "[shader-prepare] demanded queued task at position %zu of %zu\n", static_cast<std::size_t>(std::distance(tasks.begin(), found)), tasks.size());
+        std::rotate(tasks.begin(), found, std::next(found));
     }
 
     void Close() {
@@ -814,7 +855,7 @@ private:
         auto& pool = *static_cast<RegistrationPreparePool*>(argument);
         if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("shader prepare", TraceThread::DefaultCapacity / 8);
         for (;;) {
-            std::function<void()> task;
+            Task task;
             {
                 std::unique_lock lock(pool.mutex);
                 pool.ready.wait(lock, [&] { return !pool.tasks.empty(); });
@@ -822,8 +863,8 @@ private:
                 pool.tasks.pop_front();
                 ++pool.running;
             }
-            task();
-            task = nullptr;
+            task.function();
+            task = {};
             {
                 std::lock_guard lock(pool.mutex);
                 --pool.running;
@@ -833,10 +874,15 @@ private:
         return nullptr;
     }
 
+    struct Task {
+        std::function<void()> function;
+        const PreparedShaders* prepared = nullptr;
+    };
+
     std::mutex mutex;
     std::condition_variable ready;
     std::condition_variable idle;
-    std::deque<std::function<void()>> tasks;
+    std::deque<Task> tasks;
     unsigned threads = 0;
     unsigned running = 0;
     bool closed = false;
@@ -848,6 +894,7 @@ bool AsyncRegistrationPrepare() {
 }
 
 void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
+    const auto* preparedKey = snapshot->prepared.get();
     SubmitRegistrationPreparation([snapshot = std::move(snapshot), plan = std::move(plan)] {
         PerformanceContext timingContext(FrameTiming::Preparation());
         std::vector<PreparedShaders::Entry> entries;
@@ -869,13 +916,18 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
             prepared.pending = false;
         }
         prepared.settled.notify_all();
-    });
+    }, preparedKey);
 }
 
 }
 
-void SubmitRegistrationPreparation(std::function<void()> task) {
-    RegistrationPreparePool::Instance().Submit(std::move(task));
+void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared) {
+    RegistrationPreparePool::Instance().Submit(std::move(task), prepared);
+}
+
+void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {
+    prepared.demanded.store(true);
+    if (auto* pool = RegistrationPreparePool::Existing()) pool->Prioritize(prepared);
 }
 
 void SubmitLibraryPrebuild(std::function<void()> task) {
@@ -914,7 +966,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
     std::vector<PreparedGraphicsStage> prepared;
     std::uint32_t pushOffset = 0;
     const bool fixedSlots = target.fixedPushSlots;
-    const auto capacity = decoded.state.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushSlotBytes;
+    const auto capacity = decoded.state.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : decoded.state.stages.tessellation ? ShaderRecompiler::TessellationLevelPushOffsetBytes : Graphics::PipelinePushSlotBytes;
     for (std::size_t index = 0; index < decoded.programs.size(); ++index) {
         if (decoded.roles[index] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
         const auto& program = decoded.programs[index];
@@ -922,7 +974,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         const auto wave = fragment ? decoded.state.stages.fragmentWaveSize : decoded.state.stages.vertexWaveSize;
         std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
         if (!fragment) vertex = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, nullptr, true, 8u - program.firstUserSgpr);
-        if (vertex) vertex->paClVsOutCntl = decoded.state.paClVsOutCntl & Graphics::PositionExportLayoutBits;
+        if (vertex) vertex->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, decoded.state.paClVsOutCntl) | decoded.state.layerExports;
         pushOffset = Graphics::StagePushOffset(pushOffset, program.binary.stage, fixedSlots);
         const auto offset = pushOffset;
         const auto room = (fixedSlots && fragment ? Graphics::PipelinePushSlotBytes : capacity) - pushOffset % Graphics::PipelinePushSlotBytes;

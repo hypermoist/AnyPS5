@@ -73,6 +73,7 @@ Framebuffer::Framebuffer(const Context& context, VkRenderPass renderPass, std::s
     // Cached objects outlive their device's teardown; they must not keep its buffer pool alive past it.
     this->context.bufferPool.reset();
     Require(extent.width != 0 && extent.height != 0 && extent.width <= context.limits.maxFramebufferWidth && extent.height <= context.limits.maxFramebufferHeight, "framebuffer extent exceeds device limits");
+    Require(layers != 0 && layers <= context.limits.maxFramebufferLayers, "framebuffer layers exceed device limits");
     views.assign(targets.begin(), targets.end());
     if (renderPass == VK_NULL_HANDLE) return;
     VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -81,7 +82,6 @@ Framebuffer::Framebuffer(const Context& context, VkRenderPass renderPass, std::s
     framebufferInfo.pAttachments = targets.empty() ? nullptr : targets.data();
     framebufferInfo.width = extent.width;
     framebufferInfo.height = extent.height;
-    Require(layers != 0 && layers <= context.limits.maxFramebufferLayers, "framebuffer layers exceed device limits");
     framebufferInfo.layers = layers;
     Check(context.Function<PFN_vkCreateFramebuffer>("vkCreateFramebuffer")(context.device, &framebufferInfo, nullptr, &framebuffer), "vkCreateFramebuffer");
 }
@@ -499,13 +499,18 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             return;
         }
         if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
-        else Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+        else {
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+        }
         if (alternateAlpha) {
             blend.pAttachments = secondChannels.data();
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &secondChannel), "vkCreateGraphicsPipelines");
         }
         if (state.depthBiasPerFace) {
             raster.cullMode = VK_CULL_MODE_FRONT_BIT;
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &backFaces), "vkCreateGraphicsPipelines");
         }
         for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
@@ -827,6 +832,7 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
         append(key, tessellation.domain);
         append(key, tessellation.partitioning);
         append(key, tessellation.outputTopology);
+        append(key, tessellation.patchesPerGroup);
     }
 }
 

@@ -276,10 +276,12 @@ int main() {
         Run("layered volume draw through the driver", std::nullopt);
         Run("layered volume draw through the driver under uncompressed DCC keys", std::uint8_t{0xff});
         Run("layered volume draw through the driver under 0000 fast-clear DCC keys", std::uint8_t{0x00});
+        AgcDriverShutdown_nid_postfix();
         std::puts("layered volume draws through the driver passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
+        AgcDriverShutdown_nid_postfix();
         return 1;
     }
 }

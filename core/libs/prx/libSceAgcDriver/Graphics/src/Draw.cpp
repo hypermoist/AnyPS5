@@ -190,20 +190,8 @@ void proveCmask(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     else cmaskProofs()[address] = {bytes, generation};
 }
 
-std::string hexAddress(std::uint64_t address) {
-    char text[24];
-    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
-    return text;
-}
-
 void requireCmaskCodes(std::uint32_t codes) {
-    if (codes == 0) return;
     Require((codes & 1u) == 0, "a CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys, was recorded");
-    std::string listed;
-    for (std::uint32_t code = 1; code < 15; ++code) {
-        if ((codes >> code) & 1u) listed += (listed.empty() ? "" : ", ") + std::to_string(code);
-    }
-    Require(false, "CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)");
 }
 
 CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::vector<std::uint32_t>& cleared) {
@@ -658,8 +646,9 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(context.subgroup.supportedStages);
         add(context.subgroup.supportedOperations);
         add(context.fragmentShaderBarycentric);
-        add(context.clipDistance);
-        add(context.cullDistance);
+        add(context.shaderClipDistance);
+        add(context.shaderCullDistance);
+        add(context.viewportIndexLayer);
         add(state.paClVsOutCntl);
         add(state.stages.mesh.has_value());
         if (state.stages.mesh) {
@@ -681,6 +670,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
             add(tessellation.domain);
             add(tessellation.partitioning);
             add(tessellation.outputTopology);
+            add(tessellation.patchesPerGroup);
         }
     }
     return keyed;
@@ -712,7 +702,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
     }
     std::set<std::uint32_t> outputs;
     try {
-        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.clipDistance, context.cullDistance, context.viewportIndexLayer);
+        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.shaderClipDistance, context.shaderCullDistance, context.viewportIndexLayer);
     } catch (const std::exception& error) {
         if (keyed) {
             std::lock_guard lock(validationMutex());
@@ -1058,6 +1048,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
+        Require(((state.stages.registerValue >> 19u) & 3u) == 0 || !draw.indexed, "indexed fast-launch draws are unsupported");
         if (args == nullptr) {
             const auto step = mesh.inputPrimitive == 5 || mesh.inputPrimitive == 6 ? 1u : inputSize;
             const auto primitives = (draw.indexCount - inputSize) / step + 1u;
@@ -1157,7 +1148,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto bytes = args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance);
         const auto& fields = attribute.resource.fields;
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
-        Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
+        const auto firstByte = args == nullptr ? VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance) : 0;
+        Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address + firstByte, "vertex buffer aliases the render target");
         const auto stride = (fields[1] >> 16u) & 0x3fffu;
         fetchOf[i] = fetches.size();
         fetches.push_back({address, address + bytes, stride, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
@@ -1567,6 +1559,12 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
     if (bytes == nullptr) {
         resources.PatchPushConstants(block);
         stages = PushConstantStages(shaders);
+    }
+    if (state.stages.tessellation) {
+        for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::TessellationLevelPushOffsetBytes, "a stage's push constants overlap the tessellation levels");
+        const std::array<float, ShaderRecompiler::TessellationLevelPushBytes / 4> levels{state.stages.minTessellationLevel, state.stages.maxTessellationLevel};
+        static_assert(ShaderRecompiler::TessellationLevelPushOffsetBytes + ShaderRecompiler::TessellationLevelPushBytes == PipelinePushSlotBytes);
+        std::memcpy(block.data() + ShaderRecompiler::TessellationLevelPushOffsetBytes, levels.data(), sizeof(levels));
     }
     if (!state.stages.mesh) {
         pipeline.PushConstants(commands, stages, block);
@@ -2159,7 +2157,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !state.depth && resolved.moved.empty() && !multisampled) {
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty() && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -2178,6 +2176,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             recipe->masked = masked;
             recipe->fragmentOutputs = inputs.fragmentOutputs;
             recipe->shaderStages = inputs.shaderStages;
+            recipe->hasDepth = state.depth.has_value();
             *recipeOut = std::move(recipe);
         }
         timing.Mark("draw_and_resource_release");
@@ -2455,7 +2454,9 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     Require(!draw.indirect, "a draw recipe covers direct draws only");
     auto* recorder = Recorder::Active();
     if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
-    Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
+    if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
+    const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
+    Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
     if (inputs.nothing) {
         result.recorded = true;
@@ -2481,6 +2482,12 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
         targets.push_back(std::move(resident));
+    }
+    if (recipe.hasDepth) {
+        timer.phase(PhaseSetup);
+        const auto depthView = DepthSurfaceView(context, *state.depth);
+        timer.phase(PhaseReadTarget);
+        if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
     }
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed

@@ -69,7 +69,11 @@ public:
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag);
     static VkFormat DepthCopyFormat(VkFormat colorFormat);
     static bool CanDepthCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    struct BlockCopyTag {};
+    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, BlockCopyTag);
+    static bool CanBlockCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     bool IsDepthCopy() const { return perUseCopy == PerUseCopy::RefreshedOnReuse; }
+    bool IsBlockCopy() const { return blockFormat != VK_FORMAT_UNDEFINED; }
     bool RefreshDepthCopy();
     struct DepthCopyCounts {
         std::uint64_t textures;
@@ -77,15 +81,6 @@ public:
     };
     static DepthCopyCounts TakeDepthCopyCounts();
     static bool CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
-    // A block-compressed texture over the memory of an uncompressed storage image whose texels are
-    // its blocks (same address, tiling and bytes; the storage extent is the block extent), as a
-    // virtual-texture page cache written by compute and sampled compressed: an image of its own,
-    // refreshed by a GPU copy from the storage image after each write, never read back to memory.
-    struct BlockCopyTag {};
-    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, BlockCopyTag);
-    static bool CanBlockCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
-    bool IsBlockCopy() const { return blockCopy; }
-    bool RefreshBlockCopy();
     ~Texture();
     Texture(const Texture&) = delete;
     Texture& operator=(const Texture&) = delete;
@@ -93,6 +88,8 @@ public:
     VkImageView View() const;
     VkImageView FirstLayerView() const { return firstLayerView; }
     VkImageView BaseLevelView() const;
+    bool HasSrgbView() const { return srgbInfo.has_value(); }
+    VkImageView SrgbView(bool firstLayer, bool baseLevel) const;
     struct ViewRange {
         VkImageViewType type;
         std::uint32_t levels;
@@ -118,9 +115,10 @@ public:
 
 private:
     void release() noexcept;
+    bool refreshBlockCopy();
     void createFirstLayerView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
     void prepareBaseLevelView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
-    bool refreshedPerUse = false;
+    void prepareSrgbView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
 
     // Held by value: cached textures outlive the Context of the draw that created them.
     Context context;
@@ -135,6 +133,10 @@ private:
     std::optional<VkImageViewCreateInfo> baseLevelInfo;
     mutable std::mutex baseLevelMutex;
     mutable VkImageView baseLevelView = VK_NULL_HANDLE;
+    std::optional<VkImageViewCreateInfo> srgbInfo;
+    float srgbMinLod = 0.0f;
+    mutable std::mutex srgbMutex;
+    mutable std::array<VkImageView, 3> srgbViews{};
     VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkDeviceSize allocationBytes = 0;
     VkDeviceSize countedBytes = 0;
@@ -143,14 +145,15 @@ private:
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
     PerUseCopy perUseCopy = PerUseCopy::None;
-    bool blockCopy = false;
     bool copiedOnce = false;
     std::uint64_t copiedVersion = 0;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+    VkFormat blockFormat = VK_FORMAT_UNDEFINED;
     std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0, copyElementBytes = 0;
 };
 
 VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
+VkFormat SrgbTwinFormat(const Context& context, VkFormat format);
 
 // A guest texture a shader writes through a storage image. It is uploaded like a sampled texture;
 // after the GPU work completes its results are stored to guest memory (retiled, changed bytes only),
@@ -341,7 +344,7 @@ public:
     // GuestMemory::GpuMutex only, as Refresh is; never from a build's stage A.
     DccKeys UploadedKeys() const { return uploadedKeys; }
     DccKeys FilledKeys() const { return filledKeys; }
-    bool GuestSnapshotValid() const { return originalValid; }
+    bool GuestSnapshotValid() const { return originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); }
     DccKeyProof& KeyProof() const { return keyProof; }
     DccRangeProof& TargetKeyProof() const { return targetKeyProof; }
     DccKeys ProvedKeys() const;
@@ -353,6 +356,7 @@ public:
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
     std::uint64_t GuestBytes() const;
+    std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
 private:
@@ -363,6 +367,7 @@ private:
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
     void captureGuestBytes(const std::vector<bool>* layers);
+    bool originalHolds(std::uint64_t address, std::size_t bytes) const;
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
     // each, 64 KiB blocks the CPU wrote since the layer's generation keep the CPU's bytes. Block
@@ -595,7 +600,7 @@ private:
     bool dirty = false;
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
-    bool originalValid = true;
+    std::vector<bool> layerOriginal;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;

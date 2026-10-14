@@ -110,7 +110,7 @@ void Draw(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const Row& ro
         {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(PixelCode.data()), PixelCode, 0, {}},
         {waveSize, 0, std::vector<std::uint32_t>(4, 0u), std::nullopt, pixel, std::nullopt, pixelMemory},
         device.Target(),
-        {0, 0, vertexPush, 128 - vertexPush}
+        PixelPushLayout(vertexPush, device.Target())
     };
     fragment.useCache = false;
     const auto pixelResult = ShaderRecompiler::Recompile(fragment);

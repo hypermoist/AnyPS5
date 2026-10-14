@@ -1,9 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "VulkanTestDevice.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -186,12 +188,32 @@ void Check(const Step& step, const std::vector<std::byte>& colors) {
     }
 }
 
+
+// A program that exports only pos0 is compiled without the PA_CL_VS_OUT_CNTL position export bits, at
+// registration and at draw alike; one that exports pos1 keeps them, without the bits outside the layout.
+void PositionExportLayoutTests() {
+    using AgcDriver::DriverDetail::PositionExportLayout;
+    constexpr std::array<std::uint32_t, 3> PositionOnly{0xf80008cfu, 0x03020100u, 0xbf810000u};
+    Require(PositionExportLayout(nullptr, 0, VertexCode, 0x0040000fu) == 0x0040000fu, "a program exporting pos1 lost its position export bits");
+    Require(PositionExportLayout(nullptr, 0, VertexCode, 0x0144000fu) == 0x0040000fu, "bits outside the position export layout reached the vertex info");
+    Require(PositionExportLayout(nullptr, 0, PositionOnly, 0x0040000fu) == 0u, "a program exporting only pos0 kept the position export bits");
+    AgcDriver::DriverDetail::ShaderSnapshot snapshot{0x10000u, 0u, 1u, {PositionOnly.begin(), PositionOnly.end()}, {}};
+    for (int use = 0; use < 2; ++use) Require(PositionExportLayout(&snapshot, 0, snapshot.code, 0x0040000fu) == 0u, "a cached pos0-only program kept the position export bits");
+    snapshot.code.assign(VertexCode.begin(), VertexCode.end());
+    Require(PositionExportLayout(&snapshot, 2, std::span(snapshot.code).subspan(2), 0x0040000fu) == 0x0040000fu, "a program at an offset was answered from the cache of its snapshot");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         const bool noKey = argc > 1 && std::string(argv[1]) == "no-key";
         if (noKey) Require(std::getenv("APS5_NO_DRAW_KEY") != nullptr, "the no-key run must start with APS5_NO_DRAW_KEY set");
+        PositionExportLayoutTests();
+        {
+            const auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+        }
         ColorMemory = AllocateWatched(2 * Block);
         Register(VertexShader, VertexCode.data(), sizeof(VertexCode), 2);
         Register(PixelShader, PixelCode.data(), sizeof(PixelCode), 1);
@@ -211,8 +233,8 @@ int main(int argc, char** argv) {
             AgcDriver::GuestMemory::Read(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(ColorMemory)), colors);
             Check(step, colors);
         }
-        std::puts(noKey ? "vertex clip and cull distance draws passed without the draw key" : "vertex clip and cull distance draws passed");
         AgcDriverShutdown_nid_postfix();
+        std::puts(noKey ? "vertex clip and cull distance draws passed without the draw key" : "vertex clip and cull distance draws passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -5,6 +5,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include "prx/libkernel/AppMetadata/include/ParamJsonParser.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -36,7 +37,18 @@ extern "C" int* APS5_VABI __error_nid_postfix();
 
 namespace {
 
-constexpr size_t FLEXIBLE_MEMORY_SIZE = 448ULL * 1024 * 1024;
+size_t _configuredFlexibleSize() {
+    static const size_t size = [] {
+        constexpr std::uint64_t defaultSize = 448ULL * 1024 * 1024;
+        const auto path = ResolvePath_nid_no_patch("/app0/sce_sys/param.json");
+        const auto bytes = std::filesystem::exists(path) ? parseParamJson(path).flexibleMemorySizeBytes.value_or(defaultSize) : defaultSize;
+        if (bytes > std::numeric_limits<size_t>::max())
+            throw std::runtime_error("param.json kernel.flexibleMemorySize exceeds host size range");
+        std::fprintf(stderr, "[memory] configured flexible memory: 0x%llx bytes (%llu MiB)\n", static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(bytes >> 20));
+        return static_cast<size_t>(bytes);
+    }();
+    return size;
+}
 
 constexpr int PRT_APERTURE_COUNT = 3;
 
@@ -94,11 +106,12 @@ size_t _flexibleUsedLocked() {
 }
 
 int _mapFlexible(void** addr, size_t len, int prot, int flags) {
+    const size_t configured = _configuredFlexibleSize();
     const size_t images = GuestImageSegmentBytes_nid_no_patch();
     std::lock_guard lock(g_flexibleLock);
     const size_t used = images + _flexibleUsedLocked();
-    if (len > FLEXIBLE_MEMORY_SIZE - std::min(FLEXIBLE_MEMORY_SIZE, used)) {
-        std::fprintf(stderr, "[memory] flexible memory exhausted: request 0x%zx with 0x%zx of 0x%zx in use\n", len, used, static_cast<size_t>(FLEXIBLE_MEMORY_SIZE));
+    if (len > configured - std::min(configured, used)) {
+        std::fprintf(stderr, "[memory] flexible memory exhausted: request 0x%zx with 0x%zx of 0x%zx in use\n", len, used, configured);
         return SCE_KERNEL_ERROR_ENOMEM;
     }
     const int result = DoMapAnon(addr, len, prot, flags);
@@ -259,15 +272,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
   info->end = reservedEnd;
   return 0;
  }
- const auto lease = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
- assert(std::is_sorted(lease.begin(), lease.end(), [](const auto& left, const auto& right) { return left->address < right->address; }));
- const GuestAllocations::Range* best = nullptr;
- for (const auto& range : lease) {
-  const auto begin = range->address;
-  const auto end = begin + range->bytes;
-  if (address >= begin && address < end) { best = range.get(); break; }
-  if ((flags & findNext) != 0 && begin > address && (best == nullptr || begin < best->address)) best = range.get();
- }
+ const auto best = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, (flags & findNext) != 0);
  if (best != nullptr) {
   info->start = best->address;
   info->end = best->address + best->bytes;
@@ -368,15 +373,16 @@ int APS5_VABI sceKernelIsStack(void* addr, void** start, void** end) {
 
 int APS5_VABI sceKernelAvailableFlexibleMemorySize(size_t* size) {
  if (!size) return SCE_KERNEL_ERROR_EINVAL;
+ const size_t configured = _configuredFlexibleSize();
  const size_t images = GuestImageSegmentBytes_nid_no_patch();
  std::lock_guard lock(g_flexibleLock);
- *size = FLEXIBLE_MEMORY_SIZE - std::min(FLEXIBLE_MEMORY_SIZE, images + _flexibleUsedLocked());
+ *size = configured - std::min(configured, images + _flexibleUsedLocked());
  return 0;
 }
 
 int APS5_VABI sceKernelConfiguredFlexibleMemorySize(size_t* size) {
  if (!size) return SCE_KERNEL_ERROR_EINVAL;
- *size = FLEXIBLE_MEMORY_SIZE;
+ *size = _configuredFlexibleSize();
  return 0;
 }
 

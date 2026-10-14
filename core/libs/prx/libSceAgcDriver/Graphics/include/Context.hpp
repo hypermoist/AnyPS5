@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -28,6 +30,19 @@ class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
+
+class PipelineCacheSynchronization {
+public:
+    using PipelineUseLock = std::shared_lock<std::shared_mutex>;
+    using SnapshotLock = std::unique_lock<std::shared_mutex>;
+
+    PipelineUseLock LockForPipelineUse() const { return PipelineUseLock(mutex); }
+    SnapshotLock LockForSnapshot() const { return SnapshotLock(mutex); }
+    SnapshotLock TryLockForSnapshot() const { return SnapshotLock(mutex, std::try_to_lock); }
+
+private:
+    mutable std::shared_mutex mutex;
+};
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -187,11 +202,11 @@ struct Context {
     bool imageInt64Atomics = false;
     bool geometryShader = false;
     bool sampleRateShading = false;
+    bool shaderClipDistance = false;
+    bool shaderCullDistance = false;
     bool nullDescriptors = false;
     bool bufferInt64Atomics = false;
     const PlaceholderImages* placeholderImages = nullptr;
-    bool clipDistance = false;
-    bool cullDistance = false;
     bool viewportIndexLayer = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
@@ -203,6 +218,11 @@ struct Context {
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
+    PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
+
+    PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
+        return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
+    }
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

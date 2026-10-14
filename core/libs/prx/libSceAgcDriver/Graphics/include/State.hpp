@@ -29,6 +29,8 @@ struct ShaderStages {
     std::uint32_t fragmentWaveSize;
     std::optional<ShaderRecompiler::MeshConfiguration> mesh;
     std::optional<ShaderRecompiler::TessellationConfiguration> tessellation;
+    float minTessellationLevel = 1.0f;
+    float maxTessellationLevel = 64.0f;
 };
 
 struct ColorTarget {
@@ -120,13 +122,13 @@ struct State {
     VkPipelineColorBlendAttachmentState blend;
     std::array<float, 4> blendConstants;
     std::uint32_t samples = 1;
-    std::uint32_t paClVsOutCntl = 0;
     std::array<std::uint8_t, 8> sampleLocations{};
     bool customSampleLocations = false;
+    std::uint32_t paClVsOutCntl = 0;
 };
 
 // PA_CL_VS_OUT_CNTL bits that place position exports (clip and cull distances, the misc and the two
-// distance vectors); a vertex program's artifact depends on them.
+// distance vectors); a vertex program that exports pos1..pos3 depends on them.
 inline constexpr std::uint32_t PositionExportLayoutBits = 0xffffu | (1u << 21u) | (1u << 22u) | (1u << 23u);
 
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
