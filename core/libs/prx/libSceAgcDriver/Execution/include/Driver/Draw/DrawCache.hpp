@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -10,6 +11,8 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
+#include <span>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
@@ -68,6 +71,7 @@ struct DrawEntry {
 
     AtomicSharedPtr<const std::vector<DrawRecipeRecord>> recipes;
     std::uint64_t touched = 0;
+    bool probation = false;
     std::list<std::uint64_t>::iterator order;
     std::uint64_t shape = 0;
 };
@@ -101,8 +105,10 @@ public:
     static constexpr std::size_t Ways = 4;
     explicit DrawKeySightings(std::size_t keys);
     bool SeenBefore(std::uint64_t key);
+    bool Seen(std::uint64_t key) const;
 
 private:
+    std::size_t bucketOf(std::uint64_t key) const;
     std::vector<std::uint64_t> keys;
     std::vector<std::uint8_t> filled;
     std::vector<std::uint8_t> next;
@@ -120,6 +126,8 @@ struct StageCapture {
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
+ShaderRecompiler::RecompileRequest DrawStageRequest(const DrawProgram& program, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const Pm4::DrawParameters& drawParameters, const ShaderRecompiler::SpirvTarget& target, std::uint32_t pushOffset);
+std::shared_ptr<DispatchVariant> DrawStageVariant(const DrawProgram& program, const StageCapture& capture, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const Graphics::DecodeRead> decodeReads);
 
 }
 

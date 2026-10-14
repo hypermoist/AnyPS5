@@ -84,12 +84,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         drawKey = published != nullptr ? (shapeKey = published->shape, published->key) : drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey);
+        std::vector<std::shared_ptr<DrawEntry>> released;
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
         const auto found = drawCache.find(drawKey);
         if (found != drawCache.end()) {
+            sightDrawEntry(drawKey, *found->second, released);
             entry = found->second;
             decode = entry->decode;
         } else {

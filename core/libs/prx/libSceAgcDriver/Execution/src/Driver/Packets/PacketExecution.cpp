@@ -79,9 +79,16 @@ void Driver::execute(const Submission& submission) {
     }
     auto& queue = *state;
     if (submission.queue == 0 && drawEntries() && registerKeyEnabled()) {
-        if (drawAhead == nullptr) drawAhead = std::make_unique<DrawAhead>(*this);
+        if (drawAhead == nullptr) drawAhead = std::make_unique<DrawAhead>(*this, DrawAhead::Workers());
         drawAhead->Post(submission, queue);
     }
+    struct RetireDrawAhead {
+        DrawAhead* drawAhead;
+        std::uint64_t serial;
+        ~RetireDrawAhead() {
+            if (drawAhead != nullptr) drawAhead->Retire(serial);
+        }
+    } retireDrawAhead{submission.queue == 0 ? drawAhead.get() : nullptr, submission.serial};
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
 
