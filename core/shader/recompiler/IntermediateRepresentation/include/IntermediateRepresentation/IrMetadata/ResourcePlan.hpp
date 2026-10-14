@@ -43,6 +43,9 @@ struct ResourceSnapshot {
     UniformFill uniformFill;
     std::vector<SrtReadPoison> srtPoison;
     std::uint32_t nullRootReads = 0;
+    // The walk's activity flags: one per descriptor source, then one per image (a 0 left the
+    // source's or the image's descriptor zero); empty when every source was active.
+    std::vector<std::uint8_t> activeSources;
 };
 
 struct UniformFillPlan {

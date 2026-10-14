@@ -40,4 +40,32 @@ void Driver::verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffse
     ++entryCounters.dataVerified;
 }
 
+void Driver::verifyUserWordHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const ShaderRecompiler::RecompileResult& patched) {
+    auto verifyMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    const auto invocation = InvocationFor(snapshot, codeOffset, request);
+    const auto capture = verifyMemory->Capture(invocation);
+    const auto regions = verifyMemory->Regions();
+    request.context.memory = regions;
+    const auto result = invocation.Materialize(*capture);
+    const char* what = nullptr;
+    std::size_t where = 0;
+    if (result->PipelineVariantId() != patched.PipelineVariantId()) what = "the variant";
+    else if (result->pushConstants != patched.pushConstants) what = "the push constants";
+    else if (result->bindings.size() != patched.bindings.size()) what = "the binding count";
+    for (std::size_t b = 0; what == nullptr && b < result->bindings.size(); ++b) {
+        const auto& fresh = result->bindings[b];
+        const auto& reused = patched.bindings[b];
+        if (fresh.kind != reused.kind || fresh.role != reused.role || fresh.binding != reused.binding || fresh.count != reused.count || fresh.guestDescriptor != reused.guestDescriptor) {
+            what = "a binding";
+            where = b;
+        }
+    }
+    std::lock_guard cacheLock(dispatchCacheMutex);
+    ++entryCounters.userVerified;
+    if (what == nullptr) return;
+    ++entryCounters.userMismatches;
+    static std::uint64_t reported = 0;
+    if (reported++ < 16) std::fprintf(stderr, "[dispatch-cache] APS5_VERIFY_USER_WORD_HITS: %s disagrees (program 0x%llx, binding %zu)\n", what, static_cast<unsigned long long>(address), where);
+}
+
 }

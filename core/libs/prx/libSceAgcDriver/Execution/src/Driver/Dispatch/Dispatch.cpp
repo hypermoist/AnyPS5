@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <mutex>
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -15,6 +17,10 @@
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+struct ConditionChanged {};
+}
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
@@ -139,29 +145,38 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         ~ProbeScope() { if (active) ShaderRecompiler::SetDebugProbeActive(false); }
     } probeScope{probeThis};
     const bool noDispatchCache = noDispatchCacheEnv || probeThis;
-    std::uint64_t key = 0xcbf29ce484222325ull;
-    const auto mix = [&](std::uint64_t value) {
-        key ^= value;
-        key *= 0x100000001b3ull;
-    };
-    mix(address);
-    mix(packet[4] & 0x8000u);
-    for (const auto threads : compute.partialThreads) mix(threads);
-    for (const auto word : userData) mix(word);
-
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
-    if (keyHygiene) {
-        for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
-            const auto found = queue.shader.find(offset);
+    const auto dispatchKey = [&](const UserWordMask* mask) {
+        std::uint64_t hash = 0xcbf29ce484222325ull;
+        const auto mix = [&](std::uint64_t value) {
+            hash ^= value;
+            hash *= 0x100000001b3ull;
+        };
+        mix(address);
+        mix(packet[4] & 0x8000u);
+        for (const auto threads : compute.partialThreads) mix(threads);
+        for (std::size_t i = 0; i < userData.size(); ++i) {
+            const bool patchable = mask != nullptr && i < mask->words->patchable.size() && mask->words->patchable[i] != 0u;
+            mix(patchable ? 0x5553u : userData[i]);
+        }
+        if (keyHygiene) {
+            for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+                const auto found = queue.shader.find(offset);
 
-            mix(found == queue.shader.end() ? (1ull << 32u) : found->second);
+                mix(found == queue.shader.end() ? (1ull << 32u) : found->second);
+            }
+        } else {
+            for (const auto& [offset, value] : queue.shader) {
+                mix(offset);
+                mix(value);
+            }
         }
-    } else {
-        for (const auto& [offset, value] : queue.shader) {
-            mix(offset);
-            mix(value);
-        }
-    }
+        mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+        return hash;
+    };
+    auto userMask = userWordHits() && !noDispatchCache ? userWordMask(address) : nullptr;
+    const std::uint64_t key = dispatchKey(nullptr);
+    const std::uint64_t maskedKey = userMask != nullptr ? dispatchKey(userMask.get()) : key;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
 
     std::shared_ptr<DispatchVariant> keepVariant;
@@ -176,6 +191,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     bool addressHit = false;
     bool cached = false;
     bool validated = false;
+    bool userHit = false;
 
     std::shared_ptr<DispatchEntry> missedEntry;
     bool missedDiffering = false;
@@ -226,8 +242,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 std::int64_t delta = 0;
                 std::uint64_t deltaCount = 0;
                 for (const auto& [value, count] : change.deltas) if (count > deltaCount) { delta = value; deltaCount = count; }
+                const auto mask = userWordMask(top[n].second.first);
+                const bool patchable = mask != nullptr && top[n].second.second < mask->words->patchable.size() && mask->words->patchable[top[n].second.second] != 0u;
                 char item[160];
-                std::snprintf(item, sizeof(item), " 0x%llx user[%zu] x%llu (recurring %llu, deltas %zu, top %lld x%llu);", static_cast<unsigned long long>(top[n].second.first), top[n].second.second, static_cast<unsigned long long>(change.count), static_cast<unsigned long long>(change.recurring), change.deltas.size(), static_cast<long long>(delta), static_cast<unsigned long long>(deltaCount));
+                std::snprintf(item, sizeof(item), " 0x%llx user[%zu]%s x%llu (recurring %llu, deltas %zu, top %lld x%llu);", static_cast<unsigned long long>(top[n].second.first), top[n].second.second, patchable ? " patchable" : "", static_cast<unsigned long long>(change.count), static_cast<unsigned long long>(change.recurring), change.deltas.size(), static_cast<long long>(delta), static_cast<unsigned long long>(deltaCount));
                 text += item;
             }
             std::fprintf(stderr, "[dispatch-key] (10 s) key changes %llu (shader registers only %llu), first seen %llu, programs %zu;%s\n", static_cast<unsigned long long>(keyChanges), static_cast<unsigned long long>(shaderOnly), static_cast<unsigned long long>(firstSeen), last.size(), text.c_str());
@@ -236,7 +254,6 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
     }
 
-    mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
@@ -261,9 +278,91 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, addressHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, addressHit, cached, validated, missedEntry, missedDiffering, userData, userHit);
+        if (!cached && maskedKey != key) {
+            const auto exactMissed = std::move(missedEntry);
+            const bool exactDiffering = missedDiffering;
+            missedEntry = nullptr;
+            lookupDispatch(address, submission, maskedKey, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, addressHit, cached, validated, missedEntry, missedDiffering, userData, userHit);
+            if (!cached) {
+                missedEntry = exactMissed;
+                missedDiffering = exactDiffering;
+            }
+        }
     }
     timing.Mark("lookup_cache");
+    if (cached && userHit && !fromAhead) {
+        try {
+            const auto invocation = InvocationFor(snapshot, codeOffset, request);
+            auto patched = std::make_shared<ShaderRecompiler::ResourceCapture>(*keepVariant->capture);
+            const auto count = std::min(patched->snapshot.userData.size(), userData.size());
+            std::copy_n(userData.begin(), count, patched->snapshot.userData.begin());
+            if (keepVariant->userPatchable) {
+                for (const auto& word : keepVariant->userMask->words->words) patched->snapshot.buffers.at(word.buffer).dwords.at(word.dword) = userData.at(word.user);
+            }
+            if (!liveWords.empty()) {
+                for (const auto& slot : keepVariant->tableSlots) {
+                    if (slot.kind == 3u) {
+                        patched->snapshot.flattenedSrt.at(slot.index) = liveWords.at(slot.position);
+                        continue;
+                    }
+                    auto& values = slot.kind == 0u ? patched->snapshot.buffers : slot.kind == 1u ? patched->snapshot.images : patched->snapshot.samplers;
+                    values.at(slot.index).dwords.at(slot.dword) = liveWords.at(slot.position);
+                }
+                std::vector<std::uint32_t> sources, conditions;
+                for (const auto& slot : keepVariant->derivedSlots) {
+                    if (liveWords.at(slot.position) == keepVariant->words.at(slot.position)) continue;
+                    patched->snapshot.flattenedSrt.at(slot.flat) = liveWords.at(slot.position);
+                    sources.insert(sources.end(), slot.sources->begin(), slot.sources->end());
+                    conditions.insert(conditions.end(), slot.conditions->begin(), slot.conditions->end());
+                }
+                if (!conditions.empty()) {
+                    std::sort(conditions.begin(), conditions.end());
+                    conditions.erase(std::unique(conditions.begin(), conditions.end()), conditions.end());
+                    const auto moved = relocatedVariant(*keepVariant, userData);
+                    const auto& runs = moved != nullptr ? moved->runs : keepVariant->runs;
+                    const bool unchanged = ConditionsUnchanged(*patched->plan, conditions, userData, runs, keepVariant->words);
+                    std::lock_guard cacheLock(dispatchCacheMutex);
+                    entryCounters.derivedConditionsEvaluated += conditions.size();
+                    if (!unchanged) {
+                        ++entryCounters.derivedConditionsChanged;
+                        throw ConditionChanged{};
+                    }
+                }
+                if (!sources.empty()) {
+                    std::sort(sources.begin(), sources.end());
+                    sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
+                    ReevaluateDescriptorSources(*patched, sources, userData);
+                    std::lock_guard cacheLock(dispatchCacheMutex);
+                    ++entryCounters.derivedHits;
+                    entryCounters.derivedSourcesEvaluated += sources.size();
+                }
+            }
+            compiledResult = invocation.Materialize(*patched);
+            capture = std::move(patched);
+            if (verifyUserWordHits()) verifyUserWordHit(snapshot, codeOffset, request, memory, address, *compiledResult);
+        } catch (const ConditionChanged&) {
+            cached = false;
+            userHit = false;
+            addressHit = false;
+            keepVariant = nullptr;
+            compiledResult = nullptr;
+            captured.clear();
+            liveWords.clear();
+        } catch (const std::exception& error) {
+            static std::atomic<std::uint64_t> reported{0};
+            if (reported.fetch_add(1) < 8) std::fprintf(stderr, "[dispatch-cache] 0x%llx user-word hit fell back to a capture: %s\n", static_cast<unsigned long long>(address), error.what());
+            std::lock_guard cacheLock(dispatchCacheMutex);
+            ++entryCounters.userMaterializeFailures;
+            cached = false;
+            userHit = false;
+            addressHit = false;
+            keepVariant = nullptr;
+            compiledResult = nullptr;
+            captured.clear();
+            liveWords.clear();
+        }
+    }
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         captureMs += phaseTiming.Elapsed();
@@ -311,7 +410,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        if (userWordHits() && !noDispatchCache && capture != nullptr && capture->plan != nullptr) userMask = learnUserWordMask(address, capture->plan);
+        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, userData);
+        if (attachVariant != nullptr && userMask != nullptr && std::any_of(userMask->words->patchable.begin(), userMask->words->patchable.end(), [](std::uint8_t patchable) { return patchable != 0u; })) {
+            if (const auto linkKey = dispatchKey(userMask.get()); linkKey != key) linkDispatchVariant(linkKey, attachVariant);
+        }
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
@@ -360,7 +463,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (traceIo) {
 
         std::string words;
-        if (std::getenv("APS5_TRACE_DISPATCH_IO")[0] == '2') {
+        if (traceIo && std::getenv("APS5_TRACE_DISPATCH_IO")[0] == '2') {
             for (const auto word : userData) {
                 char text[12];
                 std::snprintf(text, sizeof(text), " %08x", word);

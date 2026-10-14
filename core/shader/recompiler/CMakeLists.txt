@@ -220,6 +220,7 @@ function(add_shader_recompiler target runtimeTarget)
             BuildPreparedShaderKey
             BuildRectListShaders
             CaptureResources
+            ComputeDescriptorUserWords
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes

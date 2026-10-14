@@ -76,6 +76,61 @@ void BuildPreparedShaderKey(const RecompileRequest& request, std::vector<std::ui
 [[nodiscard]] std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& request);
 [[nodiscard]] std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle);
 
+// The user-data words a plan's CPU walk consumes only as whole dwords of buffer descriptors: no
+// other descriptor, condition, uniform-fill value, flattened SRT slot or read address reaches them,
+// so two captures that differ only there differ only in those snapshot.buffers dwords and in
+// snapshot.userData. `words` lists each such dword (snapshot.buffers[buffer].dwords[dword] is
+// userData[user]); `pointers` lists the relocatable pointer pairs; `patchable[user]` is 1 for each
+// user word of either kind. A plan with an indirect image or
+// an incomplete SRT plan has none.
+struct DescriptorUserWord {
+    std::uint32_t buffer = 0;
+    std::uint32_t dword = 0;
+    std::uint32_t user = 0;
+};
+// A user-data pointer pair (`low`, `high`) the walk uses only as the base of dword reads at
+// constant offsets: every read lies in [base + first, base + end). Two captures whose pointers
+// differ read the same table words at the moved addresses, so a capture validated there is valid.
+struct UserPointer {
+    std::uint32_t low = 0;
+    std::uint32_t high = 0;
+    std::int64_t first = 0;
+    std::int64_t end = 0;
+};
+// A descriptor dword the walk reads straight from a relocatable pointer's table (pointers[pointer],
+// at base + offset) and consumes nowhere else: snapshot.<kind>[index].dwords[dword] is that word,
+// kind 0 a buffer, 1 an image, 2 a sampler; kind 3 is the flattened SRT slot snapshot.flattenedSrt[index]
+// that holds the word.
+struct DescriptorTableWord {
+    std::uint32_t pointer = 0;
+    std::int64_t offset = 0;
+    std::uint32_t kind = 0;
+    std::uint32_t index = 0;
+    std::uint32_t dword = 0;
+};
+// A word of a relocatable pointer's table (pointers[pointer], at base + offset) that the walk reads
+// into the flattened SRT slot `flat` and consumes only inside the dwords of the descriptor sources
+// `sources` and the conditions `conditions`: when it changes and every such condition evaluates as
+// before, flattenedSrt[flat] takes the new word and re-evaluating the sources that were active
+// (snapshot.activeSources) gives the new descriptors.
+struct DerivedTableWord {
+    std::uint32_t pointer = 0;
+    std::int64_t offset = 0;
+    std::uint32_t flat = 0;
+    std::vector<std::uint32_t> sources;
+    // The control-flow blocks (plan.controlFlow indices) whose condition the word reaches: a capture
+    // reused over a changed word is valid only where each evaluates as it did over the old word.
+    std::vector<std::uint32_t> conditions;
+};
+struct DescriptorUserWords {
+    std::vector<DescriptorUserWord> words;
+    std::vector<UserPointer> pointers;
+    std::vector<DescriptorTableWord> tableWords;
+    std::vector<DerivedTableWord> derivedWords;
+    std::vector<std::uint8_t> patchable;
+};
+[[nodiscard]] DescriptorUserWords ComputeDescriptorUserWords(const IrResourcePlan& plan);
+
 }
 
 #endif

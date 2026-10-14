@@ -11,7 +11,7 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     return compiled.poisonedSrtReads == 0u;
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, std::span<const std::uint32_t> userData) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
@@ -76,10 +76,87 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 }
             }
         }
+        fresh->userData.assign(userData.begin(), userData.end());
+        if (userWordHits() && capture != nullptr && capture->plan != nullptr) {
+            fresh->capture = capture;
+            fresh->userMask = userWordMask(address);
+            const auto* mask = fresh->userMask.get();
+            bool patchable = mask != nullptr && mask->plan == capture->plan && !mask->words->words.empty();
+            for (std::size_t i = 0; patchable && i < mask->words->words.size(); ++i) {
+                const auto& word = mask->words->words[i];
+                patchable = word.user < userData.size() && userData[word.user] != 0u && word.buffer < capture->snapshot.buffers.size() && word.dword < capture->snapshot.buffers[word.buffer].dwordCount && capture->snapshot.buffers[word.buffer].dwords[word.dword] == userData[word.user];
+            }
+            fresh->userPatchable = patchable;
+            if (mask != nullptr && mask->plan == capture->plan && !mask->words->pointers.empty()) {
+                bool relocatable = true;
+                for (const auto& pointer : mask->words->pointers) {
+                    DispatchVariant::Relocation relocation{pointer.low, pointer.high, userPointerBase(userData, pointer.low, pointer.high), {}};
+                    if (relocation.base == 0) {
+                        relocatable = false;
+                        break;
+                    }
+                    const auto first = relocation.base + static_cast<std::uint64_t>(pointer.first);
+                    const auto end = relocation.base + static_cast<std::uint64_t>(pointer.end);
+                    for (std::uint32_t run = 0; run < fresh->runs.size(); ++run) {
+                        const auto [begin, last] = fresh->runs[run];
+                        if (last <= first || end <= begin) continue;
+                        if (begin < first || end < last) relocatable = false;
+                        relocation.runs.push_back(run);
+                    }
+                    fresh->relocations.push_back(std::move(relocation));
+                }
+                fresh->relocatable = relocatable;
+            }
+        }
         fresh->maskPositions = fresh->dataPositions;
         for (const auto& slot : fresh->addressSlots) fresh->maskPositions.push_back(slot.position);
         std::sort(fresh->maskPositions.begin(), fresh->maskPositions.end());
         fresh->maskPositions.erase(std::unique(fresh->maskPositions.begin(), fresh->maskPositions.end()), fresh->maskPositions.end());
+        if (fresh->relocatable && capture != nullptr && fresh->userMask != nullptr) {
+            std::vector<std::size_t> runOffsets;
+            std::size_t total = 0;
+            for (const auto& [begin, end] : fresh->runs) {
+                runOffsets.push_back(total);
+                total += static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+            }
+            const auto& snapshot = capture->snapshot;
+            for (const auto& word : fresh->userMask->words->tableWords) {
+                if (word.pointer >= fresh->relocations.size()) continue;
+                const auto at = fresh->relocations[word.pointer].base + static_cast<std::uint64_t>(word.offset);
+                const auto run = std::find_if(fresh->runs.begin(), fresh->runs.end(), [at](const auto& candidate) { return candidate.first <= at && at + 4u <= candidate.second; });
+                if (run == fresh->runs.end()) continue;
+                const auto position = static_cast<std::uint32_t>(runOffsets[static_cast<std::size_t>(run - fresh->runs.begin())] + (at - run->first) / sizeof(std::uint32_t));
+                if (word.kind == 3u) {
+                    if (word.index >= snapshot.flattenedSrt.size() || snapshot.flattenedSrt[word.index] != fresh->words[position]) continue;
+                } else {
+                    const auto& values = word.kind == 0u ? snapshot.buffers : word.kind == 1u ? snapshot.images : snapshot.samplers;
+                    if (word.index >= values.size() || word.dword >= values[word.index].dwordCount || values[word.index].dwords[word.dword] != fresh->words[position]) continue;
+                }
+                fresh->tableSlots.push_back({position, word.kind, word.index, word.dword});
+                fresh->tablePositions.push_back(position);
+            }
+            std::uint64_t derivedRejected = 0;
+            for (const auto& word : fresh->userMask->words->derivedWords) {
+                if (word.pointer >= fresh->relocations.size()) continue;
+                const auto at = fresh->relocations[word.pointer].base + static_cast<std::uint64_t>(word.offset);
+                const auto run = std::find_if(fresh->runs.begin(), fresh->runs.end(), [at](const auto& candidate) { return candidate.first <= at && at + 4u <= candidate.second; });
+                if (run == fresh->runs.end()) continue;
+                const auto position = static_cast<std::uint32_t>(runOffsets[static_cast<std::size_t>(run - fresh->runs.begin())] + (at - run->first) / sizeof(std::uint32_t));
+                if (word.flat >= snapshot.flattenedSrt.size() || snapshot.flattenedSrt[word.flat] != fresh->words[position]) {
+                    ++derivedRejected;
+                    continue;
+                }
+                if (std::any_of(fresh->tableSlots.begin(), fresh->tableSlots.end(), [position](const DispatchVariant::TableSlot& slot) { return slot.position == position; })) continue;
+                fresh->derivedSlots.push_back({position, word.flat, &word.sources, &word.conditions});
+                fresh->tablePositions.push_back(position);
+            }
+            std::sort(fresh->tablePositions.begin(), fresh->tablePositions.end());
+            fresh->tablePositions.erase(std::unique(fresh->tablePositions.begin(), fresh->tablePositions.end()), fresh->tablePositions.end());
+            fresh->derivedRejectedFlat = derivedRejected;
+            fresh->maskPositions.insert(fresh->maskPositions.end(), fresh->tablePositions.begin(), fresh->tablePositions.end());
+            std::sort(fresh->maskPositions.begin(), fresh->maskPositions.end());
+            fresh->maskPositions.erase(std::unique(fresh->maskPositions.begin(), fresh->maskPositions.end()), fresh->maskPositions.end());
+        }
         bool stable = true;
         if (stampValidate()) {
 
@@ -113,6 +190,11 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             ++entryCounters.inserts;
             entryCounters.runsInserted += fresh->runs.size();
             if (!fresh->addressSlots.empty()) ++entryCounters.addressInserts;
+            if (fresh->userPatchable) ++entryCounters.userInserts;
+            if (fresh->relocatable) ++entryCounters.relocatedInserts;
+            if (!fresh->tableSlots.empty()) ++entryCounters.tableInserts;
+            if (!fresh->derivedSlots.empty()) ++entryCounters.derivedInserts;
+            entryCounters.derivedRejectedFlat += fresh->derivedRejectedFlat;
             if (!fresh->dataPositions.empty()) {
                 ++entryCounters.dataInserts;
                 entryCounters.dataPositionsInserted += fresh->dataPositions.size();

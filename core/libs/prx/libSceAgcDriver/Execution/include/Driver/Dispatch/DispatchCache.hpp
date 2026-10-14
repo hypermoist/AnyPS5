@@ -18,9 +18,23 @@
 #include <utility>
 #include <vector>
 
+namespace ShaderRecompiler {
+struct DescriptorUserWords;
+struct IrResourcePlan;
+struct ResourceCapture;
+}
+
 namespace AgcDriver::DriverDetail {
 
 inline constexpr std::size_t MaxDispatchVariants = 8;
+
+// A program's user-data words that only feed buffer descriptors (ComputeDescriptorUserWords over the
+// plan it was captured with): the dispatch key leaves them out, and a hit whose user data differs
+// only there re-materializes the stored capture with the live words instead of walking again.
+struct UserWordMask {
+    std::shared_ptr<const ShaderRecompiler::IrResourcePlan> plan;
+    std::shared_ptr<const ShaderRecompiler::DescriptorUserWords> words;
+};
 
 struct DispatchVariant {
 
@@ -48,6 +62,35 @@ struct DispatchVariant {
     std::uint32_t pushOffset = 0;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    std::vector<std::uint32_t> userData;
+    std::shared_ptr<const UserWordMask> userMask;
+    bool userPatchable = false;
+    struct Relocation {
+        std::uint32_t low = 0;
+        std::uint32_t high = 0;
+        std::uint64_t base = 0;
+        std::vector<std::uint32_t> runs;
+    };
+    std::vector<Relocation> relocations;
+    bool relocatable = false;
+    struct TableSlot {
+        std::uint32_t position = 0;
+        std::uint32_t kind = 0;
+        std::uint32_t index = 0;
+        std::uint32_t dword = 0;
+    };
+    std::vector<TableSlot> tableSlots;
+    struct DerivedSlot {
+        std::uint32_t position = 0;
+        std::uint32_t flat = 0;
+        const std::vector<std::uint32_t>* sources = nullptr;
+        const std::vector<std::uint32_t>* conditions = nullptr;
+    };
+    std::vector<DerivedSlot> derivedSlots;
+    std::uint64_t derivedRejectedFlat = 0;
+    std::vector<std::uint32_t> tablePositions;
+
     std::shared_ptr<ShaderMemory> memory;
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
@@ -74,6 +117,7 @@ struct EntryCounters {
     std::array<std::uint64_t, MaxDispatchVariants> variantHitsByRank{};
     std::uint64_t variantsCompared = 0, variantsInserted = 0, variantsEvicted = 0;
 
+    std::uint64_t userRefusedData = 0, userRefusedPointer = 0, userRefusedDescriptor = 0, userRefusedOther = 0, derivedInserts = 0, derivedRejectedFlat = 0, derivedHits = 0, derivedSourcesEvaluated = 0, derivedConditionsEvaluated = 0, derivedConditionsChanged = 0, tableHits = 0, tableWordsRefreshed = 0, tableInserts = 0, relocatedHits = 0, relocatedCompared = 0, relocatedInserts = 0, userHits = 0, userRefused = 0, userInserts = 0, userMaterializeFailures = 0, userVerified = 0, userMismatches = 0;
     std::uint64_t addressHits = 0, addressRefused = 0, addressInserts = 0, dataHits = 0, dataWordsRefreshed = 0, dataVerified = 0, dataInserts = 0, dataPositionsInserted = 0, dataLeavesUnmapped = 0, dataLeavesMismatched = 0, dataLeavesAliased = 0;
     std::array<std::uint64_t, MaxDispatchVariants> dataHitsByRank{};
     std::set<std::size_t> differingPositions;
@@ -90,6 +134,14 @@ struct DataMask {
 enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };
 
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
+// Re-evaluates the descriptor sources `sources` of the capture's plan over live guest memory and
+// `userData`, and stores the values in the capture's snapshot (every buffer, image and sampler made
+// from one of them). Throws when a source cannot be evaluated.
+void ReevaluateDescriptorSources(ShaderRecompiler::ResourceCapture& capture, std::span<const std::uint32_t> sources, std::span<const std::uint32_t> userData);
+// Whether the control-flow conditions `blocks` of `plan` evaluate the same over live guest memory
+// as over `words` (the words of `runs`, in order) in place of the memory there. Throws when a
+// condition cannot be evaluated.
+bool ConditionsUnchanged(const ShaderRecompiler::IrResourcePlan& plan, std::span<const std::uint32_t> blocks, std::span<const std::uint32_t> userData, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words);
 
 }
 
