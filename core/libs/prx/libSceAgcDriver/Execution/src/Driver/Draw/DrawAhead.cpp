@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <exception>
 #include <limits>
@@ -19,6 +20,7 @@ namespace {
 
 constexpr std::size_t MaxQueuedScans = 8;
 constexpr std::size_t MaxQueuedJobs = 4096;
+std::atomic<void (*)(bool)> pinnedReadHook{nullptr};
 std::atomic<bool> compileAheadEnabled{true};
 
 void NameThread(const char* name) {
@@ -186,10 +188,15 @@ bool DrawScan::Matches(const PublishedDraw& record, const QueueState& queue) {
     });
 }
 
-DrawAhead::Speculation::Speculation(DrawAhead& owner, std::uint64_t serial, std::size_t offset) : owner(owner), serial(serial), offset(offset) {}
+DrawAhead::Speculation::Speculation(DrawAhead& owner, std::uint64_t serial, std::size_t offset, bool compile) : owner(owner), serial(serial), offset(offset), compile(compile) {}
 
 void DrawAhead::Speculation::Enter() {
-    if (!owner.pin(serial, offset)) throw std::runtime_error("draw-ahead speculation outlived its draw");
+    if (!owner.pin(serial, offset)) throw GuestMemory::SpeculativeReadRefused("draw-ahead speculation outlived its draw");
+    if (const auto hook = pinnedReadHook.load(std::memory_order_acquire)) hook(compile);
+}
+
+void DrawAhead::SetPinnedReadHook(void (*hook)(bool compile)) {
+    pinnedReadHook.store(hook, std::memory_order_release);
 }
 
 void DrawAhead::SetCompileAhead(bool enabled) {
@@ -287,6 +294,10 @@ void DrawAhead::Progress(std::uint64_t serial, std::size_t cursor) {
     pass(serial, cursor + 1);
 }
 
+void DrawAhead::Skip(std::uint64_t serial, std::size_t end) {
+    pass(serial, end);
+}
+
 void DrawAhead::Retire(std::uint64_t serial) {
     pass(serial, std::numeric_limits<std::size_t>::max());
     std::size_t dropped = 0;
@@ -357,7 +368,7 @@ void DrawAhead::scanLoop(std::stop_token token) {
         }
         try {
             scan(work, token);
-        } catch (const std::exception&) {
+        } catch (...) {
         }
     }
 }
@@ -404,7 +415,7 @@ void DrawAhead::scan(Scan& work, std::stop_token token) {
         auto& record = publication.records[index];
         record.offset = draw.offset;
         const auto opcode = (draw.packet[0] >> 8u) & 0xffu;
-        Speculation speculation(*this, work.serial, draw.offset);
+        Speculation speculation(*this, work.serial, draw.offset, false);
         if (!Pm4::IndirectDrawOpcode(opcode) && !speculation.Passed()) {
             const GuestMemory::SpeculativeReadScope speculative(speculation);
             bool resolved = false;
@@ -413,7 +424,7 @@ void DrawAhead::scan(Scan& work, std::stop_token token) {
                 record.precheck = PrecheckDrawState(draw.state, record.parameters, listRestart, rejected);
                 record.key = Driver::drawRegisterKey(draw.state, *work.shaders, deviceSerial, &record.shape);
                 resolved = true;
-            } catch (const std::exception&) {
+            } catch (...) {
             }
             record.deviceSerial = deviceSerial;
             record.indexBase = draw.state.indexBase;
@@ -430,7 +441,7 @@ void DrawAhead::scan(Scan& work, std::stop_token token) {
                 if (!cached) {
                     try {
                         queueJob({work.serial, draw.offset, record.key, record.shape, Driver::decodeDraw(draw.state, *work.shaders), record.parameters, device});
-                    } catch (const std::exception&) {
+                    } catch (...) {
                         driver.drawAheadCounts.dropped.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
@@ -451,15 +462,15 @@ void DrawAhead::workLoop(std::stop_token token) {
             job = std::move(jobs.front());
             jobs.pop_front();
         }
-        Speculation speculation(*this, job.serial, job.offset);
+        Speculation speculation(*this, job.serial, job.offset, true);
         bool inserted = false;
         if (!speculation.Passed()) {
             try {
                 inserted = driver.compileDrawAhead(job.key, job.shape, job.decode, job.parameters, job.device, speculation);
-            } catch (const std::exception&) {
+            } catch (...) {
             }
         }
-        (inserted ? driver.drawAheadCounts.compiled : driver.drawAheadCounts.dropped).fetch_add(1, std::memory_order_relaxed);
+        if (!inserted) driver.drawAheadCounts.dropped.fetch_add(1, std::memory_order_relaxed);
     }
 }
 }

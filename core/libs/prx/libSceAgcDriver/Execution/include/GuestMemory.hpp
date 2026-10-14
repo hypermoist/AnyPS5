@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -200,6 +201,10 @@ public:
 
 protected:
     ~ISpeculativeReadGate() = default;
+};
+class SpeculativeReadRefused : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 class SpeculativeReadScope {
 public:

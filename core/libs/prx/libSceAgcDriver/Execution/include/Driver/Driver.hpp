@@ -136,7 +136,7 @@ private:
     static bool verifyDrawRecipe();
     static std::size_t drawCacheEntries();
     void accountDrawVariant(const DispatchVariant& variant, bool added);
-    void insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape = 0, bool ahead = false);
+    void insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape = 0, bool ahead = false, std::shared_ptr<const Graphics::PreparedDraw> prepared = nullptr, std::size_t preparedShaders = 0);
     void sightDrawEntry(std::uint64_t key, DrawEntry& entry, std::vector<std::shared_ptr<DrawEntry>>& released);
     void evictDrawEntries();
     bool admitDrawKey(std::uint64_t key, std::uint64_t shape);

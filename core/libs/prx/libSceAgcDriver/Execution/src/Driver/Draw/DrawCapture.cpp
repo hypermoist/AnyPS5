@@ -193,7 +193,9 @@ bool Driver::compileDrawAhead(std::uint64_t key, std::uint64_t shape, const std:
     }
     ShaderMemory shaderMemory(memory);
     std::vector<StageCapture> stageCaptures(programs.size());
+    std::vector<Graphics::CompiledShader> stages;
     auto pixel = decode->pixel;
+    bool preparable = !graphics.rectList;
     std::uint32_t pushCursorBytes = 0;
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
@@ -220,17 +222,34 @@ bool Driver::compileDrawAhead(std::uint64_t key, std::uint64_t shape, const std:
         const auto& result = *stageCapture.compiled;
         const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
         require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
+        if (result.barycentricEmulation.active) preparable = false;
+        stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
     std::vector<std::shared_ptr<DispatchVariant>> fresh(programs.size());
     for (std::size_t i = 0; i < programs.size(); ++i) {
         const auto& stageCapture = stageCaptures[i];
-        if (stageCapture.compiled == nullptr || !CacheableResult(*stageCapture.compiled)) continue;
+        if (stageCapture.compiled == nullptr) continue;
+        if (!CacheableResult(*stageCapture.compiled)) {
+            preparable = false;
+            continue;
+        }
         fresh[i] = DrawStageVariant(programs[i], stageCapture, vertexInfos[i], decodeReads[i]);
         if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*fresh[i], *stageCapture.capture, decodeReads[i]);
     }
     if (speculation.Passed() || ShaderRecompiler::DebugProbeActive()) return false;
-    return speculation.Commit([&] { insertDrawEntry(key, fresh, decode, drawDataHits() ? shape : 0, true); });
+    std::shared_ptr<const Graphics::PreparedDraw> prepared;
+    if (preparable) {
+        try {
+            prepared = localDevice->PrepareDraw(graphics, stages);
+        } catch (...) {
+            prepared = nullptr;
+        }
+    }
+    return speculation.Commit([&] {
+        insertDrawEntry(key, fresh, decode, drawDataHits() ? shape : 0, true, std::move(prepared), stages.size());
+        drawAheadCounts.compiled.fetch_add(1, std::memory_order_relaxed);
+    });
 }
 
 void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey) {

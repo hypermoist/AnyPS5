@@ -63,9 +63,17 @@ struct DrawRecipeRecord {
     bool Expired() const;
 };
 
+struct PreparedDrawRecord {
+    std::vector<std::weak_ptr<const DispatchVariant>> stages;
+    std::size_t shaders = 0;
+    std::shared_ptr<const Graphics::PreparedDraw> prepared;
+    const Graphics::PreparedDraw* For(const std::vector<std::shared_ptr<DispatchVariant>>& variants, std::size_t shaderCount) const;
+};
+
 struct DrawEntry {
 
     std::shared_ptr<const DrawDecode> decode;
+    std::shared_ptr<const PreparedDrawRecord> prepared;
 
     std::vector<std::vector<std::shared_ptr<DispatchVariant>>> stages;
 

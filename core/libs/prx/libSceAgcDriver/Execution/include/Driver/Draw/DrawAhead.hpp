@@ -92,7 +92,7 @@ class DrawAhead {
 public:
     class Speculation final : public GuestMemory::ISpeculativeReadGate {
     public:
-        Speculation(DrawAhead& owner, std::uint64_t serial, std::size_t offset);
+        Speculation(DrawAhead& owner, std::uint64_t serial, std::size_t offset, bool compile);
         void Enter() override;
         void Leave() override;
         bool Passed() const;
@@ -102,6 +102,7 @@ public:
         DrawAhead& owner;
         std::uint64_t serial;
         std::size_t offset;
+        bool compile;
     };
 
     DrawAhead(Driver& driver, std::size_t workers);
@@ -109,11 +110,13 @@ public:
     DrawAhead(const DrawAhead&) = delete;
     DrawAhead& operator=(const DrawAhead&) = delete;
 
+    static void SetPinnedReadHook(void (*hook)(bool compile));
     static void SetCompileAhead(bool enabled);
     static std::size_t Workers();
     static bool HasDirectDraws(std::span<const std::uint32_t> commands);
     void Post(const Submission& submission, const QueueState& state);
     void Progress(std::uint64_t serial, std::size_t cursor);
+    void Skip(std::uint64_t serial, std::size_t end);
     void Retire(std::uint64_t serial);
     const PublishedDraw* Find(const Submission& submission, std::span<const std::uint32_t> packet, const QueueState& queue, std::uint64_t deviceSerial);
 
