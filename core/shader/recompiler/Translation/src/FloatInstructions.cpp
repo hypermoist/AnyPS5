@@ -48,7 +48,12 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         return IrU32(ir.Emit(opcode == IrOpcode::FPAdd32 ? IrOpcode::FPAdd16x2 : IrOpcode::FPMul16x2, IrType::U32, {&lhs.Value(), &rhs.Value()}));
     };
     IrU32 result = quietSnan ? packU16Lanes(minMaxLane(false), minMaxLane(true)) : native ? nativeResult() : packHalf2x16(translateLane(false), translateLane(true));
-    if (native || !inst.destination.clamp || !dx10Clamp() || quietSnan) {
+    if (relaxedFloat && !native && !quietSnan) {
+        if (inst.destination.clamp && !dx10Clamp()) {
+            const auto lane = [&](bool high) { return clampF16Bits(inst.destination, IrU32(high ? ir.ShiftRightLogical(result.Value(), ir.Constant(16u)) : ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu)))); };
+            result = packU16Lanes(lane(false), lane(true));
+        }
+    } else if (native || !inst.destination.clamp || !dx10Clamp() || quietSnan) {
         const auto isNan = [&](const IrU32& bits) {
             return IrU1(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u)));
         };
@@ -269,6 +274,7 @@ bool TranslationContext::float16Ternary(const RdnaInstruction& inst, IrOpcode op
 }
 
 IrF32 TranslationContext::fmaF16RoundedToOdd(IrF32 lhs, IrF32 rhs, IrF32 addend) {
+    if (relaxedFloat) return IrF32(ir.Emit(IrOpcode::FPFma32, IrType::F32, {&lhs.Value(), &rhs.Value(), &addend.Value()}));
     IrValue& product = ir.Emit(IrOpcode::FPMul32, IrType::F32, {&lhs.Value(), &rhs.Value()});
     IrValue& sum = ir.Emit(IrOpcode::FPAdd32, IrType::F32, {&product, &addend.Value()});
     IrValue& addendPart = ir.Emit(IrOpcode::FPSub32, IrType::F32, {&sum, &product});

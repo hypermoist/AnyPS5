@@ -93,6 +93,8 @@ struct SpirvEmitterState {
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
+    // f16 values converted to f32 need not keep their NaN payloads (RecompileTarget::relaxedFloat).
+    bool relaxedFloat = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     // The target's SPIR-V version and what the device accepts, for capabilities an emitter adds
