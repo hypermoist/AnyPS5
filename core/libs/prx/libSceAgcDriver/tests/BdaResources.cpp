@@ -232,12 +232,14 @@ void importWindowTests(const Context& context) {
     const auto lowBuffer = low->buffer;
     const auto* high = HostImportFor(importing, first + window, piece);
     Require(high != nullptr && high->base == first + window && high->bytes == piece, "a span crossed the import window");
-    Require(HostImportFor(importing, first + window - 16, 32) == nullptr, "a view crossing the import window was imported");
     change(guest + 3 * piece, true);
     const auto* grown = HostImportFor(importing, first + window, window);
     Require(grown != nullptr && grown->base == first + window && grown->bytes == window, "the next window did not grow into the new range");
     const auto* kept = HostImportFor(importing, first, 16);
     Require(kept != nullptr && kept->buffer == lowBuffer, "growth in one window re-imported another");
+    // A view crossing a window edge is served by one import over the window runs it spans.
+    const auto* crossing = HostImportFor(importing, first + window - 16, 32);
+    Require(crossing != nullptr && crossing->base <= first + window - 16 && first + window + 16 <= crossing->base + crossing->bytes, "a view crossing the import window was not served by one span");
     for (std::size_t index = 0; index < 4; ++index) change(guest + index * piece, false);
     SetHostImportWindow(0);
     ::operator delete(block, std::align_val_t{window});
@@ -297,7 +299,8 @@ void importJoinTests(const Context& context) {
     auto* heap = guest + 3 * large + 2 * piece;
     change(heap, piece, true);
     change(heap + piece, piece, true);
-    Require(bind(reinterpret_cast<std::uintptr_t>(heap + piece) - 16).second != 0 && HostImportFor(importing, reinterpret_cast<std::uintptr_t>(heap + piece) - 16, 32) == nullptr, "two pieces no larger than the import window were joined");
+    // This branch joins the window runs a view crossing a window edge spans, so the view is bound in place.
+    Require(bind(reinterpret_cast<std::uintptr_t>(heap + piece) - 16).second == 0 && HostImportFor(importing, reinterpret_cast<std::uintptr_t>(heap + piece) - 16, 32) != nullptr, "a view across two pieces crossing a window edge was not imported as one span");
     const auto heapBase = reinterpret_cast<std::uintptr_t>(heap);
     const auto [piecesBuffer, piecesCopied] = bind(heapBase, 2 * piece);
     const auto* pieces = HostImportFor(importing, heapBase, 2 * piece);

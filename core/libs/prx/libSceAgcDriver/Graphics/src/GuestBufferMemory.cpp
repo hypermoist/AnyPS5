@@ -642,8 +642,37 @@ ImportRun importRun(const GuestAllocations::Lease& lease, std::uint64_t address)
     return run;
 }
 
+// The window runs a view crossing a window edge spans, joined: the window runs never give such a
+// view an import (it was copied by the CPU at every use). Requests inside either window are served
+// by the joined import; it is replaced only when one of its windows changes.
+ImportRun extentRun(const GuestAllocations::Lease& lease, std::uint64_t address, std::uint64_t end) {
+    // Ranges all larger than the window are joined where a buffer is bound across them (joinedRun); a span mixing them
+    // with window runs is joined here, as joinedRun takes such a span only when a buffer covers it exactly.
+    const auto window = importWindow.load(std::memory_order_relaxed);
+    const auto large = [window](const ImportRun& run) { return window != 0 && run.ranges.size() == 1 && run.ranges.front()->bytes > window; };
+    auto run = importRun(lease, address);
+    if (run.ranges.empty()) return {};
+    bool allLarge = large(run);
+    while (run.base + run.bytes < end) {
+        auto next = importRun(lease, run.base + run.bytes);
+        if (next.ranges.empty() || next.base != run.base + run.bytes || !continuesRun(*run.ranges.back(), *next.ranges.front())) return {};
+        allLarge = allLarge && large(next);
+        run.bytes += next.bytes;
+        run.ranges.insert(run.ranges.end(), next.ranges.begin(), next.ranges.end());
+    }
+    if (allLarge && run.ranges.size() > 1) return {};
+    if (run.ranges.size() > 1 && Imports().unaliasedSpans.contains(run.base)) return {};
+    return run;
+}
+
+ImportRun requestRun(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    auto run = importRun(lease, begin);
+    if (run.ranges.empty() || end <= run.base + run.bytes) return run;
+    return extentRun(lease, begin, end);
+}
+
 bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
-    const auto run = importRun(lease, begin);
+    const auto run = requestRun(lease, begin, end);
     return !run.ranges.empty() && end <= run.base + run.bytes;
 }
 
@@ -701,7 +730,8 @@ bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
         const auto current = leasedRangeOwner(lease, entry.base, entry.base + entry.bytes);
         return current != nullptr && !entry.ranges.front().owner_before(current) && !current.owner_before(entry.ranges.front());
     }
-    return sameRun(entry, entry.joined ? joinedRun(lease, entry.base, entry.base + entry.bytes) : importRun(lease, entry.base));
+    if (entry.joined) return sameRun(entry, joinedRun(lease, entry.base, entry.base + entry.bytes));
+    return sameRun(entry, importRun(lease, entry.base)) || sameRun(entry, extentRun(lease, entry.base, entry.base + entry.bytes));
 }
 
 bool pointerHeld(const HostImports& state, const HostImport& entry) {
@@ -795,7 +825,7 @@ ImportRun windowRun(const HostImports& state, ImportRun run, std::uint64_t begin
 
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 bool importsStale(const Context& context, const HostImports& state);
-const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict);
+const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict, bool spanning = false);
 
 // The bytes retireLeastRecent could free outside [begin, end).
 std::uint64_t evictableBytes(const HostImports& state, std::uint64_t begin, std::uint64_t end) {
@@ -819,9 +849,13 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     if (fresh && end == 0) {
         if (const auto* current = findImport(state, address, run.ranges.empty() ? address + 1 : run.base + run.bytes)) return current;
     }
+    // A view crossing a window edge spans the window runs it reaches: like a join, the import may replace imports this
+    // build already looked up (a retired import outlives the build through its hold).
+    const bool spanning = end != 0 && !run.ranges.empty() && end > run.base + run.bytes;
+    if (spanning) run = extentRun(lease, address, end);
     if (end != 0) run = windowRun(state, std::move(run), address, end, context.hostImportAlignment);
     if (run.ranges.empty()) return nullptr;
-    return importRunAt(context, state, std::move(run), false, address, lease, end, evict);
+    return importRunAt(context, state, std::move(run), false, address, lease, end, evict, spanning);
 }
 
 const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
@@ -833,7 +867,7 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
     return importRunAt(context, state, std::move(run), true, begin, lease, end, true);
 }
 
-const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict) {
+const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict, bool spanning) {
     const auto base = run.base;
     const auto bytes = run.bytes;
     auto& failures = joined ? state.failedJoins : state.failed;
@@ -856,7 +890,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     // A join may replace imports this build already looked up: it runs before any region confirms an import
     // (UploadFinish's pre-pass re-resolves every pointer after it), and a retired import stays alive through the
     // hold (KeepThroughHold). Refusing it there would keep the run copied for good.
-    const auto held = [&](const HostImport& entry) { return !joined && pointerHeld(state, entry); };
+    const auto held = [&](const HostImport& entry) { return !joined && !spanning && pointerHeld(state, entry); };
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
         if (held(it->second)) return nullptr;
         replaced += it->second.bytes;
