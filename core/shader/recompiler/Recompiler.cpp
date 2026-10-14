@@ -650,6 +650,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     }
     targetOptions.waveLdsMemoryBarriers = request.target.waveLdsMemoryBarriers;
     targetOptions.deviceScopeLdsMemoryBarriers = request.target.deviceScopeLdsMemoryBarriers;
+    targetOptions.relaxedFloat = request.target.relaxedFloat;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
