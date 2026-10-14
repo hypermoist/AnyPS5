@@ -316,6 +316,7 @@ private:
     // The device's Graphics::Context: a copy of the one built at setup (its instance functions
     // resolved then, its function table filled then), or with APS5_NO_CONTEXT_CACHE=1 built anew.
     Graphics::Context graphicsContext() const;
+    const Graphics::Context& graphicsContext(std::optional<Graphics::Context>& built) const;
     ShaderRecompiler::SpirvTarget buildTarget() const;
     Graphics::Context buildContext() const;
     // Body of Dispatch and DispatchIndirect: `arguments` 0 dispatches x, y, z groups.
