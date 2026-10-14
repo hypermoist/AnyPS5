@@ -29,10 +29,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pending.tailAt = phaseLap;
         return DrawVerdict::Drawn;
     };
-    auto drawParameters = Pm4::ResolveDraw(packet, queue);
-    bool traceIndirect = false;
-    if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
-    phaseTiming.Phase(DrawRowPrecheck);
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
 
@@ -41,8 +37,25 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const std::uint64_t dumpSlot1 = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SLOT1"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
 
     static const bool lockedPrepare = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
-    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
+    const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::shared_ptr<VulkanDevice> localDevice;
+    const PublishedDraw* published = nullptr;
+    if (drawAhead != nullptr && registerKey && !lockedPrepare && !verifyDrawRecipe() && !verifyDrawEntries() && (localDevice = device.Load()) != nullptr) published = drawAhead->Find(submission, packet, queue, localDevice->Serial());
+    Pm4::DrawParameters drawParameters{};
+    bool traceIndirect = false;
+    if (published != nullptr) {
+        drawParameters = published->parameters;
+        if (drawParameters.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(drawParameters.indexAddress), static_cast<std::size_t>(drawParameters.indexCount) * drawParameters.indexSize, drawParameters.indexSize);
+        if (published->precheck == DrawPrecheckOutcome::Nothing) return DrawVerdict::Nothing;
+        traceIndirect = TraceIndirectDraws();
+    } else {
+        drawParameters = Pm4::ResolveDraw(packet, queue);
+        if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
+    }
+    phaseTiming.Phase(DrawRowPrecheck);
+
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
     if (lockedPrepare) {
 
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -54,7 +67,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
-    } else if ((localDevice = device.Load()) == nullptr) {
+    } else if (localDevice == nullptr && (localDevice = device.Load()) == nullptr) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard createLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
@@ -63,8 +76,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
-    const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
-    const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
@@ -72,7 +83,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::uint64_t shapeKey = 0;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey);
+        drawKey = published != nullptr ? (shapeKey = published->shape, published->key) : drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey);
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
