@@ -7041,7 +7041,8 @@ int main(int argc, char** argv) {
                 return capture;
             },
             [] { return mock.pipelineCreateCount; },
-            [] { return mock.pipelineSpecializations.back(); }
+            [] { return mock.pipelineSpecializations.back(); },
+            [] { return mock.descriptorPools.size(); }
         });
         std::cout << "Graphics validation tests passed\n";
         return 0;
