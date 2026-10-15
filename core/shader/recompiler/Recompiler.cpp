@@ -331,6 +331,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::vector<std::uint32_t> code;
     std::vector<std::uint32_t> linkedCallFallbacks;
     std::shared_ptr<const IrResourcePlan> plan;
+    bool runtimeCaptured = false;
     // A plan build that threw (an unsupported resource chain or control flow) is remembered and
     // rethrown: the front end ran every pass before failing, ~13 ms per dispatch of a shader the
     // title issues every frame (0x1048947300 at the intro video). APS5_NO_FAILURE_MEMO=1 rebuilds.
@@ -469,6 +470,25 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         }
     }
     return source;
+}
+
+std::shared_ptr<const IrResourcePlan> acquirePlan(const RecompileRequest& request, const std::shared_ptr<SourceEntry>& source, bool runtimeCapture) {
+    for (;;) {
+        {
+            std::lock_guard lock(source->mutex);
+            if (source->plan != nullptr) {
+                if (runtimeCapture) source->runtimeCaptured = true;
+                return source->plan;
+            }
+        }
+        if (getSource(request) != source) throw std::runtime_error("ShaderRecompiler: resource plan source changed while reloading");
+    }
+}
+
+void releaseUndrawnPlan(const SourceHandle& handle) {
+    if (handle.source == nullptr || !diskPlans()) return;
+    std::lock_guard lock(handle.source->mutex);
+    if (!handle.source->runtimeCaptured) handle.source->plan.reset();
 }
 
 std::array<std::uint32_t, 3> partialThreads(const RecompileRequest& request) {
@@ -1110,7 +1130,7 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
         return materializeResult(variant, request, snapshot);
     }
     const auto source = getSource(request);
-    materializer.Materialize(*source->plan, runtime, snapshot);
+    materializer.Materialize(*acquirePlan(request, source, true), runtime, snapshot);
     return materializeVariant(*source, request, snapshot);
 }
 
@@ -1318,8 +1338,15 @@ auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltyp
 
 std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request) {
     static_cast<void>(RequestInputInfo(request));
-    if (request.useCache) return getSource(request)->plan;
+    if (request.useCache) {
+        const auto source = getSource(request);
+        return acquirePlan(request, source, false);
+    }
     return makeResourcePlan(request);
+}
+
+void ReleaseUndrawnResourcePlan(const SourceHandle& handle) {
+    releaseUndrawnPlan(handle);
 }
 
 namespace {
@@ -1350,7 +1377,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     auto capture = std::make_shared<ResourceCapture>();
     if (request.useCache) {
         capture->source = getSource(request);
-        capture->plan = capture->source->plan;
+        capture->plan = acquirePlan(request, capture->source, true);
     } else {
         capture->plan = makeResourcePlan(request);
     }
@@ -1434,13 +1461,13 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(cons
 std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const SrtRuntime& runtime) const {
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle->source;
-    capture->plan = handle->source->plan;
+    capture->plan = acquirePlan(request, handle->source, true);
     materializeCapture(*capture, runtime);
     return capture;
 }
 
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {
-    if (capture.source != handle->source || capture.plan != handle->source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    if (capture.source != handle->source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
     result->cacheHit = true;
@@ -1468,7 +1495,7 @@ std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest
 
 std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle) {
     if (!MatchesPreparedShader(request, handle)) throw std::runtime_error("ShaderRecompiler: prepared artifact does not match the static ABI");
-    if (capture.source != handle.source || capture.plan != handle.source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
+    if (capture.source != handle.source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle.source, handle.artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle.artifact, request, capture.snapshot));
     result->cacheHit = true;
@@ -1484,7 +1511,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(RequestInputInfo(request));
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle.source;
-    capture->plan = handle.source->plan;
+    capture->plan = acquirePlan(request, handle.source, true);
     if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
     materializeCapture(*capture, runtime);
     return capture;

@@ -1861,6 +1861,22 @@ void verifyPlanRoundTrip() {
         std::cout << "plan round trip: " << fixture.name << ", " << plan->valueStorage.Size() << " values, " << ShaderDiskCache::EncodePlanEntry(key, *plan).size() << " bytes per entry, " << succeeded << " of 1000 runtimes materialized\n";
         ++index;
     }
+    auto releaseFixture = fixtures.front();
+    releaseFixture.waveSize = 32u;
+    auto registeredRequest = releaseFixture.Request(true);
+    const auto registeredHandle = PrepareShader(registeredRequest);
+    const auto registeredPlan = GetResourcePlan(registeredRequest);
+    ShaderDiskCache::Flush();
+    ReleaseUndrawnResourcePlan(*registeredHandle);
+    const auto beforeReload = ShaderDiskCache::Totals();
+    const auto reloadedPlan = GetResourcePlan(registeredRequest);
+    require(ShaderDiskCache::Totals().planHits == beforeReload.planHits + 1u, "a released registration plan was not reloaded from the disk cache");
+    require(samePlan(*registeredPlan, *reloadedPlan), "a released registration plan changed when reloaded");
+    RequestMemoryView registeredMemory(registeredRequest.context.memory);
+    const auto runtimeCapture = CaptureResources(registeredRequest, registeredMemory.MakeRuntime(registeredRequest.context.userData, registeredRequest.shader.codeAddress), *registeredHandle);
+    const auto beforeKeep = ShaderDiskCache::Totals();
+    ReleaseUndrawnResourcePlan(*registeredHandle);
+    require(GetResourcePlan(registeredRequest) == runtimeCapture->plan && ShaderDiskCache::Totals().planHits == beforeKeep.planHits, "a runtime-captured plan was released");
     const auto covers = [&](const std::function<bool(const IrResourcePlan&)>& predicate) {
         return std::any_of(plans.begin(), plans.end(), [&](const std::shared_ptr<const IrResourcePlan>& plan) { return predicate(*plan); });
     };

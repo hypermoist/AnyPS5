@@ -247,6 +247,7 @@ function(add_shader_recompiler target runtimeTarget)
             MaterializeShader
             RegistrationResult
             ResolveSource
+            ReleaseUndrawnResourcePlan
             ResourceMaterializer::SpecializationNanoseconds
             RuntimeAbi::RequireVersion
             RuntimeAbi::HeapCapacity
