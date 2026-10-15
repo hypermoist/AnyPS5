@@ -61,10 +61,9 @@ private:
     std::size_t size;
     std::size_t capacity;
     VkDeviceSize allocationBytes = 0;
-    // Backed by host memory because the device ran out (not returned to the pool).
-    bool hostFallback = false;
     VkBufferUsageFlags usage;
     std::shared_ptr<BufferPool> cache;
+    bool hostPlaced = false;
 };
 
 // Records a whole-range buffer copy.
