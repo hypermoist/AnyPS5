@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -51,7 +52,7 @@ std::string Hex(std::uint32_t value) {
 }
 
 // Function-storage variables in the module: the window array alone per lane half when it is not narrowed.
-std::uint32_t FunctionVariables(const std::vector<std::uint32_t>& words) {
+std::uint32_t FunctionVariables(std::span<const std::uint32_t> words) {
     std::uint32_t count = 0;
     for (std::size_t at = 5; at < words.size();) {
         const auto length = words[at] >> 16u;
@@ -80,7 +81,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, std::uint32_t 
     };
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
-    Require(FunctionVariables(result.spirv) > 8u, "vector window narrowing: wave" + std::to_string(waveSize) + " window was not split into separate slot variables");
+    Require(FunctionVariables(result.spirv.Words()) > 8u, "vector window narrowing: wave" + std::to_string(waveSize) + " window was not split into separate slot variables");
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
 }

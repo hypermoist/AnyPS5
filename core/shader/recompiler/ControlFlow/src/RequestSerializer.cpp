@@ -799,7 +799,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.vertexSubgroups);
     writer.WriteBool(request.target.float16DenormPreserve);
     writer.WriteU32Span(request.context.linkedCallFallbacks);
-    writer.WriteBool(request.target.relaxedFloat);
+    if (request.target.relaxedFloat) writer.WriteBool(true);
     return base64Encode(buffer);
 }
 
@@ -844,7 +844,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.linkedCallFallbacks = reader.ReadU32Vector();
         result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
     }
-    if (version >= 30u) result.request.target.relaxedFloat = reader.ReadBool();
+    if (version >= 30u && reader.Remaining() != 0u) result.request.target.relaxedFloat = reader.ReadBool();
     if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     return result;
 }

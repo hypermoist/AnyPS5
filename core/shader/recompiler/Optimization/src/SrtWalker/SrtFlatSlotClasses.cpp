@@ -119,7 +119,7 @@ DescriptorUserWords ComputeDescriptorUserWords(const IrResourcePlan& plan) {
     DescriptorUserWords result;
     result.patchable.assign(plan.userDataCount, 0u);
     const bool disqualified = !plan.srtPlanComplete || plan.materializationSources.size() < plan.info.buffers.size()
-        || std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.indirectImage.has_value(); })
+        || std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value(); })
         || (plan.uniformFill.fill.kind != UniformFillKind::None && plan.uniformFill.fill.words > plan.uniformFill.values.size());
     if (disqualified) return result;
     const auto userIndex = [&plan](const IrValue* value) -> std::optional<std::uint32_t> {

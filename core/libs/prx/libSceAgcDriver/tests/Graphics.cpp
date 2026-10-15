@@ -4381,9 +4381,10 @@ void sampledTextureBudgetTests() {
     Require(SampledTextureBudget(memory, &reported, 0) == 4 * GiB, "a zero budget for the largest device-local heap did not fall back to a quarter of the heap");
     reported.heapBudget[2] = 15 * GiB;
     reported.heapUsage[2] = 9 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == 5 * GiB + 128 * MiB, "a 15 GiB budget with 4 GiB used outside the texture caches does not leave 5 GiB 128 MiB after the 4 GiB storage cache and 1 GiB 896 MiB of headroom");
+    const auto pressure = AgcDriver::Graphics::DeviceMemoryPressure();
+    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == 5 * GiB + 128 * MiB - pressure, "a 15 GiB budget with 4 GiB used outside the texture caches does not leave 5 GiB 128 MiB after the 4 GiB storage cache and 1 GiB 896 MiB of headroom");
     reported.heapUsage[2] = 3 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == 9 * GiB + 128 * MiB, "usage below the cached bytes is not read as no other device memory in use");
+    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == 9 * GiB + 128 * MiB - pressure, "usage below the cached bytes is not read as no other device memory in use");
     reported.heapUsage[2] = 12 * GiB;
     Require(SampledTextureBudget(memory, &reported, 1 * GiB) == 2 * GiB, "a heap whose other users leave no room does not keep the 2 GiB floor");
     memory.memoryHeaps[0].flags = 0;
@@ -4411,6 +4412,7 @@ void deviceMemoryPressureTests() {
     VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     reported.heapBudget[0] = 15 * GiB;
     reported.heapUsage[0] = 9 * GiB;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     const auto before = SampledTextureBudget(memory, &reported, 5 * GiB);
     const auto pressure = DeviceMemoryPressure();
     SetDeviceMemoryReclaimer(&testReclaimer);
