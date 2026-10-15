@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
+#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -15,6 +16,14 @@ bool DrawRecipeRecord::Matches(const std::vector<std::shared_ptr<DispatchVariant
         if (stages[i].owner_before(variants[i]) || variants[i].owner_before(stages[i])) return false;
     }
     return true;
+}
+
+const Graphics::PreparedDraw* PreparedDrawRecord::For(const std::vector<std::shared_ptr<DispatchVariant>>& variants, std::size_t shaderCount) const {
+    if (shaderCount != shaders || variants.size() != stages.size()) return nullptr;
+    for (std::size_t i = 0; i < stages.size(); ++i) {
+        if (stages[i].owner_before(variants[i]) || variants[i].owner_before(stages[i])) return nullptr;
+    }
+    return prepared.get();
 }
 
 bool DrawRecipeRecord::Expired() const {
@@ -84,12 +93,22 @@ DrawKeySightings::DrawKeySightings(std::size_t keyCount) {
     bucketMask = buckets - 1;
 }
 
-bool DrawKeySightings::SeenBefore(std::uint64_t key) {
+std::size_t DrawKeySightings::bucketOf(std::uint64_t key) const {
     auto mixed = key;
     mixed = (mixed ^ (mixed >> 30u)) * 0xbf58476d1ce4e5b9ull;
     mixed = (mixed ^ (mixed >> 27u)) * 0x94d049bb133111ebull;
     mixed ^= mixed >> 31u;
-    const auto bucket = static_cast<std::size_t>(mixed) & bucketMask;
+    return static_cast<std::size_t>(mixed) & bucketMask;
+}
+
+bool DrawKeySightings::Seen(std::uint64_t key) const {
+    const auto bucket = bucketOf(key);
+    const auto* ways = keys.data() + bucket * Ways;
+    return std::find(ways, ways + filled[bucket], key) != ways + filled[bucket];
+}
+
+bool DrawKeySightings::SeenBefore(std::uint64_t key) {
+    const auto bucket = bucketOf(key);
     auto* ways = keys.data() + bucket * Ways;
     if (std::find(ways, ways + filled[bucket], key) != ways + filled[bucket]) return true;
     ways[next[bucket]] = key;
@@ -101,14 +120,30 @@ bool DrawKeySightings::SeenBefore(std::uint64_t key) {
 bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
     std::lock_guard cacheLock(drawCacheMutex);
     if (drawCache.contains(key)) return true;
+    return sightDrawKey(key, shape);
+}
+
+bool Driver::sightDrawKey(std::uint64_t key, std::uint64_t shape) {
     if (!drawKeySightings) drawKeySightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
     const bool seen = drawKeySightings->SeenBefore(key);
-    if (seen || shape == 0 || drawShapes.contains(shape)) return seen;
+    if (seen || shape == 0 || shapeHasOtherEntry(key, shape)) return seen;
     if (!drawShapeSightings) drawShapeSightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
     return drawShapeSightings->SeenBefore(shape);
 }
 
-void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape) {
+bool Driver::drawKeyAdmitted(std::uint64_t key, std::uint64_t shape) const {
+    if (drawKeySightings && drawKeySightings->Seen(key)) return true;
+    if (shape == 0 || shapeHasOtherEntry(key, shape)) return false;
+    return drawShapeSightings && drawShapeSightings->Seen(shape);
+}
+
+bool Driver::shapeHasOtherEntry(std::uint64_t key, std::uint64_t shape) const {
+    const auto owner = drawShapes.find(shape);
+    return owner != drawShapes.end() && owner->second != key;
+}
+
+void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, bool ahead, std::shared_ptr<const Graphics::PreparedDraw> prepared, std::size_t preparedShaders) {
+    std::vector<std::shared_ptr<DrawEntry>> released;
     std::lock_guard cacheLock(drawCacheMutex);
     auto& counters = drawEntryCounters;
     ++counters.inserts;
@@ -120,6 +155,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     if (found != drawCache.end()) {
         if (found->second->stages.size() == fresh.size()) replacement->stages = found->second->stages;
         if (found->second->decode != nullptr) replacement->decode = found->second->decode;
+        replacement->prepared = found->second->prepared;
         replacement->recipes.store(found->second->recipes.load());
     }
     for (std::size_t i = 0; i < fresh.size(); ++i) {
@@ -140,29 +176,52 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
             ++counters.variantsEvicted;
         }
     }
+    if (prepared != nullptr) replacement->prepared = std::make_shared<const PreparedDrawRecord>(PreparedDrawRecord{{fresh.begin(), fresh.end()}, preparedShaders, std::move(prepared)});
     replacement->touched = drawCacheHits;
-    if (replacement->decode != nullptr && shape != 0) drawShapes[shape] = key;
+    const bool probation = ahead && found == drawCache.end() && !drawKeyAdmitted(key, shape);
+    replacement->probation = found == drawCache.end() ? probation : found->second->probation;
+    if (!replacement->probation && replacement->decode != nullptr && shape != 0) drawShapes[shape] = key;
     if (found == drawCache.end()) {
-        drawOrder.push_front(key);
-        replacement->order = drawOrder.begin();
+        auto& order = replacement->probation ? drawProbation : drawOrder;
+        order.push_front(key);
+        replacement->order = order.begin();
         drawCache.emplace(key, std::move(replacement));
     } else {
         replacement->order = found->second->order;
-        drawOrder.splice(drawOrder.begin(), drawOrder, replacement->order);
-        found->second = std::move(replacement);
+        auto& order = replacement->probation ? drawProbation : drawOrder;
+        order.splice(order.begin(), order, replacement->order);
+        releasedDrawEntries.push_back(std::exchange(found->second, std::move(replacement)));
     }
-    while (drawCache.size() > drawCacheEntries()) {
-        const auto last = drawCache.find(drawOrder.back());
+    evictDrawEntries();
+    released.swap(releasedDrawEntries);
+}
+
+void Driver::sightDrawEntry(std::uint64_t key, DrawEntry& entry, std::vector<std::shared_ptr<DrawEntry>>& released) {
+    if (!entry.probation || !sightDrawKey(key, entry.shape)) return;
+    drawOrder.splice(drawOrder.begin(), drawProbation, entry.order);
+    entry.probation = false;
+    entry.touched = drawCacheHits;
+    if (entry.decode != nullptr && entry.shape != 0) drawShapes[entry.shape] = key;
+    evictDrawEntries();
+    released.swap(releasedDrawEntries);
+}
+
+void Driver::evictDrawEntries() {
+    const auto evict = [&](std::list<std::uint64_t>& order) {
+        const auto last = drawCache.find(order.back());
         for (const auto& variants : last->second->stages) {
             for (const auto& variant : variants) accountDrawVariant(*variant, false);
         }
         if (traceDrawCache()) traceInsert(traceKeysEvicted, last->first);
         if (const auto shapeOf = drawShapes.find(last->second->shape); shapeOf != drawShapes.end() && shapeOf->second == last->first) drawShapes.erase(shapeOf);
-        drawOrder.erase(last->second->order);
+        order.erase(last->second->order);
+        releasedDrawEntries.push_back(std::move(last->second));
         drawCache.erase(last);
         ++drawCacheEvictions;
-        ++counters.evictions;
-    }
+        ++drawEntryCounters.evictions;
+    };
+    while (drawOrder.size() > drawCacheEntries()) evict(drawOrder);
+    while (drawProbation.size() > drawCacheEntries()) evict(drawProbation);
 }
 
 void Driver::eraseDrawEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>& expected) {
@@ -172,7 +231,7 @@ void Driver::eraseDrawEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>&
         for (const auto& variant : variants) accountDrawVariant(*variant, false);
     }
     if (const auto shapeOf = drawShapes.find(found->second->shape); shapeOf != drawShapes.end() && shapeOf->second == key) drawShapes.erase(shapeOf);
-    drawOrder.erase(found->second->order);
+    (found->second->probation ? drawProbation : drawOrder).erase(found->second->order);
     drawCache.erase(found);
 }
 

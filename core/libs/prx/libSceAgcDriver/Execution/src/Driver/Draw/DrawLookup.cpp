@@ -75,11 +75,16 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.ditheredAlphaToCoverage);
             mix(pixel.quadPixelMask);
             for (const auto mask : pixel.quadSampleMask) mix(mask);
+            std::vector<std::shared_ptr<DrawEntry>> released;
             std::lock_guard cacheLock(drawCacheMutex);
             ++drawEntryCounters.lookups;
             const auto found = drawCache.find(drawKey);
-            if (found != drawCache.end()) entry = found->second;
-            else ++drawEntryCounters.absent;
+            if (found != drawCache.end()) {
+                sightDrawEntry(drawKey, *found->second, released);
+                entry = found->second;
+            } else {
+                ++drawEntryCounters.absent;
+            }
             maybeReportDrawCache(profile);
         }
         if (entry != nullptr) {
@@ -161,6 +166,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (rotate) {
                         auto rotated = std::make_shared<DrawEntry>();
                         rotated->decode = entry->decode;
+                        rotated->prepared = entry->prepared;
                         rotated->stages = entry->stages;
                         rotated->shape = entry->shape;
                         rotated->recipes.store(entry->recipes.load());
@@ -171,10 +177,11 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             variants.insert(variants.begin(), matched[i]);
                         }
                         rotated->touched = entry->touched;
+                        rotated->probation = entry->probation;
                         rotated->order = entry->order;
                         again->second = std::move(rotated);
                     }
-                    if (drawCacheHits - again->second->touched > drawCacheEntries() / 8) {
+                    if (!again->second->probation && drawCacheHits - again->second->touched > drawCacheEntries() / 8) {
                         drawOrder.splice(drawOrder.begin(), drawOrder, again->second->order);
                         again->second->touched = drawCacheHits;
                         ++counters.touches;

@@ -44,6 +44,11 @@ DrawEntryCounters Driver::DrawCacheCounters() {
     return drawEntryCounters;
 }
 
+Driver::DrawCacheOccupancy Driver::DrawCacheState() {
+    std::lock_guard cacheLock(drawCacheMutex);
+    return {drawOrder.size(), drawProbation.size(), releasedDrawEntries.size()};
+}
+
 std::string Driver::profileDrawCacheLines(const DrawEntryCounters& counters) {
     std::string text;
     const auto append = [&](const char* format, auto... values) {
@@ -64,6 +69,10 @@ std::string Driver::profileDrawCacheLines(const DrawEntryCounters& counters) {
     append("[draw-cache] register key (10 s): %llu lookups, %llu hits, key build %.1f us each; decode skipped %llu, partial (state/pixel/programs from the entry) %llu; facade log != table %llu; verify: %llu decodes compared, %llu differed\n", count(counters.registerKeyLookups), count(counters.registerKeyHits), counters.registerKeyLookups != 0 ? counters.keyUs / static_cast<double>(counters.registerKeyLookups) : 0.0, count(counters.decodeSkipped), count(counters.decodePartial), count(counters.facadeMismatches), count(counters.verifyDecodes), count(counters.verifyDecodeMismatches));
     append("[draw-cache] stage data hits (10 s): %llu stages (%llu words refreshed), verified %llu; stage inserts with data positions %llu (%.1f positions each)\n", count(counters.stageDataHits), count(counters.stageDataWords), count(counters.stageDataVerified), count(counters.stageDataInserts), counters.stageDataInserts != 0 ? static_cast<double>(counters.stageDataPositions) / static_cast<double>(counters.stageDataInserts) : 0.0);
     return text;
+}
+
+DrawAheadCounters Driver::DrawAheadStatistics() const {
+    return {drawAheadCounts.published.load(std::memory_order_relaxed), drawAheadCounts.used.load(std::memory_order_relaxed), drawAheadCounts.compiled.load(std::memory_order_relaxed), drawAheadCounts.dropped.load(std::memory_order_relaxed)};
 }
 
 }
