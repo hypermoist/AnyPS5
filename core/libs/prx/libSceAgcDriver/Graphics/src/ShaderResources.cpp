@@ -3763,6 +3763,12 @@ DescriptorCache::Stats DescriptorCache::Counters() const {
     return stats;
 }
 
+namespace {
+thread_local std::uint64_t traceProgram = 0;
+}
+
+void SetTraceProgram(std::uint64_t address) { traceProgram = address; }
+
 std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read) {
     Require(words.size() == 4, "buffer descriptor must contain four DWORDs");
     Require((words[1] & 0x40000000u) == 0, "buffer descriptor has reserved bits set");
@@ -3797,6 +3803,12 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     Require(!written || !overlap(address, size, indexAddress, indexBytes), "writable shader buffer aliases the index buffer");
     written = written || allWritten;
     const bool swept = read && dispatchThreads != 0 && descriptor.Stride() != 0 && dispatchThreads * descriptor.Stride() * 2u >= byteSize;
+    static const bool traceLarge = std::getenv("APS5_TRACE_LARGE_WRITES") != nullptr;
+    static std::atomic<int> traceLeft{400};
+    if (traceLarge && written && size >= (32u << 20u) && traceLeft.fetch_sub(1, std::memory_order_relaxed) > 0) {
+        const auto packet = GuestMemory::CurrentPacket();
+        std::fprintf(stderr, "[large-write] program 0x%llx packet 0x%x: buffer 0x%llx+0x%zx stride %llu read %d atomic %d swept %d dispatch threads %llu words %08x %08x %08x %08x\n", static_cast<unsigned long long>(traceProgram), packet.opcode, static_cast<unsigned long long>(address), size, static_cast<unsigned long long>(descriptor.Stride()), read ? 1 : 0, atomic ? 1 : 0, swept ? 1 : 0, static_cast<unsigned long long>(dispatchThreads), words[0], words[1], words[2], words[3]);
+    }
     if (written) guestMemory.AddWritable(address, size, atomic, swept);
     else {
         guestMemory.AddReadable(address, size);

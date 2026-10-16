@@ -24,6 +24,9 @@ namespace AgcDriver { class VulkanDevice; }
 
 namespace AgcDriver::Graphics {
 
+// Debug aid (APS5_TRACE_LARGE_WRITES): the program the calling thread binds resources for.
+void SetTraceProgram(std::uint64_t address);
+
 class Recorder;
 
 void FlushCachedTextures(VkDevice device);
