@@ -4362,12 +4362,12 @@ bool GuestBufferMemory::HasCopiedWrites() const {
 }
 
 bool GuestBufferMemory::BoundInPlace(std::uint64_t address) const {
-    const auto* found = owner(address);
+    const auto* found = owner(address, address + 1);
     return found != nullptr && found->direct != nullptr;
 }
 
 bool GuestBufferMemory::DirectWriteAt(std::uint64_t address) const {
-    const auto* found = owner(address);
+    const auto* found = owner(address, address + 1);
     return found != nullptr && (found->direct != nullptr || (found->gpuCopy && found->copiedBack));
 }
 

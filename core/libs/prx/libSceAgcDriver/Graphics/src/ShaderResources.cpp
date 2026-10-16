@@ -4286,8 +4286,6 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         const bool writeOnly = written && element < binding.imageRead.size() && !binding.imageRead[element] && !sameAsPrevious;
         CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
         if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
-        // Images the shader only reads have nothing to store back.
-        const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else {
