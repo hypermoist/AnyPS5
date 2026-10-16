@@ -166,9 +166,6 @@ struct SpirvEmitterState {
     std::uint32_t numWorkgroupsVariable = 0;
     std::array<std::uint32_t, 2> scratchVariable {};
     std::array<std::uint32_t, 2> vectorWindowVariable {};
-    // The window slots relative accesses likely reach (0 when unknown): the array holds only those;
-    // each slot past them is a variable of its own, so the device can keep it in a register instead
-    // of indexable memory. A relative access past the array switches over those variables.
     std::uint32_t vectorWindowIndexed = 0;
     std::array<std::vector<std::uint32_t>, 2> vectorWindowSlots {};
     std::array<std::uint32_t, ImageBindingCount> imageVariables {};

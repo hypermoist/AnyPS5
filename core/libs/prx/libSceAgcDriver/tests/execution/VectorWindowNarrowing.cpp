@@ -12,9 +12,6 @@
 #include <string>
 #include <vector>
 
-// A 32-register relative-addressing window whose one bounded index (s8 & 3) keeps it to a 4-slot array
-// and separate variables for the other slots, and whose data index (s9) reaches either part at run time.
-
 namespace {
 
 using AgcDriver::Graphics::Require;
@@ -25,9 +22,6 @@ constexpr std::uint32_t Results = 16;
 constexpr std::uint32_t Checked = 6;
 alignas(256) std::array<std::uint32_t, MaxThreads * Results> Output{};
 
-// v1 = tid * 64, v[10 + k] = (tid << 8) + k for k < 32;
-// m0 = s8 & 3: v_movrels v4, v10;  m0 = s9: v_movrels v5, v10; v_movreld v10, v4;
-// m0 = s8 & 3: v_movreld v10, v5; stores v4, v5, v12, v13, v30, v41.
 alignas(256) constexpr std::array<std::uint32_t, 54> Code{
     0x34020086, 0x34060088, 0x4a140680, 0x4a160681, 0x4a180682, 0x4a1a0683, 0x4a1c0684, 0x4a1e0685,
     0x4a200686, 0x4a220687, 0x4a240688, 0x4a260689, 0x4a28068a, 0x4a2a068b, 0x4a2c068c, 0x4a2e068d,
@@ -51,7 +45,6 @@ std::string Hex(std::uint32_t value) {
     return text;
 }
 
-// Function-storage variables in the module: the window array alone per lane half when it is not narrowed.
 std::uint32_t FunctionVariables(std::span<const std::uint32_t> words) {
     std::uint32_t count = 0;
     for (std::size_t at = 5; at < words.size();) {

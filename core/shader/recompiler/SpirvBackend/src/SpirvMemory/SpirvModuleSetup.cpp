@@ -48,12 +48,6 @@ std::uint32_t DefineInterfaceVariable(SpirvEmitterState& state, std::uint32_t ty
 
 namespace {
 
-// A likely upper bound of a 32-bit window index value. A window slot's value is bounded by the stores
-// to that slot that can reach the load (or its initial zero), leaving out stores to a slot known only
-// at run time, which move data rather than indices, and a lane-masked write (a select keeping a window
-// load) by its new value, as the lanes keeping the old one are mostly inactive; any select or phi by
-// the alternatives that have a bound. A cycle or an unknown operation has no bound. Only a guess: an access past it still works (see
-// SpirvEmitterState::vectorWindowIndexed).
 class WindowIndexBounds {
 public:
     std::optional<std::uint64_t> Of(const IrValue& input) {
@@ -79,8 +73,6 @@ private:
         return result;
     }
 
-    // The values a load of window slot `slot` can see: per path back from the load, the latest store
-    // to that slot.
     static std::vector<const IrValue*> reachingStores(const IrValue& load, std::uint32_t slot) {
         std::vector<const IrValue*> values;
         std::unordered_set<const IrBlock*> visited;
@@ -128,7 +120,6 @@ private:
             return lhs ? lhs : rhs;
         }
         case IrOpcode::UMin32: {
-            // Not the other side alone: the window clamps each index to its last slot.
             const auto lhs = arg(0);
             const auto rhs = arg(1);
             if (!lhs || !rhs) return std::nullopt;
@@ -201,9 +192,6 @@ private:
     std::unordered_set<const IrValue*> active;
 };
 
-// The window slots relative accesses likely reach (see SpirvEmitterState::vectorWindowIndexed), from
-// the indices likely bounded below half the window (0 when none is); the others are left to the
-// switch past the array.
 std::uint32_t IndexedWindowSlots(const IrProgram& program) {
     const auto window = program.Metadata().vectorWindowSize;
     WindowIndexBounds bounds;

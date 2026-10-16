@@ -242,6 +242,7 @@ CompiledVariant sampleVariant() {
     image.depthBitsCompatible = false;
     image.constantSwizzle = true;
     image.constantSwizzleCompatible = false;
+    image.cubeFaceCompatible = false;
     image.flatVolumeCompatible = false;
     image.singleMipPlaneBiasCompatible = true;
     image.flatLineCompatible = false;

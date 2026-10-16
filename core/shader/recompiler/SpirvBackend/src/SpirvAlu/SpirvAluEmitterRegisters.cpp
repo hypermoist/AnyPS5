@@ -56,9 +56,6 @@ std::uint32_t VectorWindowElement(SpirvEmitterState& state, std::uint32_t index)
     return pointer;
 }
 
-// Accesses window slot `index`, a value known only at run time, through `access` (given the slot's
-// pointer, it returns the loaded value or 0) when the array holds only the first slots: in the array
-// when the index is below them, else through a switch over the separate slot variables.
 std::uint32_t AccessNarrowedWindow(SpirvEmitterState& state, std::uint32_t index, const std::function<std::uint32_t(std::uint32_t)>& access) {
     const auto& slots = state.vectorWindowSlots.at(state.laneHalf);
     const auto arrayLabel = state.module.AllocateId();
@@ -103,7 +100,6 @@ std::uint32_t AccessNarrowedWindow(SpirvEmitterState& state, std::uint32_t index
     return value;
 }
 
-// The pointer to window slot `index` when the access needs no switch, else 0.
 std::uint32_t DirectWindowElement(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const IrValue* index = inst.Argument(0)->Resolve();
