@@ -4644,6 +4644,8 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
         layers[layer] = whole || (address < layerBegin(layer) + layerBytes(layer) && layerBegin(layer) < address + bytes);
         if (layers[layer]) ++selected;
     }
+    static const bool traceUnits = std::getenv("APS5_TRACE_WRITEBACK_UNITS") != nullptr;
+    if (traceUnits) std::fprintf(stderr, "[wb-units] image 0x%llx+0x%llx for %s 0x%llx+0x%zx: block units %d, units %u, pending %zu, selected %zu, whole %d (keys %s, filled %s)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), flushReason != nullptr ? flushReason : "other", static_cast<unsigned long long>(address), bytes, blockUnits ? 1 : 0, trackedLayers, pendingCount, selected, whole ? 1 : 0, DccKeysName(uploadedKeys), DccKeysName(filledKeys));
     if (selected == 0) {
         reconcilePending();
         return;
