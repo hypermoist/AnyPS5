@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -273,6 +274,25 @@ struct Context {
         const auto function = reinterpret_cast<TFunction>(CachedDeviceProc(device, deviceProc, name));
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
         return function;
+    }
+
+    // APS5_DEBUG_LABELS=1: names a Vulkan object (a shader module, a pipeline) for external GPU
+    // profilers; a guest program's are "p<code address>". Nothing without VK_EXT_debug_utils.
+    void DebugName(VkObjectType type, std::uint64_t handle, const char* name) const {
+        static const bool enabled = std::getenv("APS5_DEBUG_LABELS") != nullptr;
+        if (!enabled || handle == 0 || deviceProc == nullptr) return;
+        const auto setName = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(CachedDeviceProc(device, deviceProc, "vkSetDebugUtilsObjectNameEXT"));
+        if (setName == nullptr) return;
+        VkDebugUtilsObjectNameInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT};
+        info.objectType = type;
+        info.objectHandle = handle;
+        info.pObjectName = name;
+        setName(device, &info);
+    }
+    void DebugNameProgram(VkObjectType type, std::uint64_t handle, std::uint64_t address, const char* fallback) const {
+        char name[32];
+        if (address != 0) std::snprintf(name, sizeof(name), "p%llx", static_cast<unsigned long long>(address));
+        DebugName(type, handle, address != 0 ? name : fallback);
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.

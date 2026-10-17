@@ -338,6 +338,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             module.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
             module.pCode = shader.spirv.data();
             Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &module, nullptr, &_modules[i]), "vkCreateShaderModule graphics");
+            context.DebugNameProgram(VK_OBJECT_TYPE_SHADER_MODULE, reinterpret_cast<std::uint64_t>(_modules[i]), shaders[i].address, "aps5 graphics stage");
             const auto stage = VulkanStage(shaders[i].stage);
             stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
             stages[i].stage = stage;
@@ -554,6 +555,15 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             raster.cullMode = VK_CULL_MODE_FRONT_BIT;
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &backFaces), "vkCreateGraphicsPipelines");
+        }
+        {
+            std::string name;
+            for (const auto& shader : shaders) {
+                char part[24];
+                std::snprintf(part, sizeof(part), "%sp%llx", name.empty() ? "" : "/", static_cast<unsigned long long>(shader.address));
+                name += part;
+            }
+            for (const auto object : {pipeline, secondChannel, backFaces}) context.DebugName(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(object), name.c_str());
         }
         for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         _modules.clear();
