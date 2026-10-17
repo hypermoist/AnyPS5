@@ -450,6 +450,9 @@ public:
     // range index to pass to End, or NoTiming when timing is off or the batch's queries are used up.
     static constexpr std::uint32_t NoTiming = 0xffffffffu;
     static bool GpuTimingEnabled();
+    // APS5_DEBUG_LABELS=1 (implies GPU timing): each timed range is also a VK_EXT_debug_utils label
+    // named "p<program address>" or by its command class, for external GPU profilers.
+    static bool DebugLabelsEnabled();
     static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.

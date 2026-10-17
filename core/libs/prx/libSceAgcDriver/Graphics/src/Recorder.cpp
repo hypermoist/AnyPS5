@@ -1816,7 +1816,12 @@ void reportBarriers() {
 }
 
 bool Recorder::GpuTimingEnabled() {
-    static const bool enabled = std::getenv("APS5_PROFILE_GPU") != nullptr;
+    static const bool enabled = std::getenv("APS5_PROFILE_GPU") != nullptr || DebugLabelsEnabled();
+    return enabled;
+}
+
+bool Recorder::DebugLabelsEnabled() {
+    static const bool enabled = std::getenv("APS5_DEBUG_LABELS") != nullptr;
     return enabled;
 }
 
@@ -1908,7 +1913,16 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     if (!GpuTimingEnabled()) return NoTiming;
     Commands();
-    return beginTiming(key);
+    const auto index = beginTiming(key);
+    if (index != NoTiming && DebugLabelsEnabled()) {
+        char name[48];
+        if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) std::snprintf(name, sizeof(name), "%s", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]);
+        else std::snprintf(name, sizeof(name), "p%llx", static_cast<unsigned long long>(key));
+        VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+        label.pLabelName = name;
+        context.Function<PFN_vkCmdBeginDebugUtilsLabelEXT>("vkCmdBeginDebugUtilsLabelEXT")(open->commands, &label);
+    }
+    return index;
 }
 
 std::uint32_t Recorder::beginTiming(std::uint64_t key) {
@@ -1947,6 +1961,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
+    if (DebugLabelsEnabled()) context.Function<PFN_vkCmdEndDebugUtilsLabelEXT>("vkCmdEndDebugUtilsLabelEXT")(open->commands);
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
 }
 
