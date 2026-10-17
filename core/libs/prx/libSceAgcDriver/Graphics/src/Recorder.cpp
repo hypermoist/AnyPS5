@@ -1914,13 +1914,14 @@ std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     if (!GpuTimingEnabled()) return NoTiming;
     Commands();
     const auto index = beginTiming(key);
-    if (index != NoTiming && DebugLabelsEnabled()) {
+    const auto beginLabel = context.OptionalFunction<PFN_vkCmdBeginDebugUtilsLabelEXT>("vkCmdBeginDebugUtilsLabelEXT");
+    if (index != NoTiming && DebugLabelsEnabled() && beginLabel != nullptr && context.OptionalFunction<PFN_vkCmdEndDebugUtilsLabelEXT>("vkCmdEndDebugUtilsLabelEXT") != nullptr) {
         char name[48];
         if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) std::snprintf(name, sizeof(name), "%s", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]);
         else std::snprintf(name, sizeof(name), "p%llx", static_cast<unsigned long long>(key));
         VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
         label.pLabelName = name;
-        context.Function<PFN_vkCmdBeginDebugUtilsLabelEXT>("vkCmdBeginDebugUtilsLabelEXT")(open->commands, &label);
+        beginLabel(open->commands, &label);
     }
     return index;
 }
@@ -1961,7 +1962,9 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
-    if (DebugLabelsEnabled()) context.Function<PFN_vkCmdEndDebugUtilsLabelEXT>("vkCmdEndDebugUtilsLabelEXT")(open->commands);
+    // Paired with BeginGpuTiming's label: both entry points resolve, or neither label is recorded.
+    const auto endLabel = context.OptionalFunction<PFN_vkCmdEndDebugUtilsLabelEXT>("vkCmdEndDebugUtilsLabelEXT");
+    if (DebugLabelsEnabled() && endLabel != nullptr && context.OptionalFunction<PFN_vkCmdBeginDebugUtilsLabelEXT>("vkCmdBeginDebugUtilsLabelEXT") != nullptr) endLabel(open->commands);
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
 }
 

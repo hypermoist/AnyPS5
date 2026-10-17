@@ -281,7 +281,7 @@ struct Context {
     void DebugName(VkObjectType type, std::uint64_t handle, const char* name) const {
         static const bool enabled = std::getenv("APS5_DEBUG_LABELS") != nullptr;
         if (!enabled || handle == 0 || deviceProc == nullptr) return;
-        const auto setName = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(CachedDeviceProc(device, deviceProc, "vkSetDebugUtilsObjectNameEXT"));
+        const auto setName = OptionalFunction<PFN_vkSetDebugUtilsObjectNameEXT>("vkSetDebugUtilsObjectNameEXT");
         if (setName == nullptr) return;
         VkDebugUtilsObjectNameInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT};
         info.objectType = type;
@@ -293,6 +293,12 @@ struct Context {
         char name[32];
         if (address != 0) std::snprintf(name, sizeof(name), "p%llx", static_cast<unsigned long long>(address));
         DebugName(type, handle, address != 0 ? name : fallback);
+    }
+
+    // A device function that may be absent (an extension's), or null.
+    template<typename TFunction>
+    TFunction OptionalFunction(const char* name) const {
+        return deviceProc != nullptr ? reinterpret_cast<TFunction>(CachedDeviceProc(device, deviceProc, name)) : nullptr;
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.
