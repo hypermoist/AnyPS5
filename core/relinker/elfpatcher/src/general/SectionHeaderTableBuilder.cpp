@@ -2,6 +2,9 @@
 #include <elfpatcher/general/ElfConstants.hpp>
 #include <io/BufferUtils.hpp>
 #include <stdexcept>
+#include <algorithm>
+#include <cstddef>
+#include <iterator>
 #include <limits>
 
 namespace Elfpatcher {
@@ -71,13 +74,43 @@ void SectionHeaderTableBuilder::WriteTable(
     const auto dynamicAddress = mappedAddress(request.DynamicSegmentOffset, request.DynamicSegmentSize);
     const auto stubAddress = mappedAddress(request.StubOffset, request.StubSize);
 
-    const auto shStrTabOff = static_cast<std::uint64_t>(buf.size());
     constexpr std::uint64_t shStrTabSize = sizeof(kShStrTabBlob);
-    for (const char i : kShStrTabBlob)
-        buf.push_back(static_cast<std::uint8_t>(i));
+    constexpr std::uint64_t tableBytes = kShdrEntrySize * kSectionHeaderCount;
+    // Tools that walk a loaded image (Frida in Nsight's injector) read the section headers at the
+    // in-memory ELF header plus e_shoff. The ELF header is mapped by its own load segment, so the
+    // table goes in the zero gap right after the program headers when it fits, and that segment
+    // grows to cover it; otherwise e_shoff points past the header page into unmapped memory.
+    std::uint64_t headerLoad = 0;
+    std::uint64_t gapStart = kElfHeaderSize;
+    std::uint64_t gapEnd = buf.size();
+    for (std::uint16_t index = 0; index < phCount; ++index) {
+        const auto header = phOffset + index * phStride;
+        if (Io::ReadU32(buf, header) != PT_LOAD) continue;
+        const auto offset = Io::ReadU64(buf, header + kPhdrOffsetOffset);
+        if (offset == 0) headerLoad = header;
+        else gapEnd = std::min(gapEnd, offset);
+    }
+    if (phOffset < gapEnd) gapStart = std::max(gapStart, phOffset + std::uint64_t{phCount} * phStride);
+    const auto shStrTabInGap = (gapStart + 7) & ~std::uint64_t{7};
+    const auto shOffInGap = (shStrTabInGap + shStrTabSize + 7) & ~std::uint64_t{7};
+    const bool inHeaderPage = headerLoad != 0 && shOffInGap + tableBytes <= gapEnd &&
+        std::all_of(buf.begin() + static_cast<std::ptrdiff_t>(gapStart), buf.begin() + static_cast<std::ptrdiff_t>(shOffInGap + tableBytes), [](std::uint8_t byte) { return byte == 0; });
 
-    const auto shOff = static_cast<std::uint64_t>(buf.size());
-    buf.resize(buf.size() + kShdrEntrySize * kSectionHeaderCount, 0);
+    std::uint64_t shStrTabOff = buf.size();
+    std::uint64_t shOff = 0;
+    if (inHeaderPage) {
+        shStrTabOff = shStrTabInGap;
+        shOff = shOffInGap;
+        std::copy(std::begin(kShStrTabBlob), std::end(kShStrTabBlob), buf.begin() + static_cast<std::ptrdiff_t>(shStrTabOff));
+        const auto covered = shOff + tableBytes;
+        if (Io::ReadU64(buf, headerLoad + kPhdrFileSizeOffset) < covered) _byteWriter->WriteU64(buf, headerLoad + kPhdrFileSizeOffset, covered);
+        if (Io::ReadU64(buf, headerLoad + kPhdrMemSizeOffset) < covered) _byteWriter->WriteU64(buf, headerLoad + kPhdrMemSizeOffset, covered);
+    } else {
+        for (const char i : kShStrTabBlob)
+            buf.push_back(static_cast<std::uint8_t>(i));
+        shOff = static_cast<std::uint64_t>(buf.size());
+        buf.resize(buf.size() + tableBytes, 0);
+    }
 
     _writeSectionHeader(buf, shOff + kShdrEntrySize * 0, 0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0);
     _writeSectionHeader(buf, shOff + kShdrEntrySize * 1, kShStrTabNameOffset, SHT_STRTAB, 0, 0, shStrTabOff, shStrTabSize, 0, 0, kNoSpecialAlignment, 0);
