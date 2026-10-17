@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DebugSpirv.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -337,6 +338,13 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
             module.pCode = shader.spirv.data();
+            char debugName[32];
+            std::snprintf(debugName, sizeof(debugName), "p%llx", static_cast<unsigned long long>(shaders[i].address));
+            const auto named = shaders[i].address != 0 ? DebugNamedSpirv(shader.spirv, debugName) : std::vector<std::uint32_t>{};
+            if (!named.empty()) {
+                module.codeSize = named.size() * sizeof(std::uint32_t);
+                module.pCode = named.data();
+            }
             Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &module, nullptr, &_modules[i]), "vkCreateShaderModule graphics");
             context.DebugNameProgram(VK_OBJECT_TYPE_SHADER_MODULE, reinterpret_cast<std::uint64_t>(_modules[i]), shaders[i].address, "aps5 graphics stage");
             const auto stage = VulkanStage(shaders[i].stage);

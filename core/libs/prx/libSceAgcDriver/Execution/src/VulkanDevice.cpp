@@ -7,6 +7,7 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DebugSpirv.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -4620,6 +4621,13 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
     moduleInfo.pCode = shader.spirv.data();
+    char debugName[32];
+    std::snprintf(debugName, sizeof(debugName), "p%llx", static_cast<unsigned long long>(programAddress));
+    const auto named = programAddress != 0 ? Graphics::DebugNamedSpirv(shader.spirv, debugName) : std::vector<std::uint32_t>{};
+    if (!named.empty()) {
+        moduleInfo.codeSize = named.size() * sizeof(std::uint32_t);
+        moduleInfo.pCode = named.data();
+    }
     check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
     context.DebugNameProgram(VK_OBJECT_TYPE_SHADER_MODULE, reinterpret_cast<std::uint64_t>(objects->module), programAddress, "aps5 compute");
     objects->resourcesLayout = setLayout;
