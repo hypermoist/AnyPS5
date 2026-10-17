@@ -314,6 +314,30 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
     return true;
 }
 
+// An occlusion counter dump counts the samples of the draws recorded before it, so it is queued
+// behind them on the draw pipeline instead of draining it: queue 0 keeps preparing the following
+// draws. Readers of the dump range drain through the pipeline's write ranges, as for queued labels.
+// Debug aid: APS5_PIPELINE_DRAIN_SAMPLE_DUMPS=1 drains the pipeline before each dump, as before.
+bool Driver::enqueueSampleDumpPacket(std::span<const std::uint32_t> packet, std::uint32_t queue) {
+    static const bool ordered = std::getenv("APS5_PIPELINE_DRAIN_SAMPLE_DUMPS") == nullptr;
+    if (!ordered || queue != 0 || !Pm4::SampleDump(packet) || packet.size() < 4 || !DrawPipeline::Active() || !deferredLabels().labels.empty()) return false;
+    const auto address = Pm4::SampleDumpAddress(packet);
+    DrawPipeline::Queue0().Enqueue([this, queue, address] {
+        GuestMemory::SetCurrentPacket(0x46, queue);
+        bool wroteOnGpu = false;
+        {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (const auto localDevice = device.Load()) {
+                recordDeferredLabels(localDevice.get(), queue);
+                wroteOnGpu = localDevice->DumpSamplesOnGpu(address);
+            }
+        }
+        if (!wroteOnGpu) dumpSampleCounters(address);
+    }, {{address, address + Pm4::SampleDumpBytes}});
+    return true;
+}
+
 void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes) {
     constexpr std::size_t gpuStoreLimit = 65536;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
