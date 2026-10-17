@@ -322,8 +322,10 @@ void Driver::execute(const Submission& submission) {
             currentPacketOffset() = cursor;
             if (gateOpened()) {
                 gateOpened() = false;
-                if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
-                timed(&WorkerProfile::dispatchMs, [&] { skipFailed("dispatch group", [&] { resolveGroupAhead(submission, queue, cursor); }); });
+                if (!pipelineDispatch() || submission.queue != 0) {
+                    if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+                    timed(&WorkerProfile::dispatchMs, [&] { skipFailed("dispatch group", [&] { resolveGroupAhead(submission, queue, cursor); }); });
+                }
             }
             if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { skipFailed("dispatch", [&] { dispatch(queue, packet, submission); }); });
             else timed(&WorkerProfile::dispatchMs, [&] { skipFailed("dispatch", [&] { dispatchIndirect(queue, packet, submission); }); });
