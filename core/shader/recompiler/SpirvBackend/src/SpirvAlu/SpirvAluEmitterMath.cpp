@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "IntermediateRepresentation/IrBlock.hpp"
 #include "IntermediateRepresentation/IrValue.hpp"
+#include <cstdlib>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -546,7 +547,9 @@ bool CrossesRowsOf(const IrValue* value, const IrValue* scan, bool narrow) {
     return flags.x16 && !flags.fetchInactive && Resolved(permlane->Argument(0)) == scan && IsU32(permlane->Argument(1), 0xffffffffu) && IsU32(permlane->Argument(2), 0xffffffffu) && EveryLaneBit(permlane->Argument(3), narrow);
 }
 
-std::optional<HalfWaveScan> MatchHalfWaveScan(const IrValue* value, IrShaderStage stage, bool narrow) {
+// `everyLane`: all 64 lanes of the wave exist and the caller reduces the scan's own input over them,
+// so the input needs no proof that lanes outside the entry mask hold the identity.
+std::optional<HalfWaveScan> MatchHalfWaveScan(const IrValue* value, IrShaderStage stage, bool narrow, bool everyLane = false) {
     const auto* combined = Unmasked(Resolved(value), narrow);
     std::optional<std::array<const IrValue*, 2>> operands;
     const auto reduction = std::find_if(WaveReductions.begin(), WaveReductions.end(), [&](const WaveReduction& candidate) { return (operands = ReductionOperands(combined, candidate)).has_value(); });
@@ -557,10 +560,30 @@ std::optional<HalfWaveScan> MatchHalfWaveScan(const IrValue* value, IrShaderStag
         if (scan == nullptr) return std::nullopt;
     }
     const auto* source = Unmasked(scan, narrow);
+    if (everyLane) return HalfWaveScan{&*reduction, source};
     const bool entryKeys = Is(source, IrOpcode::SelectU32) && IsU32(source->Argument(2), reduction->identity) && EntryLaneWalk{stage}.ZeroBit(source->Argument(0));
     const bool upperKeys = narrow && reduction->identity == 0u && !reduction->floating && UpperLaneWalk{stage}.ZeroValue(source);
     if (!entryKeys && !upperKeys) return std::nullopt;
     return HalfWaveScan{&*reduction, source};
+}
+
+// A wave64 program at two lanes per invocation (laneCount 2) holds lane k in half 0 and lane k + 32
+// in half 1 of invocation k, so the half-wave scan's lane 31 is the 32-lane subgroup reduction of the
+// half-0 keys and its lane 63 that of the half-1 keys.
+std::optional<std::uint32_t> EmitTwoLaneWaveReduction(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t lane) {
+    auto& state = ctx.state;
+    if (state.laneCount != 2u || state.program.WaveSize() != 64u || state.hostSubgroupSize != 32u || (lane & 31u) != 31u || ctx.otherHalf == nullptr) return std::nullopt;
+    const auto& capabilities = state.supportedCapabilities;
+    if (std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformArithmetic)) == capabilities.end()) return std::nullopt;
+    auto scan = MatchHalfWaveScan(inst.Argument(0), state.program.Resources().stage, false);
+    if (!scan && state.fullWaves) scan = MatchHalfWaveScan(inst.Argument(0), state.program.Resources().stage, true, true);
+    if (!scan || scan->reduction->floating) return std::nullopt;
+    auto& owner = (lane >= 32u) == (state.laneHalf == 1u) ? ctx : *ctx.otherHalf;
+    const auto keys = owner.Def(scan->source);
+    state.module.EmitCapability(spv::CapabilityGroupNonUniformArithmetic);
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(scan->reduction->reduce, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup), static_cast<std::uint32_t>(spv::GroupOperationReduce), keys);
+    return result;
 }
 
 std::optional<std::uint32_t> EmitHalfWaveReduction(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t lane) {
@@ -1036,6 +1059,10 @@ std::uint32_t EmitReadLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
             if (index >= 32u && UpperLaneWalk{state.program.Resources().stage}.ZeroValue(inst.Argument(0))) return ConstantU32(state, 0u);
             FailOutsideHostSubgroup(ctx, inst, "v_readlane_b32 of lane " + std::to_string(index));
         }
+    }
+    static const bool twoLaneReductions = std::getenv("APS5_NO_TWO_LANE_REDUCTIONS") == nullptr;
+    if (twoLaneReductions && selector != nullptr && selector->HasImmediate() && state.laneCount == 2u) {
+        if (const auto reduced = EmitTwoLaneWaveReduction(ctx, inst, selector->ImmediateU32() & 63u)) return *reduced;
     }
     const auto lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, state.program.WaveSize() - 1u));
     return ctx.Shuffle(inst, 0, lane);

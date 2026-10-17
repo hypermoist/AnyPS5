@@ -101,6 +101,8 @@ struct SpirvEmitterState {
     std::uint32_t hostSubgroupSize = 0;
     bool splitSubgroup = false;
     bool spannedWave = false;
+    // Every workgroup is whole waves, so every lane of a wave exists (an all-true exec is every lane).
+    bool fullWaves = false;
     std::uint32_t spannedExchangeVariable = 0;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
