@@ -346,8 +346,6 @@ int APS5_VABI sceNetCtlGetInfo(int code, NetCtlInfo* info) {
         case NET_CTL_INFO_MTU: WriteInfoWord(info, host.mtu); break;
         case NET_CTL_INFO_LINK: WriteInfoWord(info, NET_CTL_LINK_CONNECTED); break;
         case NET_CTL_INFO_IP_CONFIG: WriteInfoWord(info, NET_CTL_IP_DHCP); break;
-        case NET_CTL_INFO_DHCP_HOSTNAME:
-        case NET_CTL_INFO_PPPOE_AUTH_NAME: std::memset(info->opaque, 0, sizeof(info->opaque)); break;
         case NET_CTL_INFO_IP_ADDRESS: WriteInfoAddress(info, host.address); break;
         case NET_CTL_INFO_NETMASK: WriteInfoAddress(info, host.netmask); break;
         case NET_CTL_INFO_DEFAULT_ROUTE: WriteInfoAddress(info, host.gateway); break;
