@@ -4400,15 +4400,6 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         prepared->key = DispatchContentKey(compute, context.device);
         phase(PreparedDispatch::PrepareKey);
         cached = state->resourceCache.Find(prepared->key);
-        if (cached != nullptr && DispatchMove()) {
-            Graphics::ShaderResources::MoveProof proof;
-            if (!cached->MovedDispatchBuffers(compute, nullptr, DispatchMoveBytes(), proof).has_value()) {
-                DispatchMoves().filtered[static_cast<std::size_t>(proof.refusal)].fetch_add(1, std::memory_order_relaxed);
-                prepared->key = DispatchContentKey(compute, context.device, false);
-                prepared->exact = true;
-                cached = state->resourceCache.Find(prepared->key);
-            }
-        }
         prepared->cached = cached;
         phase(PreparedDispatch::PrepareFind);
     }
@@ -4606,10 +4597,6 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
     if (record.resources != nullptr) recorder.KeepBytes(record.resources.get(), record.resources->CopiedBytes());
-    if (record.bindings != nullptr) {
-        recorder.Keep(record.bindings);
-        for (const auto& snapshot : record.bindings->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
-    }
     recordStep(PhaseRecordKeeps);
     if (record.dataRefresh != RecordedDispatch::DataRefresh::None) {
         // The template's data buffers take this dispatch's words: a transfer write the pre-dispatch
@@ -4885,7 +4872,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> movedBindings;
     std::vector<Graphics::ShaderResources::MovedBuffer> movedWrites;
     double revalidateMs = 0;
-    std::shared_ptr<Graphics::ShaderResources::DrawBindings> overlay;
     // The batches the pre-sync (PrepareDispatch) waited for are reaped first: their completions
     // (CPU write-backs) land before stage B or a cached object's Revalidate reads, and the flush
     // hook then finds nothing pending over their surfaces.
@@ -4966,7 +4952,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // object it found: revalidated as a map hit would be (an entry replaced meanwhile is left
         // alone by the pointer-conditional Remove). APS5_NO_PREPARED_FIND=1 looks the key up again.
         static const bool preparedFind = std::getenv("APS5_NO_PREPARED_FIND") == nullptr;
-        const bool exactEntry = prepared != nullptr && prepared->exact;
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
         if (cached == nullptr) countRescacheMiss("no entry");
@@ -5031,7 +5016,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         if (profile) timer.add(PhaseResourcesFullBuild, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
         if (cacheable) {
             ++d.cacheMisses;
-            if (refusedMove) noteRefusalBuild(resources->Reusable());
             if (resources->Reusable()) insert();
         }
     }
@@ -5078,7 +5062,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     record.movedSet = movedBindings != nullptr ? movedBindings->allocation.set : VK_NULL_HANDLE;
     record.moved = movedWrites;
     record.resourceKeyMatched = fromCache;
-    record.bindings = overlay;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
