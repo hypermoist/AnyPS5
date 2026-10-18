@@ -168,6 +168,10 @@ void ForgetLockedRange(uintptr_t start, uintptr_t end) {
 
 }
 
+void ReleaseFlexibleMappingRange(std::uintptr_t address, size_t len) {
+    _releaseFlexible(address, len);
+}
+
 extern "C" {
 
 int APS5_VABI sceKernelAllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, size_t alignment, int memory_type, int64_t* phys_addr_out) {
@@ -258,6 +262,7 @@ int32_t APS5_VABI sceKernelMapNamedFlexibleMemoryInternal(void** addr_in_out, si
 
 int APS5_VABI sceKernelMprotect(const void* addr, size_t len, int prot) {
  constexpr int DefinedProtection = 0x3F7;
+ if (len == 0) return 0;
  return DoMprotect(addr, len, prot & DefinedProtection);
 }
 
@@ -382,6 +387,7 @@ int APS5_VABI sceKernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 }
 
 int APS5_VABI sceKernelMtypeprotect(const void* addr, size_t len, int type, int prot) {
+ if (len == 0) return 0;
  return DoMtypeprotect(addr, len, type, prot);
 }
 

@@ -261,6 +261,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
     state.float16DenormPreserve = target.float16DenormPreserve;
     state.relaxedFloat = target.relaxedFloat;
+    state.robustBufferAccess2 = target.robustBufferAccess2;
     state.hostSubgroupSize = target.subgroupSize;
     if (HostSubgroupSingleLane(state)) {
         state.requirements.subgroupBallot = false;

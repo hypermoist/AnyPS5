@@ -28,6 +28,8 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "ResidentPresent.hpp"
+#include "ImageTableAbi.hpp"
+#include "HostImportLifetime.hpp"
 #include "SampleLod_spv.h"
 #include "BufferUpdate_spv.h"
 #include "SampleArray_spv.h"
@@ -311,6 +313,28 @@ public:
                 extensionsEnabled.insert(extensionsEnabled.end(), libraryExtensions.begin(), libraryExtensions.end());
                 address.pNext = &library;
             }
+            VkPhysicalDeviceDescriptorIndexingFeaturesEXT indexing{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+            if (hasExtension(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &indexing};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                context.descriptorIndexing = indexing.shaderSampledImageArrayNonUniformIndexing == VK_TRUE && indexing.shaderStorageImageArrayNonUniformIndexing == VK_TRUE;
+                context.partiallyBound = indexing.descriptorBindingPartiallyBound == VK_TRUE;
+                context.variableDescriptorCount = indexing.descriptorBindingVariableDescriptorCount == VK_TRUE;
+                context.runtimeDescriptorArray = indexing.runtimeDescriptorArray == VK_TRUE;
+            }
+            indexing = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT};
+            if (context.descriptorIndexing && context.partiallyBound && context.variableDescriptorCount && context.runtimeDescriptorArray) {
+                extensionsEnabled.push_back(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+                indexing.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+                indexing.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
+                indexing.descriptorBindingPartiallyBound = VK_TRUE;
+                indexing.descriptorBindingVariableDescriptorCount = VK_TRUE;
+                indexing.runtimeDescriptorArray = VK_TRUE;
+                indexing.pNext = address.pNext;
+                address.pNext = &indexing;
+            } else {
+                context.descriptorIndexing = context.partiallyBound = context.variableDescriptorCount = context.runtimeDescriptorArray = false;
+            }
             VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
             if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness};
@@ -339,6 +363,7 @@ public:
             std::cout << "Vulkan device: " << properties.deviceName << '\n';
             context.limits = properties.limits;
             context.bufferDeviceAddress = true;
+            context.imageTableCapacity = ImageTableCapacity(context);
             context.formatProperties = function<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
             context.imageFormatProperties = function<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties");
             context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 0, &context.queue);
@@ -2086,10 +2111,12 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         auto first = resources.PrepareDrawBindings(snapshotRecorder);
         Require(first != nullptr && first->snapshots.size() == 1, "read-only draw input was not snapshotted");
         std::memset(reinterpret_cast<void*>(element), 0x22, elementBytes);
+        AgcDriver::GuestMemory::MarkWritten(element, elementBytes);
         auto second = resources.PrepareDrawBindings(snapshotRecorder);
         Require(second != nullptr && second->snapshots.size() == 1, "cached draw input was not snapshotted again");
         Require(first->allocation.set != second->allocation.set, "in-flight draws share mutable descriptor bindings");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
+        AgcDriver::GuestMemory::MarkWritten(element, elementBytes);
         auto downloaded = std::make_shared<Buffer>(snapshotContext, elementBytes * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const auto commands = snapshotRecorder.Commands();
         RecordMemoryBarrier(snapshotContext, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -2447,6 +2474,7 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
         };
         check();
         guest[offset + 8] ^= 0xffu;
+        AgcDriver::GuestMemory::MarkWritten(view, elementBytes);
         check();
         regionRecorder.Sync();
     }
@@ -2540,6 +2568,7 @@ public:
     struct Contents {
         std::map<std::pair<std::uint32_t, std::uint32_t>, VkDescriptorBufferInfo> buffers;
         std::map<std::pair<std::uint32_t, std::uint32_t>, VkDescriptorImageInfo> images;
+        std::map<std::pair<VkDescriptorSet, std::uint32_t>, std::uint32_t> written;
     };
     explicit DescriptorUpdates(Context& context) : context(context), previous(context.functions),
         update(context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")) {
@@ -2558,6 +2587,7 @@ private:
         Contents contents;
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto& write = writes[i];
+            contents.written[{write.dstSet, write.dstBinding}] += write.descriptorCount;
             for (std::uint32_t element = 0; element < write.descriptorCount; ++element) {
                 const auto key = std::pair{write.dstBinding, write.dstArrayElement + element};
                 if (write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) contents.buffers[key] = write.pBufferInfo[element];
@@ -2625,6 +2655,85 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         }
         snapshots.Sync();
     }
+    recorder.Activate();
+}
+
+void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    using ShaderRecompiler::DescriptorKind;
+    using ShaderRecompiler::DescriptorRole;
+    const auto& base = device.GetContext();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    if (context.imageTableCapacity < 2u) {
+        std::cout << "image tables unavailable: draw snapshot table sets not tested\n";
+        return;
+    }
+    constexpr std::uint32_t width = 4;
+    constexpr std::uint32_t height = 4;
+    alignas(256) static std::array<float, width * height> texels{};
+    texels.fill(1.0f);
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels.data()));
+    const std::array<std::uint32_t, 8> texture{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (22u << 20u) | (((width - 1u) & 3u) << 30u), ((width - 1u) >> 2u) | ((height - 1u) << 14u), 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
+    constexpr auto bindingCount = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
+    const auto addTable = [&](ShaderRecompiler::RecompileResult& program, ShaderRecompiler::RuntimeAbi::Stage stage, std::uint32_t set, std::uint32_t elements) {
+        ShaderRecompiler::DescriptorBinding map{};
+        map.kind = DescriptorKind::StorageBuffer;
+        map.role = DescriptorRole::ImageTableMap;
+        map.descriptorSet = set;
+        map.binding = static_cast<std::uint32_t>(stage) * bindingCount + static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap);
+        map.count = 1;
+        map.guestDescriptor.assign(Abi::HeaderWords + elements, 0u);
+        map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+        map.guestDescriptor[Abi::HeaderElementCount] = elements;
+        map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+        map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + elements;
+        program.bindings.push_back(map);
+        ShaderRecompiler::DescriptorBinding images{};
+        images.kind = DescriptorKind::SampledImage;
+        images.role = DescriptorRole::ImageTable;
+        images.descriptorSet = set;
+        images.binding = ShaderRecompiler::RuntimeAbi::ImageTableBinding;
+        images.count = elements;
+        for (std::uint32_t element = 0; element < elements; ++element) images.guestDescriptor.insert(images.guestDescriptor.end(), texture.begin(), texture.end());
+        images.imageShapes.assign(elements, ShaderRecompiler::DescriptorImageShape::Image2D);
+        images.imageDepthCompare.assign(elements, false);
+        images.imageSamplers.assign(elements, 0u);
+        program.bindings.push_back(std::move(images));
+    };
+    DescriptorUpdates updates(context);
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        Recorder snapshots(context);
+        snapshots.Activate();
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = DescriptorKind::StorageBuffer;
+        data.role = DescriptorRole::FlattenedSrt;
+        data.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::FlattenedSrt);
+        data.count = 1;
+        data.guestDescriptor = {1, 2, 3, 4};
+        vertex.bindings.push_back(data);
+        addTable(vertex, ShaderRecompiler::RuntimeAbi::Stage::Main, 0u, 1u);
+        addTable(fragment, ShaderRecompiler::RuntimeAbi::Stage::Fragment, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 2u);
+        const ColorTarget target{};
+        ShaderResources resources(context, vertex, fragment, target, 0, 0);
+        Require(resources.SplitSets(), "a fragment image table did not get its own descriptor set");
+        const ShaderResources::MovedBuffer moved{0, 0, 16, {5, 6, 7, 8}};
+        const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+        Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
+        const auto& written = updates.calls.back().written;
+        const auto tableWrites = [&](VkDescriptorSet set) {
+            const auto it = written.find({set, ShaderRecompiler::RuntimeAbi::ImageTableBinding});
+            return it == written.end() ? 0u : it->second;
+        };
+        Require(tableWrites(draw->allocation.set) == 1u, "the draw snapshot wrote the wrong number of image table descriptors into the vertex set");
+        Require(tableWrites(draw->fragmentAllocation.set) == 2u, "the draw snapshot wrote the wrong number of image table descriptors into the fragment set");
+        snapshots.Sync();
+    }
+    ClearCachedTextures(context.device);
     recorder.Activate();
 }
 
@@ -3911,6 +4020,11 @@ void importWatchTests(const Device& device) {
     std::cout << "import watch decisions: Windows host imports through views use comparisons\n";
     if (context.hostImportAlignment == 0 || !WriteWatched()) {
         std::cout << "host imports or write watching unavailable: the Windows import probe not tested\n";
+        return;
+    }
+    if (context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr) {
+        Require(PrepareImportWatch(context) == ImportWatch::Unwatch, "(w) a device without a settle queue kept host imports watched");
+        std::cout << "no settle queue: the Windows import probe skipped\n";
         return;
     }
     const auto probe = ProbeImportWriteProtection(context);
@@ -5437,35 +5551,37 @@ class CoverPass {
 public:
     explicit CoverPass(const Context& context) : context(context), target(context, ColorTarget{0, {8, 8}, VK_FORMAT_R8G8B8A8_UNORM, 8 * 8 * 4, 0}, false) {
         try {
-            VkAttachmentDescription attachment{};
-            attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
-            attachment.samples = VK_SAMPLE_COUNT_1_BIT;
-            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            attachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
-            const VkAttachmentReference color{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-            VkSubpassDescription subpass{};
-            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-            subpass.colorAttachmentCount = 1;
-            subpass.pColorAttachments = &color;
-            VkRenderPassCreateInfo passInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-            passInfo.attachmentCount = 1;
-            passInfo.pAttachments = &attachment;
-            passInfo.subpassCount = 1;
-            passInfo.pSubpasses = &subpass;
-            Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &passInfo, nullptr, &renderPass), "vkCreateRenderPass cover");
-            const auto view = target.View();
-            VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-            framebufferInfo.renderPass = renderPass;
-            framebufferInfo.attachmentCount = 1;
-            framebufferInfo.pAttachments = &view;
-            framebufferInfo.width = 8;
-            framebufferInfo.height = 8;
-            framebufferInfo.layers = 1;
-            Check(context.Function<PFN_vkCreateFramebuffer>("vkCreateFramebuffer")(context.device, &framebufferInfo, nullptr, &framebuffer), "vkCreateFramebuffer cover");
+            if (!context.graphicsPipelineLibrary) {
+                VkAttachmentDescription attachment{};
+                attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
+                attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+                attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                attachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+                const VkAttachmentReference color{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+                VkSubpassDescription subpass{};
+                subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+                subpass.colorAttachmentCount = 1;
+                subpass.pColorAttachments = &color;
+                VkRenderPassCreateInfo passInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+                passInfo.attachmentCount = 1;
+                passInfo.pAttachments = &attachment;
+                passInfo.subpassCount = 1;
+                passInfo.pSubpasses = &subpass;
+                Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &passInfo, nullptr, &renderPass), "vkCreateRenderPass cover");
+                const auto view = target.View();
+                VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+                framebufferInfo.renderPass = renderPass;
+                framebufferInfo.attachmentCount = 1;
+                framebufferInfo.pAttachments = &view;
+                framebufferInfo.width = 8;
+                framebufferInfo.height = 8;
+                framebufferInfo.layers = 1;
+                Check(context.Function<PFN_vkCreateFramebuffer>("vkCreateFramebuffer")(context.device, &framebufferInfo, nullptr, &framebuffer), "vkCreateFramebuffer cover");
+            }
             VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
             Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout cover");
             const auto module = [&](const std::uint32_t* code, std::size_t bytes) {
@@ -5512,7 +5628,12 @@ public:
             pipelineInfo.pMultisampleState = &multisample;
             pipelineInfo.pColorBlendState = &blendState;
             pipelineInfo.layout = layout;
-            pipelineInfo.renderPass = renderPass;
+            const VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+            VkPipelineRenderingCreateInfoKHR renderingFormats{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+            renderingFormats.colorAttachmentCount = 1;
+            renderingFormats.pColorAttachmentFormats = &colorFormat;
+            if (context.graphicsPipelineLibrary) pipelineInfo.pNext = &renderingFormats;
+            else pipelineInfo.renderPass = renderPass;
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines cover");
         } catch (...) {
             release();
@@ -5529,11 +5650,35 @@ public:
         const auto commands = start.commands;
         if (!continued) {
             recorder.PrepareSampleSlot();
-            VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-            begin.renderPass = renderPass;
-            begin.framebuffer = framebuffer;
-            begin.renderArea = {{0, 0}, {8, 8}};
-            context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
+            if (context.graphicsPipelineLibrary) {
+                if (!transitioned) {
+                    transitioned = true;
+                    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    barrier.image = target.Image();
+                    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+                }
+                VkRenderingAttachmentInfoKHR attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+                attachment.imageView = target.View();
+                attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+                rendering.renderArea = {{0, 0}, {8, 8}};
+                rendering.layerCount = 1;
+                rendering.colorAttachmentCount = 1;
+                rendering.pColorAttachments = &attachment;
+                context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
+            } else {
+                VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+                begin.renderPass = renderPass;
+                begin.framebuffer = framebuffer;
+                begin.renderArea = {{0, 0}, {8, 8}};
+                context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
+            }
         }
         context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         recorder.NoteSampledDraw(commands);
@@ -5562,6 +5707,7 @@ private:
     }
     const Context& context;
     RenderTarget target;
+    mutable bool transitioned = false;
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -6550,7 +6696,7 @@ void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
 #ifdef _WIN32
     void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
-    void* block = std::aligned_alloc(65536, bytes);
+    void* block = std::aligned_alloc(65536, (bytes + 65535u) & ~std::size_t{65535u});
 #endif
     Require(block != nullptr, "cannot allocate the FMASK decompress block");
     std::memset(block, 0, bytes);
@@ -7014,6 +7160,70 @@ void singleCubeTests(const Device& device, Recorder& recorder) {
             expectRed(program.Red(storageView.View(), storageView.Layout(), 0, face), expected, "single cube storage view sampled the wrong face");
         }
     }
+}
+
+struct SampledViewProbe {
+    Context& context;
+    PFN_vkGetDeviceProcAddr resolver;
+    std::uint32_t views = 0;
+    bool checking = false;
+    static inline SampledViewProbe* active = nullptr;
+    explicit SampledViewProbe(Context& context) : context(context), resolver(context.deviceProc) {
+        Require(active == nullptr, "sampled view probe is already active");
+        active = this;
+        context.deviceProc = resolve;
+    }
+    ~SampledViewProbe() {
+        context.deviceProc = resolver;
+        active = nullptr;
+    }
+    static VKAPI_ATTR VkResult VKAPI_CALL createView(VkDevice device, const VkImageViewCreateInfo* info, const VkAllocationCallbacks* callbacks, VkImageView* created) {
+        if (active->checking && info->format == VK_FORMAT_R8G8B8A8_SRGB) {
+            const auto* next = static_cast<const VkBaseInStructure*>(info->pNext);
+            while (next != nullptr && next->sType != VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO) next = next->pNext;
+            if (next == nullptr || reinterpret_cast<const VkImageViewUsageCreateInfo*>(next)->usage != VK_IMAGE_USAGE_SAMPLED_BIT) return VK_ERROR_VALIDATION_FAILED_EXT;
+            ++active->views;
+        }
+        return reinterpret_cast<PFN_vkCreateImageView>(active->resolver(device, "vkCreateImageView"))(device, info, callbacks, created);
+    }
+    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL resolve(VkDevice device, const char* name) {
+        if (std::strcmp(name, "vkCreateImageView") == 0) return reinterpret_cast<PFN_vkVoidFunction>(createView);
+        return active->resolver(device, name);
+    }
+};
+
+void sampledStorageBaseLevelUsageTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.width = resource.height = 8;
+    resource.depthOrLastArray = 1;
+    resource.mipCount = 2;
+    resource.lastLevel = 1;
+    resource.minLod = context.imageViewMinLod ? 0x100 : 0;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2DArray;
+    resource.format = 130;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto geometry = DescribeSurface(resource);
+    std::vector<std::byte> memory(static_cast<std::size_t>(geometry.guestBytes) + 256, std::byte{0x80});
+    resource.baseAddress = (reinterpret_cast<std::uintptr_t>(memory.data()) + 255) & ~std::uintptr_t{255};
+    auto storage = StorageTexture::Create(context, detiler, resource, 0);
+    recorder.Keep(storage);
+    recorder.Sync();
+    SampleProgram program(context, recorder);
+    auto sampledContext = context;
+    SampledViewProbe probe(sampledContext);
+    Texture sampled(sampledContext, storage, resource, VkComponentMapping{});
+    probe.checking = true;
+    const auto base = sampled.BaseLevelView();
+    probe.checking = false;
+    expectRed(program.Red(base, sampled.Layout(), 0), 0.21586f, "sampled sRGB base level");
+    Require(sampled.BaseLevelView() == base && probe.views == 1, "the lazy base-level view of a sampled storage image must restrict usage to SAMPLED and be reused");
 }
 
 void firstLayerViewTests(const Device& device, Recorder& recorder) {
@@ -8150,6 +8360,8 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && std::string_view(argv[1]) == "--host-import-lifetime-only") return RunHostImportLifetimeTests(device.GetContext());
+        if (argc == 2 && std::string_view(argv[1]) == "--host-import-mutation-race-only") return RunHostImportMutationRaceTests(device.GetContext());
         if (argc == 2 && std::string_view(argv[1]) == "--import-watch-only") {
             importWatchTests(device);
             return 0;
@@ -8246,6 +8458,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--sampled-storage-base-level-usage-only") {
+            sampledStorageBaseLevelUsageTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unchanged-cpu-stamps-only") {
@@ -8370,6 +8586,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-descriptors-only") {
             drawDescriptorWriteTests(device, recorder);
+            drawSnapshotTableSetTests(device, recorder);
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
             return 0;
         }
@@ -8428,6 +8645,7 @@ int main(int argc, char** argv) {
         misalignedRegionTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
         drawDescriptorWriteTests(device, recorder);
+        drawSnapshotTableSetTests(device, recorder);
         drawSnapshotCapTests(device, recorder);
         drawSnapshotEvictionTests(device);
         unwrittenSnapshotTests(device);
@@ -8466,6 +8684,7 @@ int main(int argc, char** argv) {
         imageMemoTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
+        sampledStorageBaseLevelUsageTests(device, recorder);
         singleCubeTests(device, recorder);
         atomicViewTests(device, recorder);
         metadataPassTests(device, recorder);
