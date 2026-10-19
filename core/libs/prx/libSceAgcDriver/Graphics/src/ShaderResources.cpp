@@ -3473,6 +3473,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // A shadow-staged region's copy-in (RecordStagingCopies) stores its pending results into the
     // unit shadow itself: no flush into the import here.
     const auto flushedHere = [&](std::uint64_t begin) { return !guestMemory.ShadowStaged(begin); };
+    static const bool profileFlush = std::getenv("APS5_PROFILE_FLUSH") != nullptr;
     if (EpochRevalidate()) {
         if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
@@ -3486,7 +3487,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
             // published by the flush, as one over a pending image is stored.
             for (const auto& region : regions) {
-                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+                    if (profileFlush) StorageTexture::NoteFlushDetail(guestMemory.ShadowStagingRefusal(region.begin));
+                    StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+                    if (profileFlush) StorageTexture::NoteFlushDetail(nullptr);
+                }
             }
         }
         if (HostImportsUnchanged(context, importsProof)) {
@@ -3497,7 +3502,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     } else {
         for (const auto& region : directRegions) {
-            if (flushedHere(region.begin)) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+            if (!flushedHere(region.begin)) continue;
+            if (profileFlush) StorageTexture::NoteFlushDetail(guestMemory.ShadowStagingRefusal(region.begin));
+            StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+            if (profileFlush) StorageTexture::NoteFlushDetail(nullptr);
         }
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);

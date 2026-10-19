@@ -3782,11 +3782,13 @@ namespace {
 
 thread_local std::uint64_t flushProgram = 0;
 thread_local int flushWritable = -1;
+thread_local const char* flushDetail = nullptr;
 
 struct FlushProfileKey {
     const char* reason;
     std::uint64_t program;
     int writable;
+    const char* detail;
     std::uint64_t image;
     std::uint32_t format;
     std::uint32_t width;
@@ -3809,7 +3811,7 @@ void profileFlush(const char* reason, std::uint64_t address, std::size_t bytes, 
         const auto [base, guestBytes, format, width, height] = describe(*texture);
         const auto begin = std::max(address, base);
         const auto end = std::min(address + bytes, base + guestBytes);
-        auto& entry = totals[{reason, flushProgram, flushWritable, base, format, width, height}];
+        auto& entry = totals[{reason, flushProgram, flushWritable, flushDetail, base, format, width, height}];
         ++entry.count;
         entry.bytes += end > begin ? end - begin : 0;
     }
@@ -3823,7 +3825,7 @@ void profileFlush(const char* reason, std::uint64_t address, std::size_t bytes, 
     std::fprintf(stderr, "[flush-profile] 10 s: %.1f MiB of pending images stored by flushes over %zu keys; largest:\n", static_cast<double>(all) / 1048576.0, sorted.size());
     for (std::size_t i = 0; i < sorted.size() && i < 20; ++i) {
         const auto& [key, value] = sorted[i];
-        std::fprintf(stderr, "[flush-profile]   %8.1f MiB x%-5llu %-24s program 0x%llx binding %s image 0x%llx %ux%u format %u\n", static_cast<double>(value.bytes) / 1048576.0, static_cast<unsigned long long>(value.count), key.reason, static_cast<unsigned long long>(key.program), key.writable < 0 ? "?" : key.writable ? "written" : "read", static_cast<unsigned long long>(key.image), key.width, key.height, key.format);
+        std::fprintf(stderr, "[flush-profile]   %8.1f MiB x%-5llu %-24s program 0x%llx binding %s%s%s image 0x%llx %ux%u format %u\n", static_cast<double>(value.bytes) / 1048576.0, static_cast<unsigned long long>(value.count), key.reason, static_cast<unsigned long long>(key.program), key.writable < 0 ? "?" : key.writable ? "written" : "read", key.detail != nullptr ? " / " : "", key.detail != nullptr ? key.detail : "", static_cast<unsigned long long>(key.image), key.width, key.height, key.format);
     }
     totals.clear();
 }
@@ -3836,6 +3838,10 @@ void StorageTexture::NoteFlushProgram(std::uint64_t program) {
 
 void StorageTexture::NoteFlushWritable(int writable) {
     flushWritable = writable;
+}
+
+void StorageTexture::NoteFlushDetail(const char* detail) {
+    flushDetail = detail;
 }
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {

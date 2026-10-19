@@ -3991,6 +3991,32 @@ bool GuestBufferMemory::ShadowStagingWanted(std::uint64_t begin) const {
     return std::any_of(regions.begin(), regions.end(), [&](const Region& region) { return region.begin == begin && region.direct != nullptr && shadowStagingCandidate(region, false); });
 }
 
+const char* GuestBufferMemory::ShadowStagingRefusal(std::uint64_t begin) const {
+    const auto classify = [&](const Region& region, bool base) -> const char* {
+        if (region.gpuCopy && region.deviceLocal) return base ? "base staged" : "staged";
+        if (!stagingAllowed) return base ? "base no staging" : "no staging";
+        if (region.direct == nullptr) return base ? "base not direct" : "not direct";
+        if (region.unstaged) return base ? "base unstaged" : "unstaged";
+        if (region.sparse) return base ? "base sparse" : "sparse";
+        if (region.mirror != nullptr) return base ? "base mirror" : "mirror";
+        if (!gpuCopiesEnabled() || !shadowStagingEnabled()) return "disabled";
+        const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+        if (bytes > shadowStageMax()) return base ? "base too large" : "too large";
+        if (WritesOverlap(region.begin, bytes)) return base ? "base written" : "written";
+        if (!AnyShadowedOverlaps(region.begin, bytes) && !StorageTexture::PendingUnitsOverlap(region.begin, bytes)) return base ? "base no shadow" : "no shadow";
+        return base ? "base wanted" : "wanted";
+    };
+    for (const auto& region : regions) {
+        if (region.begin == begin) return classify(region, false);
+    }
+    if (space != nullptr) {
+        for (const auto& region : space->base) {
+            if (region.begin == begin) return classify(region, true);
+        }
+    }
+    return "not found";
+}
+
 bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) const {
     if (!stagingAllowed || addressable || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;

@@ -4158,6 +4158,31 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
         Require(sources[1].shadow && sources[1].begin == 3 * unit && sources[1].end == 4 * unit && sources[1].buffer == half->buffer && sources[1].offset == half->offset && sources[1].slab == half->slab, "the fresh unit's piece does not read the slab");
         Require(!sources[2].shadow && sources[2].begin == 4 * unit && sources[2].end == 5 * unit, "the import piece after the fresh unit is wrong");
     }
+    {
+        // Shadow staging: a dispatch build's read-only range over the fresh unit is staged in device
+        // memory and copied in from the slab (the fresh unit) and the import (its neighbours),
+        // without publishing the unit into the import.
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddReadable(unit3 - unit, 3 * unit);
+        memory.Upload(false);
+        Require(memory.InPlaceReads().empty(), "a read-only range over a fresh unit was bound in place");
+        std::uint32_t adjustment = 0;
+        const auto info = memory.Descriptor(unit3 - unit, 3 * unit, adjustment);
+        auto readback = std::make_shared<Buffer>(context, static_cast<std::size_t>(3 * unit), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy copy{info.offset + adjustment, 0, 3 * unit};
+        copyBuffer(commands, info.buffer, readback->Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(readback);
+        memory.RecordCopyBacks(recorder);
+        recorder.Sync();
+        const auto* staged = reinterpret_cast<const std::uint8_t*>(readback->Bytes().data());
+        Require(staged[0] == 0x11 && staged[unit - 1] == 0x11 && staged[2 * unit] == 0x11 && staged[3 * unit - 1] == 0x11, "the staged neighbours do not hold the import's bytes");
+        Require(staged[unit] == 0x22 && staged[unit + unit / 2 - 1] == 0x22 && staged[unit + unit / 2] == 0x11, "the staged fresh unit does not hold the slab's bytes");
+        Require(words[3 * unit] == 0x11 && AnyShadowedOverlaps(unit3, unit), "shadow staging published the fresh unit into the import");
+    }
     // A whole publish: the untouched half keeps the seed (the import's bytes), the other the
     // retile's; the copy stamps nothing, and a second publish copies nothing.
     const auto pre = CollectWritesUncached(address, bytes);

@@ -228,6 +228,8 @@ public:
     // and prints the largest every 10 s.
     static void NoteFlushProgram(std::uint64_t program);
     static void NoteFlushWritable(int writable);
+    // APS5_PROFILE_FLUSH: a literal naming why the flush runs (kept per thread until reset to nullptr).
+    static void NoteFlushDetail(const char* detail);
     static void FlushAllPending(const char* reason);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
     static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
