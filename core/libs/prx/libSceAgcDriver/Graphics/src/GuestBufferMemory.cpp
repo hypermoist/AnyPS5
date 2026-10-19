@@ -4397,8 +4397,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // idle) and outlives the copy.
             static_cast<void>(recorder->Commands());
             // A shadow-staged region's copy-in stores the pending results into the shadow itself.
-            if (!shadowSourced(region)) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             region.gpuCopy = true;
+            if (!shadowSourced(region)) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             gpuCopies.push_back(&region);
             continue;
         }

@@ -4181,7 +4181,8 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
         const auto* staged = reinterpret_cast<const std::uint8_t*>(readback->Bytes().data());
         Require(staged[0] == 0x11 && staged[unit - 1] == 0x11 && staged[2 * unit] == 0x11 && staged[3 * unit - 1] == 0x11, "the staged neighbours do not hold the import's bytes");
         Require(staged[unit] == 0x22 && staged[unit + unit / 2 - 1] == 0x22 && staged[unit + unit / 2] == 0x11, "the staged fresh unit does not hold the slab's bytes");
-        Require(words[3 * unit] == 0x11 && AnyShadowedOverlaps(unit3, unit), "shadow staging published the fresh unit into the import");
+        Require(words[3 * unit] == 0x11, "shadow staging published the fresh unit into the import");
+        Require(AnyShadowedOverlaps(unit3, unit), "shadow staging dropped the fresh unit's shadow");
     }
     // A whole publish: the untouched half keeps the seed (the import's bytes), the other the
     // retile's; the copy stamps nothing, and a second publish copies nothing.
