@@ -3474,6 +3474,37 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // unit shadow itself: no flush into the import here.
     const auto flushedHere = [&](std::uint64_t begin) { return !guestMemory.ShadowStaged(begin); };
     static const bool profileFlush = std::getenv("APS5_PROFILE_FLUSH") != nullptr;
+    // APS5_PROFILE_FLUSH: names why a flushed region is not shadow-staged and, once per region,
+    // prints a written region's shape (its writes and the pending results outside them).
+    const auto noteRefusal = [&](std::uint64_t begin, std::uint64_t end) {
+        const char* refusal = guestMemory.ShadowStagingRefusal(begin);
+        StorageTexture::NoteFlushDetail(refusal);
+        if (std::string_view(refusal).find("written") == std::string_view::npos) return;
+        static std::mutex mutex;
+        static std::set<std::uint64_t> seen;
+        {
+            std::lock_guard lock(mutex);
+            if (seen.size() >= 64 || !seen.insert(begin).second) return;
+        }
+        std::string writes;
+        std::uint64_t written = 0, cursor = begin, readPending = 0;
+        auto ranges = guestMemory.Writes();
+        std::sort(ranges.begin(), ranges.end());
+        const auto gap = [&](std::uint64_t from, std::uint64_t to) {
+            if (to > from && StorageTexture::PendingUnitsOverlap(from, static_cast<std::size_t>(to - from))) readPending += to - from;
+        };
+        for (const auto& [low, high] : ranges) {
+            if (high <= begin || low >= end) continue;
+            char text[64];
+            std::snprintf(text, sizeof(text), " 0x%llx+0x%llx", static_cast<unsigned long long>(low), static_cast<unsigned long long>(high - low));
+            writes += text;
+            written += std::min(high, end) - std::max(low, begin);
+            gap(cursor, std::max(low, begin));
+            cursor = std::max(cursor, std::min(high, end));
+        }
+        gap(cursor, end);
+        std::fprintf(stderr, "[flush-shape] region 0x%llx+0x%llx (%.1f MiB): written %.1f MiB in%s; read-only gaps holding pending results %.1f MiB\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<double>(end - begin) / 1048576.0, static_cast<double>(written) / 1048576.0, writes.c_str(), static_cast<double>(readPending) / 1048576.0);
+    };
     if (EpochRevalidate()) {
         if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
@@ -3488,7 +3519,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             // published by the flush, as one over a pending image is stored.
             for (const auto& region : regions) {
                 if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
-                    if (profileFlush) StorageTexture::NoteFlushDetail(guestMemory.ShadowStagingRefusal(region.begin));
+                    if (profileFlush) noteRefusal(region.begin, region.end);
                     StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
                     if (profileFlush) StorageTexture::NoteFlushDetail(nullptr);
                 }
@@ -3503,7 +3534,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     } else {
         for (const auto& region : directRegions) {
             if (!flushedHere(region.begin)) continue;
-            if (profileFlush) StorageTexture::NoteFlushDetail(guestMemory.ShadowStagingRefusal(region.begin));
+            if (profileFlush) noteRefusal(region.begin, region.end);
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
             if (profileFlush) StorageTexture::NoteFlushDetail(nullptr);
         }
