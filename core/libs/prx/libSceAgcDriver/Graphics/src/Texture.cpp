@@ -36,6 +36,7 @@
 #include <optional>
 #include <unordered_map>
 #include <utility>
+#include <tuple>
 
 namespace AgcDriver::Graphics {
 
@@ -3777,6 +3778,66 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     return false;
 }
 
+namespace {
+
+thread_local std::uint64_t flushProgram = 0;
+thread_local int flushWritable = -1;
+
+struct FlushProfileKey {
+    const char* reason;
+    std::uint64_t program;
+    int writable;
+    std::uint64_t image;
+    std::uint32_t format;
+    std::uint32_t width;
+    std::uint32_t height;
+    auto operator<=>(const FlushProfileKey&) const = default;
+};
+
+void profileFlush(const char* reason, std::uint64_t address, std::size_t bytes, const std::vector<std::shared_ptr<StorageTexture>>& flush, const auto& describe) {
+    static const bool enabled = std::getenv("APS5_PROFILE_FLUSH") != nullptr;
+    if (!enabled) return;
+    struct Totals {
+        std::uint64_t count = 0;
+        std::uint64_t bytes = 0;
+    };
+    static std::mutex mutex;
+    static std::map<FlushProfileKey, Totals> totals;
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    for (const auto& texture : flush) {
+        const auto [base, guestBytes, format, width, height] = describe(*texture);
+        const auto begin = std::max(address, base);
+        const auto end = std::min(address + bytes, base + guestBytes);
+        auto& entry = totals[{reason, flushProgram, flushWritable, base, format, width, height}];
+        ++entry.count;
+        entry.bytes += end > begin ? end - begin : 0;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    std::vector<std::pair<FlushProfileKey, Totals>> sorted(totals.begin(), totals.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+    std::uint64_t all = 0;
+    for (const auto& item : sorted) all += item.second.bytes;
+    std::fprintf(stderr, "[flush-profile] 10 s: %.1f MiB of pending images stored by flushes over %zu keys; largest:\n", static_cast<double>(all) / 1048576.0, sorted.size());
+    for (std::size_t i = 0; i < sorted.size() && i < 20; ++i) {
+        const auto& [key, value] = sorted[i];
+        std::fprintf(stderr, "[flush-profile]   %8.1f MiB x%-5llu %-24s program 0x%llx binding %s image 0x%llx %ux%u format %u\n", static_cast<double>(value.bytes) / 1048576.0, static_cast<unsigned long long>(value.count), key.reason, static_cast<unsigned long long>(key.program), key.writable < 0 ? "?" : key.writable ? "written" : "read", static_cast<unsigned long long>(key.image), key.width, key.height, key.format);
+    }
+    totals.clear();
+}
+
+}
+
+void StorageTexture::NoteFlushProgram(std::uint64_t program) {
+    flushProgram = program;
+}
+
+void StorageTexture::NoteFlushWritable(int writable) {
+    flushWritable = writable;
+}
+
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     if (published != nullptr) *published = false;
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
@@ -3825,6 +3886,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             BumpPendingSerial();
         }
     } unregister{flush};
+    profileFlush(reason, address, bytes, flush, [](const StorageTexture& texture) { return std::make_tuple(texture.descriptor.baseAddress, static_cast<std::uint64_t>(texture.guestBytes), texture.descriptor.format, texture.descriptor.width, texture.descriptor.height); });
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
     static const bool trace = std::getenv("APS5_TRACE_FLUSH") != nullptr;
     if (trace) {

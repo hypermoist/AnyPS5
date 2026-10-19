@@ -222,6 +222,12 @@ public:
     // Whether a pending image holds results inside [address, address + bytes) that FlushPending
     // would store: PendingStorageOverlaps without the images whose pending units lie elsewhere.
     static bool PendingUnitsOverlap(std::uint64_t address, std::size_t bytes);
+    // APS5_PROFILE_FLUSH: the calling thread's current guest program (a dispatch's code address, 0
+    // otherwise) and whether the binding behind its next flush is written (1), read-only (0) or
+    // unknown (-1); FlushPending sums the bytes it stores per reason, program, binding and image
+    // and prints the largest every 10 s.
+    static void NoteFlushProgram(std::uint64_t program);
+    static void NoteFlushWritable(int writable);
     static void FlushAllPending(const char* reason);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
     static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
