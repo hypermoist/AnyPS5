@@ -3991,6 +3991,16 @@ bool GuestBufferMemory::ShadowStagingWanted(std::uint64_t begin) const {
     return std::any_of(regions.begin(), regions.end(), [&](const Region& region) { return region.begin == begin && region.direct != nullptr && shadowStagingCandidate(region, false); });
 }
 
+bool GuestBufferMemory::AnyShadowStaged() const {
+    if (!stagingAllowed) return false;
+    return std::any_of(regions.begin(), regions.end(), [&](const Region& region) { return shadowSourced(region); });
+}
+
+bool GuestBufferMemory::AnyShadowStagingWanted() const {
+    if (!stagingAllowed || !shadowStagingEnabled()) return false;
+    return std::any_of(regions.begin(), regions.end(), [&](const Region& region) { return region.direct != nullptr && shadowStagingCandidate(region, false); });
+}
+
 const char* GuestBufferMemory::ShadowStagingRefusal(std::uint64_t begin) const {
     const auto classify = [&](const Region& region, bool base) -> const char* {
         if (region.gpuCopy && region.deviceLocal) return base ? "base staged" : "staged";

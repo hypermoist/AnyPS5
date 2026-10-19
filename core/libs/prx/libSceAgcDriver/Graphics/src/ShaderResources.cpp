@@ -3467,12 +3467,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     };
     // A region bound in place that a build would now shadow-stage (a render target's results over
     // it, see GuestBufferMemory's shadow staging): the set is rebuilt rather than publishing them.
-    for (const auto& region : directRegions) {
-        if (guestMemory.ShadowStagingWanted(region.begin)) return finish(fast, false, ProofFailure::Pending);
-    }
+    if (guestMemory.AnyShadowStagingWanted()) return finish(fast, false, ProofFailure::Pending);
     // A shadow-staged region's copy-in (RecordStagingCopies) stores its pending results into the
     // unit shadow itself: no flush into the import here.
-    const auto flushedHere = [&](std::uint64_t begin) { return !guestMemory.ShadowStaged(begin); };
+    const bool anyStaged = guestMemory.AnyShadowStaged();
+    const auto flushedHere = [&](std::uint64_t begin) { return !anyStaged || !guestMemory.ShadowStaged(begin); };
     static const bool profileFlush = std::getenv("APS5_PROFILE_FLUSH") != nullptr;
     // APS5_PROFILE_FLUSH: names why a flushed region is not shadow-staged and, once per region,
     // prints a written region's shape (its writes and the pending results outside them).

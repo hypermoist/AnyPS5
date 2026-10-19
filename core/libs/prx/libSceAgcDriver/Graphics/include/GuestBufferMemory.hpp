@@ -325,6 +325,10 @@ public:
     // place but would be shadow-staged by a build now (the cached set is rebuilt).
     bool ShadowStaged(std::uint64_t begin) const;
     bool ShadowStagingWanted(std::uint64_t begin) const;
+    // One pass over the build's own regions: whether any is shadow-staged / would now be (both
+    // false for a build that may not stage, so callers skip the per-range lookups above).
+    bool AnyShadowStaged() const;
+    bool AnyShadowStagingWanted() const;
     // APS5_PROFILE_FLUSH: why the DirectRegions range at `begin` is not shadow-staged (a literal).
     const char* ShadowStagingRefusal(std::uint64_t begin) const;
     struct CutRegion {
