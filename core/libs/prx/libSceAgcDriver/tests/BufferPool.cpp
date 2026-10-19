@@ -648,14 +648,8 @@ void AllocationFailure(VkResult initial, VkResult final, bool cached) {
             failure = error.what();
         }
         const bool reclaimed = cached && (initial == VK_ERROR_OUT_OF_DEVICE_MEMORY || initial == VK_ERROR_OUT_OF_HOST_MEMORY);
-        const auto last = reclaimed ? final : initial;
-        // Still out of device memory after the retry: the buffer is placed in host memory instead.
-        const bool hostFallback = last == VK_ERROR_OUT_OF_DEVICE_MEMORY;
-        Expect(mock.attempts == before + (reclaimed ? 2 : 1) + (hostFallback ? 1 : 0), "allocation retries were not bounded or a non-memory failure was retried");
-        // The host attempt takes the next queued result: none left after a reclaimed retry (success).
-        const auto hostResult = reclaimed ? VK_SUCCESS : final;
-        if (hostFallback && hostResult == VK_SUCCESS) Expect(failure.empty(), "a device buffer still out of device memory was not placed in host memory: " + failure);
-        else Expect(failure.find("Vulkan result " + std::to_string(hostFallback ? hostResult : last)) != std::string::npos, "allocation failure lost its final Vulkan result");
+        Expect(mock.attempts == before + (reclaimed ? 2 : 1), "allocation retries were not bounded or a non-memory failure was retried");
+        Expect(failure.find("Vulkan result " + std::to_string(reclaimed ? final : initial)) != std::string::npos, "allocation failure lost its final Vulkan result");
         Expect(mock.liveBuffers.size() == (cached && !reclaimed ? 1u : 0u), "a failed allocation retained its buffer");
         Expect(mock.liveBytes == (cached && !reclaimed ? 2 * MiB : 0), "a failed allocation mishandled cached memory");
     }

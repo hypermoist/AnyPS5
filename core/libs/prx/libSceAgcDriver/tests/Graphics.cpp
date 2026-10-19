@@ -5698,7 +5698,7 @@ void imageTableSnapshotAllocationTests() {
         ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
         const auto originalMap = findWrite(map.binding).buffers.at(0);
         const std::array<std::uint32_t, 4> movedWords{11, 22, 33, 44};
-        const std::array<ShaderResources::MovedBuffer, 1> moved{{{0, 0, 16, movedWords}}};
+        const std::array<ShaderResources::MovedBuffer, 1> moved{{{0, 0, 16, {movedWords.begin(), movedWords.end()}}}};
         const auto sets = cache.Counters().sets;
         mock.writes.clear();
         mock.variableDescriptorCount.reset();
