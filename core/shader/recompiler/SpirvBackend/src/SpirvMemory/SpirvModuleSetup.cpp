@@ -265,6 +265,10 @@ void DefineModule(SpirvEmitterState& state) {
     if (state.requirements.sharedInt64Atomics) {
         state.module.EmitCapability(spv::CapabilityInt64);
     }
+    if (state.requirements.ldsBufferInt64Atomics) {
+        state.module.EmitCapability(spv::CapabilityInt64);
+        state.module.EmitCapability(spv::CapabilityInt64Atomics);
+    }
     if (state.requirements.imageInt64Atomics) {
         if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityInt64ImageEXT)) == state.supportedCapabilities.end()) {
             FailEmit("64-bit image atomics need VK_EXT_shader_image_atomic_int64");
@@ -289,7 +293,15 @@ void DefineModule(SpirvEmitterState& state) {
         state.module.EmitCapability(spv::CapabilityShaderLayer);
     }
     if (InputVariableForKind(state, StageInputKind::Layer) != 0) {
-        state.module.EmitCapability(spv::CapabilityGeometry);
+        const auto supported = [&state](spv::Capability capability) {
+            return std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(capability)) != state.supportedCapabilities.end();
+        };
+        if (supported(spv::CapabilityGeometry) || !supported(spv::CapabilityShaderViewportIndexLayerEXT)) {
+            state.module.EmitCapability(spv::CapabilityGeometry);
+        } else {
+            state.module.EmitExtension("SPV_EXT_shader_viewport_index_layer");
+            state.module.EmitCapability(spv::CapabilityShaderViewportIndexLayerEXT);
+        }
     }
     if (state.viewportIndexVariable != 0) {
         state.module.RequireVersion(0x00010500u);

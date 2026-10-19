@@ -232,6 +232,43 @@ class TraceDigestTests(unittest.TestCase):
         self.assertAlmostEqual(presenter["wait_ms_per_frame"], 15.5 / 3)
         self.assertAlmostEqual(presenter["busy_ms_per_frame"], 2.5 / 3)
 
+    def test_thread_totals_only_count_time_inside_the_frame_window(self):
+        events = [
+            complete(1, "Driver.Packet", -5000, 20000),
+            complete(1, "GpuMutex.wait.draw", -2000, 4000),
+            complete(1, "Driver.Packet.after", 12000, 1000),
+            complete(2, "Driver.WorkerWait", -10000, 2000),
+            {"name": "present", "ph": "i", "ts": 0, "tid": 1, "args": {"present": 600}},
+            {"name": "present", "ph": "i", "ts": 10000, "tid": 1, "args": {"present": 601}},
+        ]
+        result = trace_digest.digest(trace_digest.Trace(events))
+        active, outside = result["threads"]
+        self.assertEqual(active["busy_ms_per_frame"], 8.0)
+        self.assertEqual(active["wait_ms_per_frame"], 2.0)
+        self.assertEqual(active["busy_pct"], 80.0)
+        self.assertEqual(active["wait_pct"], 20.0)
+        self.assertEqual(active["top"], [{"name": "Driver.Packet", "ms_per_frame": 10.0}])
+        self.assertEqual(outside["busy_ms_per_frame"], 0.0)
+        self.assertEqual(outside["wait_ms_per_frame"], 0.0)
+        self.assertEqual(outside["untraced_ms_per_frame"], 10.0)
+        self.assertEqual(outside["top"], [])
+        self.assertEqual(result["top_slices_ms_per_frame"], [
+            {"name": "Driver.Packet", "ms": 10.0},
+            {"name": "GpuMutex.wait.draw", "ms": 2.0},
+        ])
+
+    def test_thread_totals_use_the_summary_end_after_the_last_present(self):
+        trace = trace_digest.Trace([
+            complete(1, "Driver.Packet", 1000, 20000),
+            {"name": "present", "ph": "i", "ts": 0, "tid": 1, "args": {"present": 600}},
+        ])
+        result = trace_digest.digest(trace, {"window": {"ms": 10.0}})
+        thread = result["threads"][0]
+        self.assertEqual(result["frames"], 1)
+        self.assertEqual(thread["busy_ms_per_frame"], 9.0)
+        self.assertEqual(thread["busy_pct"], 90.0)
+        self.assertEqual(thread["untraced_ms_per_frame"], 1.0)
+
     def test_largest_slices_per_frame(self):
         largest = self.result()["top_slices_ms_per_frame"]
         self.assertEqual(largest[0]["name"], "Driver.Packet")
@@ -242,6 +279,26 @@ class TraceDigestTests(unittest.TestCase):
         self.assertEqual((waits[0]["name"], waits[0]["thread"], waits[0]["present"]), ("Driver.Present.inflight_wait", "presenter", 601))
         self.assertAlmostEqual(waits[0]["ms"], 14.5)
         self.assertEqual(waits[1]["name"], "Driver.WorkerWait")
+
+    def test_wait_subscope_without_parent_is_not_busy(self):
+        events = [EVENTS[1], complete(1, "Driver.WorkerWait.dequeue_order", 0, 4000),
+                  complete(1, "Driver.Packet", 4000, 5000), EVENTS[-3], EVENTS[-2]]
+        result = trace_digest.digest(trace_digest.Trace({"traceEvents": events}))
+        worker = result["threads"][0]
+        self.assertAlmostEqual(worker["wait_pct"], 40.0)
+        self.assertAlmostEqual(worker["busy_pct"], 50.0)
+        self.assertEqual(result["longest_waits"][0]["name"], "Driver.WorkerWait.dequeue_order")
+        self.assertEqual(worker["top"][0]["name"], "Driver.Packet")
+
+    def test_nested_wait_subscope_does_not_double_count(self):
+        events = [EVENTS[1], complete(1, "Driver.WorkerWait", 0, 4000),
+                  complete(1, "Driver.WorkerWait.dequeue_order", 1000, 2000),
+                  complete(1, "Driver.Packet", 4000, 5000), EVENTS[-3], EVENTS[-2]]
+        result = trace_digest.digest(trace_digest.Trace({"traceEvents": events}))
+        worker = result["threads"][0]
+        self.assertAlmostEqual(worker["wait_pct"], 40.0)
+        self.assertAlmostEqual(worker["busy_pct"], 50.0)
+        self.assertEqual(len(result["longest_waits"]), 1)
 
     def test_gpu_mutex_waits_with_site_names(self):
         for site in ("other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"):
@@ -395,6 +452,15 @@ class TraceDigestTests(unittest.TestCase):
             complete(1, "Driver.Completion", 30000.3, 20000.0)]})
         self.assertEqual([(entry[3], entry[4]) for entry in trace.slices[1]],
                          [(0, False), (1, True), (0, False)])
+
+    def test_missing_summary_file_is_an_error(self):
+        missing = Path(self.directory.name) / "missing.jsonl"
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                trace_digest.main([str(self.trace), "--summary", str(missing)])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("summary file not found", error.getvalue())
 
 
 def interval_line(start, end, p99, gpu_ms, **changes):

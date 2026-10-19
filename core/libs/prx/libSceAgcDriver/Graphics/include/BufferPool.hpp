@@ -77,7 +77,7 @@ public:
     // The size a buffer for `bytes` is created with: its size class, or `bytes` itself when large.
     static std::size_t Capacity(std::size_t bytes, VkMemoryPropertyFlags properties);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
-    VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation);
+    VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr);
     // As AllocateMemory, but returns VK_NULL_HANDLE when the device is still out of memory after the
     // pool trim and the reclaimer.
     VkDeviceMemory TryAllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation);
@@ -153,7 +153,7 @@ private:
     PFN_vkDestroyBuffer destroyBuffer;
     PFN_vkFreeMemory freeMemory;
     PFN_vkAllocateMemory allocateMemory;
-    VkDeviceMemory allocateMemoryOrThrow(const VkMemoryAllocateInfo& allocation, const char* operation, bool throwOnOutOfMemory);
+    VkDeviceMemory allocateMemoryOrThrow(const VkMemoryAllocateInfo& allocation, const char* operation, bool throwOnOutOfMemory, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType);
     PFN_vkMapMemory mapMemory;
     std::mutex mutex;
     // Not `small`/`large`: <rpcndr.h> (via <windows.h>) defines `small` as a macro.
@@ -175,6 +175,7 @@ private:
 };
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context);
+VkDeviceMemory AllocateImageMemory(const Context& context, const VkMemoryAllocateInfo& allocation, std::uint32_t mask, const char* operation);
 
 }
 
