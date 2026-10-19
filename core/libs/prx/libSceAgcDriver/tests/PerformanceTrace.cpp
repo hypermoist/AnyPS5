@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TraceFile.hpp"
 #include "zlib.h"
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -34,6 +35,22 @@ void WindowBySeconds() {
         edges.push_back(window.Present(0, elapsed));
     Check(edges == std::vector<Edge>{Edge::None, Edge::None, Edge::Open, Edge::None, Edge::Close, Edge::None}, "seconds window opened or closed at the wrong present");
     Check(window.Describe() == "seconds 2:1", "seconds window description changed");
+}
+
+void WindowByTrigger() {
+    const auto trigger = std::filesystem::temp_directory_path() / ("aps5-trace-trigger-" + std::to_string(Clock::now().time_since_epoch().count()));
+    auto window = TraceWindow::Parse(nullptr, "0:1", trigger.string().c_str()).value();
+    std::vector<Edge> edges;
+    edges.push_back(window.Present(0, milliseconds(0)));
+    edges.push_back(window.Present(1, milliseconds(1000)));
+    std::ofstream(trigger).put('1');
+    edges.push_back(window.Present(2, milliseconds(1100)));
+    edges.push_back(window.Present(3, milliseconds(1300)));
+    edges.push_back(window.Present(4, milliseconds(2299)));
+    edges.push_back(window.Present(5, milliseconds(2300)));
+    std::filesystem::remove(trigger);
+    Check(edges == std::vector<Edge>{Edge::None, Edge::None, Edge::None, Edge::Open, Edge::None, Edge::Close}, "triggered window did not wait for its file or did not count its length from the trigger");
+    Check(window.Describe() == "seconds 0:1 after trigger", "triggered window description changed");
 }
 
 void WindowRejects() {
@@ -396,6 +413,7 @@ int main() {
     try {
         WindowByFrames();
         WindowBySeconds();
+        WindowByTrigger();
         WindowRejects();
         BufferCap();
         LostEventsCount();

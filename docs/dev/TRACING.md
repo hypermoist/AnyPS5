@@ -65,6 +65,7 @@ See [Build](BUILD.md#performance-trace) for the trace format, summary fields and
 | --- | --- |
 | `APS5_TRACE_FRAMES=<start>:<count>` | Records a window of presents by zero-based frame number. |
 | `APS5_TRACE_SECONDS=<start>:<length>` | Records a window of presents by elapsed seconds after the first present. Cannot be set with `APS5_TRACE_FRAMES`. |
+| `APS5_TRACE_TRIGGER=<file>` | With `APS5_TRACE_FRAMES` or `APS5_TRACE_SECONDS`, the window also waits past its start for this file to exist and counts its length from the present that found it (checked every 250 ms), so a capture can start at a scene reached after an unknown time. |
 | `APS5_TRACE_SUMMARY_EVERY=<seconds>` | Writes periodic summary lines without recording trace events. Can be combined with either window switch. |
 | `APS5_TRACE_EVENTS=<count>` | Sets the per-thread event-buffer capacity for a frame or seconds window (1–4,194,304; default 262,144). |
 | `APS5_TRACE_DIR=<path>` | Writes performance capture and summary files to this directory instead of the working directory. |

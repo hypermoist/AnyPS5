@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -37,7 +38,10 @@ public:
     using Clock = std::chrono::steady_clock;
     enum class Edge { None, Open, Close };
 
-    static std::optional<TraceWindow> Parse(const char* frames, const char* seconds) {
+    // `trigger` (APS5_TRACE_TRIGGER): the window waits, past its start, for this file to exist and
+    // counts its length from the present that found it, so a capture can start at a scene reached
+    // after an unknown time (create the file when the scene is on screen).
+    static std::optional<TraceWindow> Parse(const char* frames, const char* seconds, const char* trigger = nullptr) {
         if (frames == nullptr && seconds == nullptr) return std::nullopt;
         if (frames != nullptr && seconds != nullptr) throw std::invalid_argument("APS5_TRACE_FRAMES and APS5_TRACE_SECONDS cannot be set together");
         const std::string_view name = frames != nullptr ? "APS5_TRACE_FRAMES" : "APS5_TRACE_SECONDS";
@@ -47,13 +51,21 @@ public:
         std::uint64_t length = 0;
         if (colon == std::string_view::npos || !number(text.substr(0, colon), start) || !number(text.substr(colon + 1), length) || length == 0)
             throw std::invalid_argument(std::string(name) + "=" + std::string(text) + " is not <start>:<length> with a length above 0");
-        return TraceWindow(frames != nullptr, start, length);
+        TraceWindow window(frames != nullptr, start, length);
+        if (trigger != nullptr && *trigger != '\0') window.trigger = trigger;
+        return window;
     }
 
     Edge Present(std::uint64_t present, Clock::duration elapsed) {
         if (state == State::Closed) return Edge::None;
         if (state == State::Waiting) {
             if (frames ? present < start : wholeSeconds(elapsed) < start) return Edge::None;
+            if (!trigger.empty()) {
+                if (elapsed - checkedAt < std::chrono::milliseconds(250)) return Edge::None;
+                checkedAt = elapsed;
+                std::error_code error;
+                if (!std::filesystem::exists(trigger, error)) return Edge::None;
+            }
             state = State::Open;
             openedPresent = present;
             openedAt = elapsed;
@@ -65,7 +77,7 @@ public:
     }
 
     std::string Describe() const {
-        return std::string(frames ? "frames " : "seconds ") + std::to_string(start) + ":" + std::to_string(length);
+        return std::string(frames ? "frames " : "seconds ") + std::to_string(start) + ":" + std::to_string(length) + (trigger.empty() ? "" : " after trigger");
     }
 
 private:
@@ -89,6 +101,8 @@ private:
     State state = State::Waiting;
     std::uint64_t openedPresent = 0;
     Clock::duration openedAt{};
+    std::string trigger;
+    Clock::duration checkedAt{};
 };
 
 class TraceInterval {
