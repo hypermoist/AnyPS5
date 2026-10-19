@@ -3193,7 +3193,7 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         Require(original.buffers.size() == 2 && original.images.size() == 2, "descriptor test lacks mixed bindings and an image array");
         for (std::size_t allocation = 0; allocation < 2; ++allocation) {
             const std::array<std::uint32_t, 4> words{5, 6, 7, 8};
-            const ShaderResources::MovedBuffer moved{allocation, 0, 16, words};
+            const ShaderResources::MovedBuffer moved{allocation, 0, 16, {words.begin(), words.end()}};
             const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
             Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
             Require(updates.calls.size() == allocation + 2 && updates.copies == 0, "draw descriptors copied GPU memory or needed multiple updates");
@@ -3278,7 +3278,7 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
         ShaderResources resources(context, vertex, fragment, target, 0, 0);
         Require(resources.SplitSets(), "a fragment image table did not get its own descriptor set");
         const std::array<std::uint32_t, 4> movedWords{5, 6, 7, 8};
-        const ShaderResources::MovedBuffer moved{0, 0, 16, movedWords};
+        const ShaderResources::MovedBuffer moved{0, 0, 16, {movedWords.begin(), movedWords.end()}};
         const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
         Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
         const auto& written = updates.calls.back().written;

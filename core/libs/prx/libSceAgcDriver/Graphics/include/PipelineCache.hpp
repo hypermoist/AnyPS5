@@ -16,7 +16,9 @@ namespace AgcDriver::Graphics {
 
 class PipelineCache {
 public:
-    static constexpr int SaveIntervalSeconds = 10;
+    // Seconds between background saves (APS5_PIPELINE_CACHE_SAVE_SECONDS, default 300; 0 saves only at
+    // teardown). A save of a multi-GiB cache holds the file, a merged copy and the snapshot at once.
+    static int SaveIntervalSeconds();
 
     PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool loadFromFile = true);
     ~PipelineCache();

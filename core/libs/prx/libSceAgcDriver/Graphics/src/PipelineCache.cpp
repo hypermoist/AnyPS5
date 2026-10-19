@@ -251,9 +251,28 @@ void PipelineCache::SaveNow() {
     save(false);
 }
 
+int PipelineCache::SaveIntervalSeconds() {
+    static const int seconds = [] {
+        const char* text = std::getenv("APS5_PIPELINE_CACHE_SAVE_SECONDS");
+        if (text == nullptr || *text == '\0') return 300;
+        char* end = nullptr;
+        const long value = std::strtol(text, &end, 10);
+        return end != text && *end == '\0' && value >= 0 && value <= 86400 ? static_cast<int>(value) : 300;
+    }();
+    return seconds;
+}
+
 void PipelineCache::run() {
     std::unique_lock lock(mutex);
-    while (!wake.wait_for(lock, std::chrono::seconds(SaveIntervalSeconds), [&] { return stopping; })) {
+    const auto interval = SaveIntervalSeconds();
+    // Only the cache that loaded the file saves in the background: another device's cache would merge
+    // the whole file on every save, and their saves would keep changing the file under each other.
+    // Every cache still saves (merging) at teardown.
+    if (interval == 0 || !holdsFile) {
+        wake.wait(lock, [&] { return stopping; });
+        return;
+    }
+    while (!wake.wait_for(lock, std::chrono::seconds(interval), [&] { return stopping; })) {
         lock.unlock();
         save(false);
         lock.lock();
