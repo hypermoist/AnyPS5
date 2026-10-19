@@ -319,6 +319,12 @@ public:
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions() const;
+    // For a reused build's revalidation (ShaderResources::Revalidate), by a DirectRegions range:
+    // ShadowStaged, the region is shadow-staged (its copy-in stores pending results into the unit
+    // shadow itself, so no publishing flush is needed); ShadowStagingWanted, the region is bound in
+    // place but would be shadow-staged by a build now (the cached set is rebuilt).
+    bool ShadowStaged(std::uint64_t begin) const;
+    bool ShadowStagingWanted(std::uint64_t begin) const;
     struct CutRegion {
         std::uint64_t begin;
         std::uint64_t end;
@@ -435,6 +441,10 @@ private:
     // and an atomic element or a size within the written-shadow window. Independent of the import,
     // so UploadPrepare and UploadFinish decide alike.
     bool stagingEligible(const Region& region, bool addressable) const;
+    bool shadowStagingCandidate(const Region& region, bool addressable) const;
+    // A staged region the shader only reads (no Writes() overlap): copied in from the unit shadow
+    // where its units are fresh (see GuestBufferMemory.cpp, shadow staging).
+    bool shadowSourced(const Region& region) const;
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.

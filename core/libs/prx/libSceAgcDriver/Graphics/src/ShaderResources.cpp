@@ -3465,12 +3465,22 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         return true;
     };
+    // A region bound in place that a build would now shadow-stage (a render target's results over
+    // it, see GuestBufferMemory's shadow staging): the set is rebuilt rather than publishing them.
+    for (const auto& region : directRegions) {
+        if (guestMemory.ShadowStagingWanted(region.begin)) return finish(fast, false, ProofFailure::Pending);
+    }
+    // A shadow-staged region's copy-in (RecordStagingCopies) stores its pending results into the
+    // unit shadow itself: no flush into the import here.
+    const auto flushedHere = [&](std::uint64_t begin) { return !guestMemory.ShadowStaged(begin); };
     if (EpochRevalidate()) {
         if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
             auto& regions = ShaderRecompiler::ThreadOwned(regionsSlot);
             regions.clear();
-            for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
+            for (const auto& region : directRegions) {
+                if (flushedHere(region.begin)) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
+            }
             for (const auto& [begin, end] : guestMemory.Writes()) regions.push_back({begin, end, nullptr, nullptr, false});
             StorageTexture::ScanPending(regions);
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
@@ -3486,7 +3496,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             importsProof = HostImportsIdentity(context);
         }
     } else {
-        for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+        for (const auto& region : directRegions) {
+            if (flushedHere(region.begin)) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+        }
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
