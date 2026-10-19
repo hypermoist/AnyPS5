@@ -267,6 +267,29 @@ void Driver::dumpSampleCounters(std::uint64_t address) {
     }
 }
 
+// An occlusion counter dump on queue 0 is committed in order behind the pipelined draws it counts
+// (the committer records it as preparePacketMemory would, after them), so the packet worker no
+// longer drains the pipeline for each one; its range is a pending write of the item, which later
+// packets reading it (waits, predication, DMA) see through the pipeline. UE issues ~1000 per frame.
+// APS5_NO_PIPELINE_SAMPLE_DUMPS=1 drains for them as before.
+bool Driver::enqueueSampleDump(std::span<const std::uint32_t> packet, std::uint32_t queue) {
+    static const bool enabled = std::getenv("APS5_NO_PIPELINE_SAMPLE_DUMPS") == nullptr && std::getenv("APS5_DRAIN_ALL") == nullptr;
+    if (!enabled || queue != 0 || !Pm4::SampleDump(packet) || !DrawPipeline::Active() || !deferredLabels().labels.empty()) return false;
+    const auto address = Pm4::SampleDumpAddress(packet);
+    DrawPipeline::Queue0().Enqueue([this, queue, address] {
+        GuestMemory::SetCurrentPacket(0x46, queue);
+        bool wrote = false;
+        {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (const auto localDevice = device.Load()) wrote = localDevice->DumpSamplesOnGpu(address);
+        }
+        if (wrote) Graphics::Recorder::CountRecordedWork();
+        else dumpSampleCounters(address);
+    }, {{address, address + Pm4::SampleDumpBytes}});
+    return true;
+}
+
 bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state) {
     static const bool enabled = std::getenv("APS5_PIPELINE_DMA") != nullptr;
     if (!enabled || opcode != 0x50 || queue != 0 || packet.size() < 7 || !DrawPipeline::Active() || !deferredLabels().labels.empty()) return false;
