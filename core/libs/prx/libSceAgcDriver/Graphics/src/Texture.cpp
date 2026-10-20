@@ -3832,6 +3832,45 @@ void profileFlush(const char* reason, std::uint64_t address, std::size_t bytes, 
 
 }
 
+// Debug aid APS5_TRACE_REFRESH_PAIRS=1: per (refreshing image, image whose pending results its refresh
+// stores) shape pair, how often and how many overlapping bytes, top 15 every 10 s ([refresh-pair]);
+// which hand-overs a device-side copy between the two images would have to cover.
+void StorageTexture::traceRefreshPairs(const StorageTexture& target, const std::vector<std::shared_ptr<StorageTexture>>& flush) {
+    static const bool enabled = std::getenv("APS5_TRACE_REFRESH_PAIRS") != nullptr;
+    if (!enabled) return;
+    const auto shape = [](const StorageTexture& texture) {
+        const auto& d = texture.descriptor;
+        char text[160];
+        std::snprintf(text, sizeof text, "0x%llx+0x%llx %ux%ux%u mips %u fmt %u tile %u dim %u units %u", static_cast<unsigned long long>(d.baseAddress), static_cast<unsigned long long>(texture.guestBytes), d.width, d.height, d.depthOrLastArray + 1, d.mipCount, d.format, static_cast<unsigned>(d.tileMode), static_cast<unsigned>(d.dimension), texture.trackedLayers);
+        return std::string(text);
+    };
+    struct Totals {
+        std::uint64_t count = 0;
+        std::uint64_t bytes = 0;
+    };
+    static std::mutex mutex;
+    static std::map<std::pair<std::string, std::string>, Totals> totals;
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    for (const auto& texture : flush) {
+        const auto begin = std::max(target.descriptor.baseAddress, texture->descriptor.baseAddress);
+        const auto end = std::min(target.descriptor.baseAddress + target.guestBytes, texture->descriptor.baseAddress + texture->guestBytes);
+        auto& entry = totals[{shape(target), shape(*texture)}];
+        ++entry.count;
+        entry.bytes += end > begin ? end - begin : 0;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    std::vector<std::pair<std::pair<std::string, std::string>, Totals>> sorted(totals.begin(), totals.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    for (std::size_t i = 0; i < sorted.size() && i < 15; ++i) {
+        const auto& [key, value] = sorted[i];
+        std::fprintf(stderr, "[refresh-pair] x%-5llu %8.1f MiB overlap: refresh %s <- pending %s\n", static_cast<unsigned long long>(value.count), static_cast<double>(value.bytes) / 1048576.0, key.first.c_str(), key.second.c_str());
+    }
+    totals.clear();
+}
+
 void StorageTexture::NoteFlushProgram(std::uint64_t program) {
     flushProgram = program;
 }
@@ -3893,6 +3932,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         }
     } unregister{flush};
     profileFlush(reason, address, bytes, flush, [](const StorageTexture& texture) { return std::make_tuple(texture.descriptor.baseAddress, static_cast<std::uint64_t>(texture.guestBytes), texture.descriptor.format, texture.descriptor.width, texture.descriptor.height); });
+    if (refreshing != nullptr && std::strcmp(reason, "storage refresh") == 0) traceRefreshPairs(*refreshing, flush);
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
     static const bool trace = std::getenv("APS5_TRACE_FLUSH") != nullptr;
     if (trace) {
