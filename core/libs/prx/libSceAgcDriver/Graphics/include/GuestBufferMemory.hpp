@@ -5,6 +5,7 @@
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -15,6 +16,28 @@
 #include <vector>
 
 namespace AgcDriver::Graphics {
+
+// Host bytes held in guest buffer regions' snapshot and uploaded copies, for the [buffers] memory line.
+inline std::atomic<std::int64_t> RegionCopyBytes{0};
+
+template <typename T>
+struct RegionCopyAllocator {
+    using value_type = T;
+    RegionCopyAllocator() = default;
+    template <typename U>
+    RegionCopyAllocator(const RegionCopyAllocator<U>&) {}
+    T* allocate(std::size_t count) {
+        RegionCopyBytes.fetch_add(static_cast<std::int64_t>(count * sizeof(T)), std::memory_order_relaxed);
+        return std::allocator<T>{}.allocate(count);
+    }
+    void deallocate(T* pointer, std::size_t count) {
+        RegionCopyBytes.fetch_sub(static_cast<std::int64_t>(count * sizeof(T)), std::memory_order_relaxed);
+        std::allocator<T>{}.deallocate(pointer, count);
+    }
+    template <typename U>
+    bool operator==(const RegionCopyAllocator<U>&) const { return true; }
+};
+using RegionBytes = std::vector<std::byte, RegionCopyAllocator<std::byte>>;
 
 void ShutdownGuestBufferWorkers();
 
@@ -354,13 +377,13 @@ private:
         std::uint64_t begin;
         std::uint64_t end;
         bool writable;
-        std::vector<std::byte> snapshot;
+        RegionBytes snapshot;
         // Shared so a recorded GPU copy into it (see gpuCopy) can keep it in the batch itself, before
         // the caller keeps the whole resources: a throw between the two would otherwise return it to
         // the pool under an unsubmitted copy command.
         std::shared_ptr<Buffer> buffer;
         // Guest bytes as uploaded; write-back only stores bytes the GPU changed.
-        std::vector<std::byte> uploaded {};
+        RegionBytes uploaded {};
         // Registered allocation that is imported: its bytes are read from live guest memory, not a snapshot.
         bool hostBacked = false;
         // Set when the region is served by an imported allocation; nothing is copied or written back.

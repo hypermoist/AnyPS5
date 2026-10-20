@@ -1182,7 +1182,7 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
             static auto lastLive = std::chrono::steady_clock::now();
             if (std::chrono::steady_clock::now() - lastLive > std::chrono::seconds(10)) {
                 lastLive = std::chrono::steady_clock::now();
-                AgcDriver::ProfilePrint_nid_no_patch("[storage-live] cache %llu MiB of budget %llu MiB; created %llu; evictions: mips %llu, metadata %llu, budget %llu; live images: %s\n", static_cast<unsigned long long>(cache.bytes >> 20u), static_cast<unsigned long long>(storageBudget(context) >> 20u), static_cast<unsigned long long>(counters.storageCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storageEvictions[1].exchange(0)), static_cast<unsigned long long>(storageEvictions[2].exchange(0)), static_cast<unsigned long long>(storageEvictions[3].exchange(0)), LiveStorageReport().c_str());
+                AgcDriver::ProfilePrint_nid_no_patch("[storage-live] cache %llu MiB of budget %llu MiB; created %llu; evictions: mips %llu, metadata %llu, budget %llu; live images: %s; buffer region host copies %lld MiB\n", static_cast<unsigned long long>(cache.bytes >> 20u), static_cast<unsigned long long>(storageBudget(context) >> 20u), static_cast<unsigned long long>(counters.storageCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storageEvictions[1].exchange(0)), static_cast<unsigned long long>(storageEvictions[2].exchange(0)), static_cast<unsigned long long>(storageEvictions[3].exchange(0)), LiveStorageReport().c_str(), static_cast<long long>(RegionCopyBytes.load(std::memory_order_relaxed) >> 20));
             }
         }
         if (it != cache.entries.end()) {
