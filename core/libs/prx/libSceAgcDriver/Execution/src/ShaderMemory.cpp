@@ -316,7 +316,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 if (nanoseconds >= WordWaitNanoseconds) {
                     ++CaptureTotals().wordWaits;
                     CaptureTotals().wordWaitNanoseconds += nanoseconds;
-                    if (CaptureProfiled()) self.waitedReads.emplace_back(address, nanoseconds);
+                    if (CaptureProfiled()) self.waitedReads.push_back({address, nanoseconds, self.specializing});
                 }
             }
             if (observed) report(waitsBefore, before == word);
@@ -590,20 +590,32 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
 // used them for ([capwait-kind] every 10 s): a pure flat slot only (the word goes to the shader as is,
 // so the GPU could copy it into the shader data instead), another read (a descriptor, a condition, an
 // address), or a read outside the traced materialization (no pure slot in the plan, specialization).
+bool ShaderMemory::readSpecialization(void* context, std::uint64_t address, std::uint32_t* value) {
+    auto& self = *static_cast<ShaderMemory*>(context);
+    const auto previous = std::exchange(self.specializing, true);
+    struct Restore {
+        bool& flag;
+        bool previous;
+        ~Restore() { flag = previous; }
+    } restore{self.specializing, previous};
+    return read(context, address, value);
+}
+
 void ShaderMemory::classifyWaitedReads(const ShaderRecompiler::ResourceCapture& capture) {
     struct Kind {
         std::atomic<std::uint64_t> count{0}, nanoseconds{0};
     };
-    static std::array<Kind, 3> kinds;
+    static std::array<Kind, 5> kinds;
     static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
     const auto& leaves = capture.readTrace.leaves;
     const auto& other = capture.readTrace.otherReads;
-    for (const auto& [address, nanoseconds] : waitedReads) {
-        const bool leaf = std::any_of(leaves.begin(), leaves.end(), [&](const auto& entry) { return entry.second == address; });
-        const bool elsewhere = std::binary_search(other.begin(), other.end(), address);
-        auto& kind = kinds[leaf && !elsewhere ? 0 : elsewhere ? 1 : 2];
+    const bool traced = capture.plan != nullptr && std::any_of(capture.plan->pureFlatSlots.begin(), capture.plan->pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; });
+    for (const auto& read : waitedReads) {
+        const bool leaf = std::any_of(leaves.begin(), leaves.end(), [&](const auto& entry) { return entry.second == read.address; });
+        const bool elsewhere = std::binary_search(other.begin(), other.end(), read.address);
+        auto& kind = kinds[read.specialization ? 2 : leaf && !elsewhere ? 0 : elsewhere ? 1 : traced ? 4 : 3];
         kind.count.fetch_add(1, std::memory_order_relaxed);
-        kind.nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+        kind.nanoseconds.fetch_add(read.nanoseconds, std::memory_order_relaxed);
     }
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     auto due = nextReport.load(std::memory_order_relaxed);
@@ -611,8 +623,10 @@ void ShaderMemory::classifyWaitedReads(const ShaderRecompiler::ResourceCapture& 
     const auto take = [](Kind& kind) { return std::pair{kind.count.exchange(0), static_cast<double>(kind.nanoseconds.exchange(0)) / 1e6}; };
     const auto [pureCount, pureMs] = take(kinds[0]);
     const auto [otherCount, otherMs] = take(kinds[1]);
-    const auto [untracedCount, untracedMs] = take(kinds[2]);
-    std::fprintf(stderr, "[capwait-kind] capture word reads that waited for GPU work (10 s): pure flat slot only %llu / %.0f ms, other plan reads %llu / %.0f ms, untraced %llu / %.0f ms\n", static_cast<unsigned long long>(pureCount), pureMs, static_cast<unsigned long long>(otherCount), otherMs, static_cast<unsigned long long>(untracedCount), untracedMs);
+    const auto [specializationCount, specializationMs] = take(kinds[2]);
+    const auto [untracedCount, untracedMs] = take(kinds[3]);
+    const auto [strayCount, strayMs] = take(kinds[4]);
+    std::fprintf(stderr, "[capwait-kind] capture word reads that waited for GPU work (10 s): pure flat slot only %llu / %.0f ms, other plan reads %llu / %.0f ms, specialization reads %llu / %.0f ms, plan without pure slots %llu / %.0f ms, traced plan but not in its reads %llu / %.0f ms\n", static_cast<unsigned long long>(pureCount), pureMs, static_cast<unsigned long long>(otherCount), otherMs, static_cast<unsigned long long>(specializationCount), specializationMs, static_cast<unsigned long long>(untracedCount), untracedMs, static_cast<unsigned long long>(strayCount), strayMs);
 }
 
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
@@ -632,7 +646,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.shaderBase = request.shader.codeAddress;
     runtime.userContext = this;
     runtime.readMemory = &read;
-    runtime.readSpecializationMemory = &read;
+    runtime.readSpecializationMemory = &readSpecialization;
     runtime.accessible = &accessible;
     runtime.pendingWrite = &pending;
     runtime.readWords = &readWords;

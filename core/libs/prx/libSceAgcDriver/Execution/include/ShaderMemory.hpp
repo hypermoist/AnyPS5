@@ -158,8 +158,16 @@ private:
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
     PendingWriteQuery pendingSpan = nullptr;
-    // The current capture's word reads that waited for GPU work (address, ns), under APS5_PROFILE_DRAW.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> waitedReads;
+    // The current capture's word reads that waited for GPU work, under APS5_PROFILE_DRAW, and whether
+    // the plan's specialization (readSpecializationMemory) made them.
+    struct WaitedRead {
+        std::uint64_t address;
+        std::uint64_t nanoseconds;
+        bool specialization;
+    };
+    std::vector<WaitedRead> waitedReads;
+    bool specializing = false;
+    static bool readSpecialization(void* context, std::uint64_t address, std::uint32_t* value);
     void classifyWaitedReads(const ShaderRecompiler::ResourceCapture& capture);
 };
 
