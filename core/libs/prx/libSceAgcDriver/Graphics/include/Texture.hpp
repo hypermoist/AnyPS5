@@ -391,6 +391,7 @@ public:
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
+    std::size_t BaselineBytes() const { return generationBaseline.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
 private:

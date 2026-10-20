@@ -219,14 +219,16 @@ LiveImages& Live() {
 std::string LiveStorageReport() {
     auto& live = Live();
     std::lock_guard lock(live.mutex);
-    std::uint64_t cachedCount = 0, cachedBytes = 0, heldCount = 0, heldBytes = 0;
+    std::uint64_t cachedCount = 0, cachedBytes = 0, heldCount = 0, heldBytes = 0, originalBytes = 0, baselineBytes = 0;
     for (const auto* texture : live.textures) {
+        originalBytes += texture->OriginalSnapshotBytes();
+        baselineBytes += texture->BaselineBytes();
         const auto bytes = std::max<std::uint64_t>(texture->AllocationBytes(), texture->GuestBytes());
         if (texture->Cached()) { ++cachedCount; cachedBytes += bytes; }
         else { ++heldCount; heldBytes += bytes; }
     }
-    char text[160];
-    std::snprintf(text, sizeof(text), "%llu cached (%llu MiB), %llu alive outside the cache (%llu MiB)", static_cast<unsigned long long>(cachedCount), static_cast<unsigned long long>(cachedBytes >> 20u), static_cast<unsigned long long>(heldCount), static_cast<unsigned long long>(heldBytes >> 20u));
+    char text[256];
+    std::snprintf(text, sizeof(text), "%llu cached (%llu MiB), %llu alive outside the cache (%llu MiB); host copies: original %llu MiB, generation baseline %llu MiB", static_cast<unsigned long long>(cachedCount), static_cast<unsigned long long>(cachedBytes >> 20u), static_cast<unsigned long long>(heldCount), static_cast<unsigned long long>(heldBytes >> 20u), static_cast<unsigned long long>(originalBytes >> 20u), static_cast<unsigned long long>(baselineBytes >> 20u));
     return text;
 }
 
