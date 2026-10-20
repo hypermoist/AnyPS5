@@ -592,6 +592,18 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
 // address), or a read outside the traced materialization (no pure slot in the plan, specialization).
 bool ShaderMemory::readSpecialization(void* context, std::uint64_t address, std::uint32_t* value) {
     auto& self = *static_cast<ShaderMemory*>(context);
+    // Debug experiment APS5_DBG_SPEC_NOWAIT=1: a specialization word that recorded GPU work still writes
+    // is unavailable instead of waited for (a condition then keeps both branches active).
+    static const bool noWait = std::getenv("APS5_DBG_SPEC_NOWAIT") != nullptr;
+    if (noWait && address % sizeof(*value) == 0 && self.pendingWrite != nullptr && !self.overlapsInitial(address, address + sizeof(*value))) {
+        auto& page = self.page(address & ~static_cast<std::uint64_t>(PageBytes - 1));
+        const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(*value));
+        if (page.wordwise && !page.valid.Test(index) && self.pendingWrite(address, sizeof(*value), {}) == PendingWrite::Sync) {
+            static std::atomic<std::uint64_t> refused{0};
+            if ((refused.fetch_add(1, std::memory_order_relaxed) & 1023u) == 0) std::fprintf(stderr, "[spec-nowait] %llu specialization reads of pending GPU writes refused\n", static_cast<unsigned long long>(refused.load()));
+            return false;
+        }
+    }
     const auto previous = std::exchange(self.specializing, true);
     struct Restore {
         bool& flag;
