@@ -32,7 +32,12 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -3475,6 +3480,78 @@ struct RestoreSyncSite {
     ~RestoreSyncSite() { activeSyncSite = site; }
 };
 
+// APS5_WAIT_STACKS=1: the host call stacks of GPU waits (fence and timeline) of 1 ms or more, summed
+// by stack and printed every 10 s as module+offset frames, top first ([waitstack]; resolve the
+// offsets with nm on the module). Which code path reads GPU-written memory back is otherwise only a
+// return address in the sync-site table.
+class WaitStack {
+public:
+    WaitStack() : start(enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    WaitStack(const WaitStack&) = delete;
+    WaitStack& operator=(const WaitStack&) = delete;
+    ~WaitStack() {
+#ifndef _WIN32
+        if (!enabled()) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration<double, std::milli>(now - start).count();
+        if (ms < 1.0) return;
+        std::array<void*, 24> frames{};
+        const auto depth = backtrace(frames.data(), static_cast<int>(frames.size()));
+        std::string key(reinterpret_cast<const char*>(frames.data()), static_cast<std::size_t>(depth) * sizeof(void*));
+        std::lock_guard lock(mutex());
+        auto& entry = table()[key];
+        if (entry.frames.empty()) entry.frames.assign(frames.begin(), frames.begin() + depth);
+        entry.ms += ms;
+        ++entry.count;
+        if (now - reported() < std::chrono::seconds(10)) return;
+        reported() = now;
+        std::vector<const Entry*> top;
+        for (const auto& [ignored, value] : table()) top.push_back(&value);
+        std::sort(top.begin(), top.end(), [](const Entry* a, const Entry* b) { return a->ms > b->ms; });
+        for (std::size_t i = 0; i < top.size() && i < 8; ++i) {
+            std::string text;
+            for (std::size_t f = 1; f < top[i]->frames.size(); ++f) {
+                Dl_info info{};
+                char frame[160];
+                if (dladdr(top[i]->frames[f], &info) != 0 && info.dli_fname != nullptr) {
+                    const char* base = std::strrchr(info.dli_fname, '/');
+                    std::snprintf(frame, sizeof frame, " %s+0x%llx", base != nullptr ? base + 1 : info.dli_fname, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(top[i]->frames[f]) - reinterpret_cast<std::uintptr_t>(info.dli_fbase)));
+                } else {
+                    std::snprintf(frame, sizeof frame, " 0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(top[i]->frames[f])));
+                }
+                text += frame;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[waitstack] #%zu %.0f ms in %llu waits (10 s):%s\n", i, top[i]->ms, static_cast<unsigned long long>(top[i]->count), text.c_str());
+        }
+        table().clear();
+#endif
+    }
+
+private:
+    struct Entry {
+        std::vector<void*> frames;
+        double ms = 0;
+        std::uint64_t count = 0;
+    };
+    static bool enabled() {
+        static const bool on = std::getenv("APS5_WAIT_STACKS") != nullptr;
+        return on;
+    }
+    static std::mutex& mutex() {
+        static std::mutex value;
+        return value;
+    }
+    static std::unordered_map<std::string, Entry>& table() {
+        static std::unordered_map<std::string, Entry> value;
+        return value;
+    }
+    static std::chrono::steady_clock::time_point& reported() {
+        static auto value = std::chrono::steady_clock::now();
+        return value;
+    }
+    std::chrono::steady_clock::time_point start;
+};
+
 // The timeline wait itself, on handles copied out of the recorder: the caller holds no mutex, and
 // the recorder may be torn down meanwhile (its destructor waits for the registered waiters to
 // leave after completing every batch, so the handles stay valid until this returns).
@@ -3484,6 +3561,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     wait.pSemaphores = &timeline;
     wait.pValues = &serial;
     const TraceLink traced("Wait", "timeline", serial);
+    const WaitStack stack;
     auto result = waitSemaphores(device, &wait, 5'000'000'000ull);
     for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
         // As for the fence wait in finish(): a hung batch is reported every 5 s.
@@ -3883,6 +3961,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
         const TraceLink traced("Wait", "fence", batch->serial, batch->traceId);
+        const WaitStack stack;
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
