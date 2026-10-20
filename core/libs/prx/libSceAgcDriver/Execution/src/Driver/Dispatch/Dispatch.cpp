@@ -590,13 +590,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), groups, address, queueId, recipe, keepVariant, dataHit, epoch] {
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), groups, address, queueId, recipe, keepVariant, dataHit, addressHit, epoch] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
             try {
-                std::shared_ptr<RecipeHit> recipeHit = localDevice->PrepareRecipe(recipe, false);
+                // An address or user-word hit patched the result it dispatches (moved buffers, table
+                // words read now): as on the drained path, the variant's recipe, built from another
+                // result, is neither replayed nor replaced by this one.
+                std::shared_ptr<RecipeHit> recipeHit = addressHit ? nullptr : localDevice->PrepareRecipe(recipe, false);
                 std::shared_ptr<const Recipe> builtRecipe;
                 bool writersNoted = false;
                 for (;;) {
@@ -619,7 +622,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                             continue;
                         }
                     } else {
-                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), &builtRecipe);
+                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), addressHit ? nullptr : &builtRecipe);
                     }
                     break;
                 }
