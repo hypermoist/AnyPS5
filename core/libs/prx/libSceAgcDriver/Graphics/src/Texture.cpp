@@ -3939,10 +3939,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    // Debug experiment APS5_DBG_REFRESH_FLUSH_NOWAIT=1: a storage refresh's flush records the
-    // write-back behind the writer on the queue without waiting for it on the CPU.
-    static const bool refreshNoWait = std::getenv("APS5_DBG_REFRESH_FLUSH_NOWAIT") != nullptr;
-    const bool skipWait = refreshNoWait && std::strcmp(reason, "storage refresh") == 0;
+    // Debug experiment APS5_DBG_FLUSH_NOWAIT=<reason>[,<reason>...]: flushes for these reasons (GPU
+    // consumers) record the write-back behind the writer on the queue without waiting for it on the
+    // CPU; a later CPU read of the stored bytes syncs through the hook as any read does.
+    static const std::string noWaitReasons = [] { const char* text = std::getenv("APS5_DBG_FLUSH_NOWAIT"); return text != nullptr ? "," + std::string(text) + "," : std::string(); }();
+    const bool skipWait = !noWaitReasons.empty() && noWaitReasons.find("," + std::string(reason) + ",") != std::string::npos;
     if (auto* recorder = Recorder::Active(); !skipWait && recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
         try {
             recorder->Reap();
