@@ -3899,7 +3899,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
+    // Debug experiment APS5_DBG_REFRESH_FLUSH_NOWAIT=1: a storage refresh's flush records the
+    // write-back behind the writer on the queue without waiting for it on the CPU.
+    static const bool refreshNoWait = std::getenv("APS5_DBG_REFRESH_FLUSH_NOWAIT") != nullptr;
+    const bool skipWait = refreshNoWait && std::strcmp(reason, "storage refresh") == 0;
+    if (auto* recorder = Recorder::Active(); !skipWait && recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
         try {
             recorder->Reap();
             if (const auto writer = recorder->PendingWriterSerial(address, bytes); writer == recorder->OpenSerial()) {
