@@ -3941,8 +3941,15 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     std::lock_guard gpu(GuestMemory::GpuMutex());
     // Debug experiment APS5_DBG_FLUSH_NOWAIT=<reason>[,<reason>...]: flushes for these reasons (GPU
     // consumers) record the write-back behind the writer on the queue without waiting for it on the
-    // CPU; a later CPU read of the stored bytes syncs through the hook as any read does.
-    static const std::string noWaitReasons = [] { const char* text = std::getenv("APS5_DBG_FLUSH_NOWAIT"); return text != nullptr ? "," + std::string(text) + "," : std::string(); }();
+    // CPU; a later CPU read of the stored bytes syncs through the hook as any read does. '_' stands
+    // for a space in the reasons (storage_refresh).
+    static const std::string noWaitReasons = [] {
+        const char* text = std::getenv("APS5_DBG_FLUSH_NOWAIT");
+        if (text == nullptr) return std::string();
+        auto list = "," + std::string(text) + ",";
+        std::replace(list.begin(), list.end(), '_', ' ');
+        return list;
+    }();
     const bool skipWait = !noWaitReasons.empty() && noWaitReasons.find("," + std::string(reason) + ",") != std::string::npos;
     if (auto* recorder = Recorder::Active(); !skipWait && recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
         try {
