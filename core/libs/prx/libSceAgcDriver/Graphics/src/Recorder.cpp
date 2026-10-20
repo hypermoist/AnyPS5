@@ -3663,8 +3663,71 @@ void Recorder::FlushDeferredReleases() {
     ReleaseDeferredKeeps();
 }
 
+namespace {
+
+// Debug aid APS5_DBG_SYNC_COMPARE=1: for reads of up to 16 bytes that sync, the guest bytes before
+// the sync against those after it, per read site ([synccompare] every 10 s): a site whose bytes
+// never change waits on GPU writes that do not reach what it reads (a writer noted wider than it
+// writes).
+class SyncCompare {
+public:
+    SyncCompare(std::uint64_t address, std::size_t bytes) : address(address), bytes(bytes) {
+        if (!enabled() || bytes > before.size()) return;
+        active = true;
+        GuestMemory::ReadCommittedUnsynced(address, std::span(before).first(bytes));
+    }
+    SyncCompare(const SyncCompare&) = delete;
+    SyncCompare& operator=(const SyncCompare&) = delete;
+    ~SyncCompare() {
+        if (!active) return;
+        std::array<std::byte, 16> after{};
+        GuestMemory::ReadCommittedUnsynced(address, std::span(after).first(bytes));
+        const bool changed = std::memcmp(before.data(), after.data(), bytes) != 0;
+        const auto site = static_cast<std::size_t>(GuestMemory::CurrentReadSite());
+        std::lock_guard lock(mutex());
+        auto& [count, changes] = sites()[site];
+        ++count;
+        if (changed) ++changes;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - reported() < std::chrono::seconds(10)) return;
+        reported() = now;
+        std::string text;
+        for (const auto& [index, entry] : sites()) {
+            char item[96];
+            std::snprintf(item, sizeof item, " %s %llu/%llu changed", GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(index)), static_cast<unsigned long long>(entry.second), static_cast<unsigned long long>(entry.first));
+            text += item;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[synccompare] small synced reads whose bytes the sync changed (cumulative):%s\n", text.c_str());
+    }
+
+private:
+    static bool enabled() {
+        static const bool on = std::getenv("APS5_DBG_SYNC_COMPARE") != nullptr;
+        return on;
+    }
+    static std::mutex& mutex() {
+        static std::mutex value;
+        return value;
+    }
+    static std::map<std::size_t, std::pair<std::uint64_t, std::uint64_t>>& sites() {
+        static std::map<std::size_t, std::pair<std::uint64_t, std::uint64_t>> value;
+        return value;
+    }
+    static std::chrono::steady_clock::time_point& reported() {
+        static auto value = std::chrono::steady_clock::now();
+        return value;
+    }
+    std::uint64_t address;
+    std::size_t bytes;
+    bool active = false;
+    std::array<std::byte, 16> before{};
+};
+
+}
+
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     if (bytes == 0) return;
+    const SyncCompare compare(address, bytes);
     const auto end = address + bytes;
     if (completionDepth != 0 && !CompletionStoreSyncs()) {
         // A store made by a completion action (a copied buffer's write-back, GuestBufferMemory::
