@@ -8,6 +8,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "ThreadOwned.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -315,6 +316,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
                 if (nanoseconds >= WordWaitNanoseconds) {
                     ++CaptureTotals().wordWaits;
                     CaptureTotals().wordWaitNanoseconds += nanoseconds;
+                    if (CaptureProfiled()) self.waitedReads.emplace_back(address, nanoseconds);
                 }
             }
             if (observed) report(waitsBefore, before == word);
@@ -584,6 +586,35 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
     return capture(request, handle, nullptr);
 }
 
+// APS5_PROFILE_DRAW: the capture's word reads that waited for GPU work, by what the resource plan
+// used them for ([capwait-kind] every 10 s): a pure flat slot only (the word goes to the shader as is,
+// so the GPU could copy it into the shader data instead), another read (a descriptor, a condition, an
+// address), or a read outside the traced materialization (no pure slot in the plan, specialization).
+void ShaderMemory::classifyWaitedReads(const ShaderRecompiler::ResourceCapture& capture) {
+    struct Kind {
+        std::atomic<std::uint64_t> count{0}, nanoseconds{0};
+    };
+    static std::array<Kind, 3> kinds;
+    static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
+    const auto& leaves = capture.readTrace.leaves;
+    const auto& other = capture.readTrace.otherReads;
+    for (const auto& [address, nanoseconds] : waitedReads) {
+        const bool leaf = std::any_of(leaves.begin(), leaves.end(), [&](const auto& entry) { return entry.second == address; });
+        const bool elsewhere = std::binary_search(other.begin(), other.end(), address);
+        auto& kind = kinds[leaf && !elsewhere ? 0 : elsewhere ? 1 : 2];
+        kind.count.fetch_add(1, std::memory_order_relaxed);
+        kind.nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+    }
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto due = nextReport.load(std::memory_order_relaxed);
+    if (now < due || !nextReport.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count(), std::memory_order_relaxed)) return;
+    const auto take = [](Kind& kind) { return std::pair{kind.count.exchange(0), static_cast<double>(kind.nanoseconds.exchange(0)) / 1e6}; };
+    const auto [pureCount, pureMs] = take(kinds[0]);
+    const auto [otherCount, otherMs] = take(kinds[1]);
+    const auto [untracedCount, untracedMs] = take(kinds[2]);
+    std::fprintf(stderr, "[capwait-kind] capture word reads that waited for GPU work (10 s): pure flat slot only %llu / %.0f ms, other plan reads %llu / %.0f ms, untraced %llu / %.0f ms\n", static_cast<unsigned long long>(pureCount), pureMs, static_cast<unsigned long long>(otherCount), otherMs, static_cast<unsigned long long>(untracedCount), untracedMs);
+}
+
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(const ShaderRecompiler::PreparedShaderInvocation& invocation) {
     return capture(invocation.Request(), nullptr, &invocation);
 }
@@ -608,7 +639,9 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.stampWrites = &stampWrites;
     runtime.unchangedSince = &unchangedSince;
     runtime.supplyWords = &supplyWords;
+    waitedReads.clear();
     auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+    if (profile && !waitedReads.empty()) classifyWaitedReads(*capture);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;

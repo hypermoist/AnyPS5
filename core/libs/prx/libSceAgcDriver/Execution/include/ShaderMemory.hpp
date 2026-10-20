@@ -158,6 +158,9 @@ private:
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
     PendingWriteQuery pendingSpan = nullptr;
+    // The current capture's word reads that waited for GPU work (address, ns), under APS5_PROFILE_DRAW.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> waitedReads;
+    void classifyWaitedReads(const ShaderRecompiler::ResourceCapture& capture);
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a
