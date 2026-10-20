@@ -191,6 +191,20 @@ void BatchIds() {
     Check(TraceFormat::GpuSlices(ranges, first, last, origin)[0].batch == 3, "a GPU range lost its batch id");
 }
 
+void LinkedSlices() {
+    std::atomic<std::uint64_t> presents{1};
+    TraceThread thread("draw committer", presents, 8);
+    const auto origin = Clock::now();
+    thread.AddLinked("Wait", "fence", origin, origin + microseconds(3), 17, 5);
+    thread.Add("Driver.Packet", nullptr, origin + microseconds(3), origin + microseconds(6));
+    const auto snapshot = thread.Collect();
+    Check(snapshot.slices.size() == 1 && snapshot.slices[0].linked && snapshot.slices[0].link == 17 && snapshot.slices[0].batch == 5, "a short linked slice was folded or lost its link");
+    const std::vector<TraceThread::Snapshot> threads{{"draw committer", snapshot.slices, {}, false}};
+    const std::vector<Clock::time_point> stamps{origin, origin + milliseconds(16)};
+    const auto json = TraceFormat::Events(7, origin, threads, 0, stamps, 5);
+    Check(json.find("{\"name\":\"Wait.fence\",\"ph\":\"X\",\"ts\":0.000,\"pid\":7,\"tid\":1,\"dur\":3.000,\"args\":{\"batch\":5,\"link\":17}}") != std::string::npos, "a linked slice's link was not written");
+}
+
 void FullBufferEvents() {
     const auto origin = Clock::now();
     const std::vector<TraceThread::Slice> slices{{"Driver.Packet", nullptr, origin + milliseconds(1), microseconds(30)}};
@@ -424,6 +438,7 @@ int main() {
         EscapeStrings();
         EventsShape();
         BatchIds();
+        LinkedSlices();
         SummaryFields();
         GpuClock();
         IntervalDue();
