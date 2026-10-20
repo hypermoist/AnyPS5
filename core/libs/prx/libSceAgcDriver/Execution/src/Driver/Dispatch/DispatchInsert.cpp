@@ -148,6 +148,8 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 fresh->tablePositions.push_back(position);
             }
             std::uint64_t derivedRejected = 0;
+            std::vector<std::uint32_t> tableOnly(fresh->tablePositions);
+            std::sort(tableOnly.begin(), tableOnly.end());
             for (const auto& word : fresh->userMask->words->derivedWords) {
                 if (word.pointer >= fresh->relocations.size()) continue;
                 const auto at = fresh->relocations[word.pointer].base + static_cast<std::uint64_t>(word.offset);
@@ -158,7 +160,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                     ++derivedRejected;
                     continue;
                 }
-                if (std::any_of(fresh->tableSlots.begin(), fresh->tableSlots.end(), [position](const DispatchVariant::TableSlot& slot) { return slot.position == position; })) continue;
+                if (std::binary_search(tableOnly.begin(), tableOnly.end(), position)) continue;
                 fresh->derivedSlots.push_back({position, word.flat, &word.sources, &word.conditions});
                 fresh->tablePositions.push_back(position);
             }
