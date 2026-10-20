@@ -2791,13 +2791,26 @@ std::string HostStackText(void* const* frames, std::size_t count) {
     return text;
 }
 
-// Debug aid APS5_TRACE_NOTE_WRITE=<hex address>: the host call stack of every pending GPU write
-// noted over that address ([notewrite]), first 200, to name what makes a CPU read of it sync.
+// Debug aid APS5_TRACE_NOTE_WRITE=<hex first>[-<hex end>][:<hex bytes>]: the host call stack of every
+// pending GPU write noted over that address range (of exactly that size, when given) ([notewrite]),
+// first 200, to name what makes a CPU read of it sync.
 void TraceNoteWrite(std::uint64_t address, std::size_t bytes) {
 #ifndef _WIN32
-    static const std::uint64_t watched = [] { const char* text = std::getenv("APS5_TRACE_NOTE_WRITE"); return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull; }();
+    struct Watch {
+        std::uint64_t first = 0, end = 0, bytes = 0;
+    };
+    static const Watch watch = [] {
+        Watch value;
+        const char* text = std::getenv("APS5_TRACE_NOTE_WRITE");
+        if (text == nullptr) return value;
+        char* next = nullptr;
+        value.first = std::strtoull(text, &next, 16);
+        value.end = *next == '-' ? std::strtoull(next + 1, &next, 16) : value.first + 1;
+        if (*next == ':') value.bytes = std::strtoull(next + 1, nullptr, 16);
+        return value;
+    }();
     static std::atomic<int> printed{0};
-    if (watched == 0 || watched < address || watched >= address + bytes || printed.fetch_add(1, std::memory_order_relaxed) >= 200) return;
+    if (watch.first == 0 || address >= watch.end || address + bytes <= watch.first || (watch.bytes != 0 && bytes != watch.bytes) || printed.fetch_add(1, std::memory_order_relaxed) >= 200) return;
     std::array<void*, 20> frames{};
     const auto depth = backtrace(frames.data(), static_cast<int>(frames.size()));
     std::fprintf(stderr, "[notewrite] 0x%llx+0x%zx:%s\n", static_cast<unsigned long long>(address), bytes, HostStackText(frames.data() + 1, static_cast<std::size_t>(std::max(depth - 1, 0))).c_str());
