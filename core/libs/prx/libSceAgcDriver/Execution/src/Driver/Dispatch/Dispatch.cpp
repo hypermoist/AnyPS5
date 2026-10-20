@@ -322,6 +322,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (const auto found = dispatchCache.find(key); found != dispatchCache.end()) {
                 entryFound = true;
                 for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
+            } else if (const auto masked = maskedKey != key ? dispatchCache.find(maskedKey) : dispatchCache.end(); masked != dispatchCache.end()) {
+                // A user-word hit reads its variants' runs where this dispatch's user pointers put them.
+                entryFound = true;
+                for (const auto& variant : masked->second->variants) {
+                    if (const auto moved = relocatedVariant(*variant, userData)) appendEntryRegions(*moved, reads);
+                    else appendEntryRegions(*variant, reads);
+                }
             }
         }
         if (!entryFound || noDispatchCache || stampValidate()) {
@@ -441,7 +448,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
     if (readsClear) {
-        if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
+        // An address or user-word hit dispatches its patched result without the recipe (see the item).
+        if (cached && keepVariant != nullptr && (addressHit || keepVariant->recipe.load(std::memory_order_acquire) != nullptr)) {
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
             pipelined = bounded;
