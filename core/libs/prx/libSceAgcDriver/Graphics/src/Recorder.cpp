@@ -2680,6 +2680,13 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         const auto offset = static_cast<std::size_t>(from - address);
         spans.push_back({held.data() + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
     }
+    // A snapshot only this map holds takes the changed blocks whole: comparing them first reads
+    // both copies and then copies the differing bytes anyway. One shared with a recorded use is
+    // refreshed only when nothing differs, which the comparison decides.
+    if (sole) {
+        for (const auto& span : spans) std::memcpy(const_cast<void*>(span.first), span.second, span.bytes);
+        return true;
+    }
     equal.assign(spans.size(), 0);
     CompareSpans(spans, equal);
     for (std::size_t k = 0; k < spans.size(); ++k) {
