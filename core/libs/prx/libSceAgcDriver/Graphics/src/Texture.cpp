@@ -1712,6 +1712,39 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 // so the comparison with guest memory must not flush them.
 thread_local const StorageTexture* refreshing = nullptr;
 
+// Set when a flush for a GPU consumer left its range's recorded writers unwaited (FlushPending): the
+// CPU compares of guest bytes that follow on this thread (compareUntracked, unchangedSinceBaseline
+// read unsynced) wait for them first. Cleared when the flush, or the refresh around it, ends.
+thread_local bool flushWaitDeferred = false;
+
+// FlushPending's wait: the recorded GPU writers of the range finish (the open batch is submitted and
+// waited for when it holds one).
+void SettleRecordedWriters(std::uint64_t address, std::size_t bytes) {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || Recorder::InCompletion() || recorder->PendingWriterSerial(address, bytes) == 0) return;
+    recorder->Reap();
+    if (const auto writer = recorder->PendingWriterSerial(address, bytes); writer == recorder->OpenSerial()) {
+        Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
+        recorder->Sync();
+    } else if (writer != 0) {
+        recorder->FinishUpTo(writer);
+    }
+}
+
+// The flushes whose stored bytes only the GPU consumes next (a dispatch's refreshed storage image, a
+// bound buffer over pending image results): their write-backs are recorded behind the writers on the
+// queue, so the CPU does not wait for those (a CPU read of the bytes later syncs through the hook).
+// APS5_FLUSH_WAIT=1 waits for every flush as before.
+bool GpuConsumedFlush(const char* reason) {
+    static const bool wait = std::getenv("APS5_FLUSH_WAIT") != nullptr;
+    if (wait) return false;
+    for (const char* name : {"storage refresh", "written buffer range", "imported buffer region", "copied buffer region"}) {
+        if (std::strcmp(reason, name) == 0) return true;
+    }
+    return false;
+}
+
 void FlushHook(std::uint64_t address, std::size_t bytes) {
     StorageTexture::FlushPending(address, bytes);
 }
@@ -2139,7 +2172,10 @@ bool StorageTexture::Refresh(bool writeOnly) {
     refreshProof = {};
     struct Exempt {
         const StorageTexture* previous;
-        ~Exempt() { refreshing = previous; }
+        ~Exempt() {
+            refreshing = previous;
+            if (previous == nullptr) flushWaitDeferred = false;
+        }
     } exempt{refreshing};
     // This image's own pending results stay on the GPU, where the next dispatch wants them (the
     // flush below and the compare through the hook skip it).
@@ -2525,6 +2561,7 @@ bool StorageTexture::originalHolds(std::uint64_t address, std::size_t bytes) con
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
     if (!originalHolds(address, bytes)) return false;
+    if (flushWaitDeferred) SettleRecordedWriters(address, bytes);
     struct Exempt {
         const StorageTexture* previous;
         ~Exempt() { refreshing = previous; }
@@ -3939,27 +3976,17 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    // Debug experiment APS5_DBG_FLUSH_NOWAIT=<reason>[,<reason>...]: flushes for these reasons (GPU
-    // consumers) record the write-back behind the writer on the queue without waiting for it on the
-    // CPU; a later CPU read of the stored bytes syncs through the hook as any read does. '_' stands
-    // for a space in the reasons (storage_refresh).
-    static const std::string noWaitReasons = [] {
-        const char* text = std::getenv("APS5_DBG_FLUSH_NOWAIT");
-        if (text == nullptr) return std::string();
-        auto list = "," + std::string(text) + ",";
-        std::replace(list.begin(), list.end(), '_', ' ');
-        return list;
-    }();
-    const bool skipWait = !noWaitReasons.empty() && noWaitReasons.find("," + std::string(reason) + ",") != std::string::npos;
-    if (auto* recorder = Recorder::Active(); !skipWait && recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
+    struct Deferral {
+        bool outer;
+        ~Deferral() {
+            if (outer) flushWaitDeferred = false;
+        }
+    } deferral{refreshing == nullptr && !flushWaitDeferred};
+    if (GpuConsumedFlush(reason)) {
+        flushWaitDeferred = true;
+    } else {
         try {
-            recorder->Reap();
-            if (const auto writer = recorder->PendingWriterSerial(address, bytes); writer == recorder->OpenSerial()) {
-                Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
-                recorder->Sync();
-            } else if (writer != 0) {
-                recorder->FinishUpTo(writer);
-            }
+            SettleRecordedWriters(address, bytes);
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
             throw;
@@ -5252,6 +5279,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
     const auto baseline = originalHolds(from, static_cast<std::size_t>(to - from)) ? std::span<const std::byte>(original) : std::span<const std::byte>(generationBaseline);
     if (baseline.size() != guestBytes) return false;
     const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
+    if (flushWaitDeferred) SettleRecordedWriters(from, static_cast<std::size_t>(to - from));
     return GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(baseline).subspan(offset, static_cast<std::size_t>(to - from)));
 }
 
