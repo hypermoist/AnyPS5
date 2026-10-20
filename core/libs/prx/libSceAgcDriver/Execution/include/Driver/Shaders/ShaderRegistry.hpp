@@ -159,6 +159,9 @@ struct PreparedShaders : PreparedShaderState {
     std::atomic<bool> demanded{false};
     bool pending = false;
     std::vector<std::size_t> convertedSamples;
+    // Code offsets of compute programs whose code (from the offset on) holds no s_swappc, so
+    // InvocationFor skips the per-use scan for user-data callees.
+    std::vector<std::size_t> callFreeOffsets;
 };
 
 struct RegisteredShaderState {

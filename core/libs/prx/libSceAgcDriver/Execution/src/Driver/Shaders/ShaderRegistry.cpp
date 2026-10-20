@@ -687,10 +687,14 @@ std::vector<ShaderRecompiler::TableCallee> ReadTableCallees(const ShaderRecompil
     return callees;
 }
 
+bool HoldsSwappc(std::span<const std::uint32_t> code) {
+    return std::any_of(code.begin(), code.end(), [](std::uint32_t word) { return (word & 0xff80ff00u) == 0xbe802100u; });
+}
+
 ShaderRecompiler::LinkedCalls LinkUserDataCallees(const ShaderRecompiler::RecompileRequest& request) {
     if (request.shader.stage != ShaderRecompiler::ShaderStage::Compute) return {};
     const auto code = request.shader.code;
-    if (std::none_of(code.begin(), code.end(), [](std::uint32_t word) { return (word & 0xff80ff00u) == 0xbe802100u; })) return {};
+    if (!HoldsSwappc(code)) return {};
     const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
     const ShaderRecompiler::SwappcInfo swappc{false, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), request.context.waveSize};
     const auto calls = ShaderRecompiler::FindUserDataCalls(program, swappc);
@@ -724,7 +728,18 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
-    auto linked = LinkUserDataCallees(request);
+    const bool compute = request.shader.stage == ShaderRecompiler::ShaderStage::Compute;
+    bool callFree = false;
+    if (compute) {
+        std::lock_guard lock(snapshot.prepared->mutex);
+        callFree = std::ranges::find(snapshot.prepared->callFreeOffsets, codeOffset) != snapshot.prepared->callFreeOffsets.end();
+    }
+    if (compute && !callFree && !HoldsSwappc(code)) {
+        callFree = true;
+        std::lock_guard lock(snapshot.prepared->mutex);
+        if (std::ranges::find(snapshot.prepared->callFreeOffsets, codeOffset) == snapshot.prepared->callFreeOffsets.end()) snapshot.prepared->callFreeOffsets.push_back(codeOffset);
+    }
+    auto linked = callFree ? ShaderRecompiler::LinkedCalls{} : LinkUserDataCallees(request);
     if (linked.code.empty()) linked.code = LinkGraphicsUserDataTail(request, snapshot);
     auto source = request;
     if (!linked.code.empty()) {
