@@ -2770,7 +2770,44 @@ void Recorder::OnComplete(std::function<void()> action) {
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
+namespace {
+
+// Host call stack frames as " module+0xoffset" (resolve with nm on the module), outermost last.
+std::string HostStackText(void* const* frames, std::size_t count) {
+    std::string text;
+#ifndef _WIN32
+    for (std::size_t f = 0; f < count; ++f) {
+        Dl_info info{};
+        char frame[160];
+        if (dladdr(frames[f], &info) != 0 && info.dli_fname != nullptr) {
+            const char* base = std::strrchr(info.dli_fname, '/');
+            std::snprintf(frame, sizeof frame, " %s+0x%llx", base != nullptr ? base + 1 : info.dli_fname, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(frames[f]) - reinterpret_cast<std::uintptr_t>(info.dli_fbase)));
+        } else {
+            std::snprintf(frame, sizeof frame, " 0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(frames[f])));
+        }
+        text += frame;
+    }
+#endif
+    return text;
+}
+
+// Debug aid APS5_TRACE_NOTE_WRITE=<hex address>: the host call stack of every pending GPU write
+// noted over that address ([notewrite]), first 200, to name what makes a CPU read of it sync.
+void TraceNoteWrite(std::uint64_t address, std::size_t bytes) {
+#ifndef _WIN32
+    static const std::uint64_t watched = [] { const char* text = std::getenv("APS5_TRACE_NOTE_WRITE"); return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull; }();
+    static std::atomic<int> printed{0};
+    if (watched == 0 || watched < address || watched >= address + bytes || printed.fetch_add(1, std::memory_order_relaxed) >= 200) return;
+    std::array<void*, 20> frames{};
+    const auto depth = backtrace(frames.data(), static_cast<int>(frames.size()));
+    std::fprintf(stderr, "[notewrite] 0x%llx+0x%zx:%s\n", static_cast<unsigned long long>(address), bytes, HostStackText(frames.data() + 1, static_cast<std::size_t>(std::max(depth - 1, 0))).c_str());
+#endif
+}
+
+}
+
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value) {
+    TraceNoteWrite(address, bytes);
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
@@ -3509,18 +3546,7 @@ public:
         for (const auto& [ignored, value] : table()) top.push_back(&value);
         std::sort(top.begin(), top.end(), [](const Entry* a, const Entry* b) { return a->ms > b->ms; });
         for (std::size_t i = 0; i < top.size() && i < 8; ++i) {
-            std::string text;
-            for (std::size_t f = 1; f < top[i]->frames.size(); ++f) {
-                Dl_info info{};
-                char frame[160];
-                if (dladdr(top[i]->frames[f], &info) != 0 && info.dli_fname != nullptr) {
-                    const char* base = std::strrchr(info.dli_fname, '/');
-                    std::snprintf(frame, sizeof frame, " %s+0x%llx", base != nullptr ? base + 1 : info.dli_fname, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(top[i]->frames[f]) - reinterpret_cast<std::uintptr_t>(info.dli_fbase)));
-                } else {
-                    std::snprintf(frame, sizeof frame, " 0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(top[i]->frames[f])));
-                }
-                text += frame;
-            }
+            const auto text = HostStackText(top[i]->frames.data() + 1, top[i]->frames.size() - 1);
             AgcDriver::ProfilePrint_nid_no_patch("[waitstack] #%zu %.0f ms in %llu waits (10 s):%s\n", i, top[i]->ms, static_cast<unsigned long long>(top[i]->count), text.c_str());
         }
         table().clear();
