@@ -3766,6 +3766,49 @@ void drawSnapshotEvictionTests(const Device& device) {
     Require(cache.ReusableDrawSnapshot(address, 16) == nullptr && cache.ReusableDrawSnapshot(address, 16) == nullptr, "a snapshot outlived a CPU store");
 }
 
+// A storage snapshot refreshed over CPU stores: one only the cache holds takes the stored blocks
+// (its bytes match guest memory again, untouched blocks kept), one a recorded use still holds is
+// dropped when its bytes differ.
+void drawSnapshotRefreshTests(const Device& device) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 3 * block;
+    void* memory = WriteWatched() ? AllocateWatched(bytes, block) : nullptr;
+    if (memory == nullptr) {
+        std::cout << "write watching unavailable: draw snapshot refresh not tested\n";
+        return;
+    }
+    struct Release {
+        void* memory;
+        ~Release() { ReleaseWatched(memory, bytes); }
+    } release{memory};
+    auto* guest = static_cast<std::uint8_t*>(memory);
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(guest, 0x11, bytes);
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto first = CollectWrites(address, bytes);
+    Require(first != 0, "the watched snapshot range has no generation");
+    Recorder cache(device.GetContext());
+    std::weak_ptr<Buffer> kept;
+    {
+        auto buffer = std::make_shared<Buffer>(device.GetContext(), bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memcpy(buffer->Bytes().data(), guest, bytes);
+        cache.KeepDrawSnapshot(address, bytes, first, registry, buffer);
+        kept = buffer;
+    }
+    std::memset(guest + block + 100, 0x22, 64);
+    const auto second = CollectWrites(address, bytes);
+    Require(second != first, "a CPU store did not move the generation");
+    const auto refreshed = cache.ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::Storage, nullptr, second);
+    Require(refreshed != nullptr && refreshed == kept.lock(), "a snapshot only the cache holds was not refreshed in place");
+    Require(std::memcmp(refreshed->Bytes().data(), guest, bytes) == 0, "the refreshed snapshot does not hold guest memory's bytes");
+    std::memset(guest + 2 * block + 7, 0x33, 9);
+    const auto third = CollectWrites(address, bytes);
+    const auto shared = refreshed;
+    Require(cache.ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::Storage, nullptr, third) == nullptr, "a snapshot a recorded use holds was refreshed under it");
+    Require(std::to_integer<int>(shared->Bytes()[2 * block + 7]) == 0x11, "the held snapshot's bytes changed");
+}
+
 void unwrittenSnapshotTests(const Device& device) {
     Recorder cache(device.GetContext());
     const auto buffer = std::make_shared<Buffer>(device.GetContext(), 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -9372,6 +9415,12 @@ int main(int argc, char** argv) {
             std::cout << "Draw snapshot cap tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-refresh-only") {
+            drawSnapshotEvictionTests(device);
+            drawSnapshotRefreshTests(device);
+            std::cout << "Draw snapshot refresh tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {
             drawSnapshotEpochTests(device);
             return 0;
@@ -9418,6 +9467,7 @@ int main(int argc, char** argv) {
         drawSnapshotTableSetTests(device, recorder);
         drawSnapshotCapTests(device, recorder);
         drawSnapshotEvictionTests(device);
+        drawSnapshotRefreshTests(device);
         unwrittenSnapshotTests(device);
         drawSnapshotUploadTests(device, recorder);
         drawInputReuseTests(device, recorder);
