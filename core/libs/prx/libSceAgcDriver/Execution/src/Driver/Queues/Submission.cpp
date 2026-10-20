@@ -220,6 +220,7 @@ void Driver::holdFlipBehindWorker(const Submission& submission) {
     }
     if (!flips) return;
     flipHolders.fetch_add(1, std::memory_order_acq_rel);
+    const TraceLink traced("Wait", "flipHold", submission.received);
     changed.wait(lock, [&] { return failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipsAhead.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire); });
     flipHolders.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -485,6 +486,7 @@ void Driver::enqueue(Submission submission) {
     submission.waitFree = waitFree(submission);
     auto& worker = workers[queue];
     for (const auto dword : submission.labelWrites) ++worker.unfinishedWrites[dword];
+    TraceLink::Instant("Submission", "queued", submission.received, queue + 1);
     worker.pending.push_back(std::move(submission));
     worker.queued.fetch_add(1, std::memory_order_acq_rel);
     if (!worker.thread.joinable()) worker.thread = std::thread([this, queue] {

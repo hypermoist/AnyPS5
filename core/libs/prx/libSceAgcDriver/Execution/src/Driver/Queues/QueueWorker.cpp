@@ -237,6 +237,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 }
                 submission = std::move(pending.front());
                 pending.pop_front();
+                TraceLink::Instant("Submission", "dequeue", submission.received, id + 1);
                 if (APS5_ENABLE_TIMING_LOG) submission.dequeuedAt = std::chrono::steady_clock::now();
                 if (id == 0) queue0Executing = submission.suspend ? 0 : submission.received;
                 if (submission.waitFree) {

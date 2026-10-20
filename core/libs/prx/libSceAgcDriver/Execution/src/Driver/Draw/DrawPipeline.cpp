@@ -85,6 +85,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
+        const TraceLink traced("Wait", "pipelineFull", itemsDone + 1);
         ++idleWaiters;
         idle.wait(lock, [&] { return items.size() < Depth(); });
         --idleWaiters;
@@ -93,6 +94,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
+    TraceLink::Instant("Pipeline", "enqueue", ++itemsEnqueued);
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes)});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
@@ -139,6 +141,7 @@ void DrawPipeline::run() {
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
+            const TraceLink traced("Wait", "committerIdle", itemsDone + 1);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
@@ -150,6 +153,7 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
+            const TraceLink traced("Pipeline", "commit", itemsDone + 1);
             if (commit != nullptr) (*commit)();
         } catch (const std::exception&) {
             failed = true;
@@ -167,6 +171,7 @@ void DrawPipeline::run() {
         }
         std::lock_guard lock(mutex);
         items.pop_front();
+        ++itemsDone;
         ++commits;
         commitNs += spent;
         if (failed) ++commitErrors;
@@ -195,8 +200,10 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
+    TraceLink traced("Wait", "pipelineDrain", 0, opcode);
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
+    traced.Link(itemsEnqueued);
     ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });
     --idleWaiters;

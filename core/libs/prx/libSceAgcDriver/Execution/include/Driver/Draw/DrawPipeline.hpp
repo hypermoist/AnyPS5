@@ -68,6 +68,9 @@ private:
     std::uint64_t commitNs = 0;
     std::uint64_t commitErrors = 0;
     std::uint64_t enqueued = 0;
+    // Never reset (the counters above are, per report): item numbers for the trace links.
+    std::uint64_t itemsEnqueued = 0;
+    std::uint64_t itemsDone = 0;
     std::uint64_t fullWaitNs = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};

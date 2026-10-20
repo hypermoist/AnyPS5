@@ -152,6 +152,17 @@ public:
     static constexpr std::size_t MaximumCapacity = 4194304;
     static constexpr Clock::duration MinimumSlice = std::chrono::microseconds(20);
 
+    // APS5_TRACE_MIN_SLICE_US: the shortest slice written on its own (shorter ones fold into the
+    // present's sample); 0 writes every slice, for a capture tools/chain.py walks end to end.
+    static Clock::duration ShortestSlice() {
+        static const Clock::duration shortest = [] {
+            const char* text = std::getenv("APS5_TRACE_MIN_SLICE_US");
+            if (text == nullptr) return Clock::duration(MinimumSlice);
+            return Clock::duration(std::chrono::microseconds(std::strtoull(text, nullptr, 10)));
+        }();
+        return shortest;
+    }
+
     static std::size_t ParseCapacity(const char* events) {
         if (events == nullptr) return DefaultCapacity;
         const std::string_view text = events;
@@ -169,6 +180,10 @@ public:
         Clock::time_point begin;
         Clock::duration length;
         std::uint64_t batch = 0;
+        // What the slice waits on or hands over (a batch serial, a draw-pipeline item, a label
+        // address); written whatever its length (see TraceLink).
+        std::uint64_t link = 0;
+        bool linked = false;
     };
 
     struct Total {
@@ -197,19 +212,11 @@ public:
     TraceThread& operator=(const TraceThread&) = delete;
 
     void Add(const char* scope, const char* stage, Clock::time_point begin, Clock::time_point end) {
-        const auto length = end - begin;
-        account(scope, stage, length);
-        if (!buffering.load(std::memory_order_relaxed)) return;
-        const auto present = presents.load(std::memory_order_relaxed);
-        if (!sampled || present != sampledPresent) {
-            if (sampled) append({nullptr, nullptr, sampleBegin, folded});
-            sampled = true;
-            sampledPresent = present;
-            sampleBegin = begin;
-            folded = {};
-        }
-        if (length < MinimumSlice) folded += length;
-        else append({scope, stage, begin, length, TraceBatchTag});
+        add(scope, stage, begin, end, TraceBatchTag, 0, false);
+    }
+
+    void AddLinked(const char* scope, const char* stage, Clock::time_point begin, Clock::time_point end, std::uint64_t link, std::uint64_t batch) {
+        add(scope, stage, begin, end, batch != 0 ? batch : TraceBatchTag, link, true);
     }
 
     Snapshot Collect() const {
@@ -227,6 +234,22 @@ public:
     }
 
 private:
+    void add(const char* scope, const char* stage, Clock::time_point begin, Clock::time_point end, std::uint64_t batch, std::uint64_t link, bool linked) {
+        const auto length = end - begin;
+        account(scope, stage, length);
+        if (!buffering.load(std::memory_order_relaxed)) return;
+        const auto present = presents.load(std::memory_order_relaxed);
+        if (!sampled || present != sampledPresent) {
+            if (sampled) append({nullptr, nullptr, sampleBegin, folded});
+            sampled = true;
+            sampledPresent = present;
+            sampleBegin = begin;
+            folded = {};
+        }
+        if (!linked && length < ShortestSlice()) folded += length;
+        else append({scope, stage, begin, length, batch, link, linked});
+    }
+
     struct Entry {
         std::atomic<const char*> scope{nullptr};
         std::atomic<const char*> stage{nullptr};
@@ -364,13 +387,14 @@ public:
             std::stable_sort(slices.begin(), slices.end(), [](const auto& a, const auto& b) { return a.begin != b.begin ? a.begin < b.begin : a.length > b.length; });
             const auto folded = thread.name + " folded";
             for (const auto& slice : slices) {
-                char text[112];
+                char text[160];
                 if (slice.scope == nullptr) {
                     event(folded, "C", slice.begin, tid);
                     std::snprintf(text, sizeof text, ",\"args\":{\"ms\":%.3f}}", milliseconds(slice.length));
                 } else {
                     event(Name(slice.scope, slice.stage), "X", slice.begin, tid);
-                    if (slice.batch != 0) std::snprintf(text, sizeof text, ",\"dur\":%.3f,\"args\":{\"batch\":%llu}}", microseconds(slice.length), static_cast<unsigned long long>(slice.batch));
+                    if (slice.linked) std::snprintf(text, sizeof text, ",\"dur\":%.3f,\"args\":{\"batch\":%llu,\"link\":%llu}}", microseconds(slice.length), static_cast<unsigned long long>(slice.batch), static_cast<unsigned long long>(slice.link));
+                    else if (slice.batch != 0) std::snprintf(text, sizeof text, ",\"dur\":%.3f,\"args\":{\"batch\":%llu}}", microseconds(slice.length), static_cast<unsigned long long>(slice.batch));
                     else std::snprintf(text, sizeof text, ",\"dur\":%.3f}", microseconds(slice.length));
                 }
                 output += text;
@@ -576,6 +600,56 @@ private:
     inline static std::mutex gpuMutex;
     inline static std::vector<TraceGpuRange> gpuRanges;
     inline static std::uint64_t gpuLost = 0;
+};
+
+// A wait or hand-off on the frame's critical path, written whatever its length with what it is
+// about (`link`: the batch serial a GPU wait ends at, the draw-pipeline item a drain waits for, the
+// label address a WAIT_REG_MEM polls), so tools/chain.py can walk each frame back across threads.
+// A thread no one bound (a guest thread submitting or holding a flip) is bound as "guest".
+class TraceLink {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    TraceLink(const char* scope, const char* stage, std::uint64_t link = 0, std::uint64_t batch = 0) : trace(current()), scope(scope), stage(stage), link(link), batch(batch) {
+        if (trace != nullptr) start = Clock::now();
+    }
+
+    TraceLink(const TraceLink&) = delete;
+    TraceLink& operator=(const TraceLink&) = delete;
+
+    ~TraceLink() {
+        if (trace != nullptr) trace->AddLinked(scope, stage, start, Clock::now(), link, batch);
+    }
+
+    void Link(std::uint64_t value, std::uint64_t batchId = 0) {
+        link = value;
+        if (batchId != 0) batch = batchId;
+    }
+
+    static void Instant(const char* scope, const char* stage, std::uint64_t link, std::uint64_t batch = 0) {
+        auto* trace = current();
+        if (trace == nullptr) return;
+        const auto now = Clock::now();
+        trace->AddLinked(scope, stage, now, now, link, batch);
+    }
+
+private:
+    static TraceThread* current() {
+        if (!PerformanceTrace::Recording()) return nullptr;
+        auto* thread = PerformanceTrace::Thread();
+        if (thread == nullptr) {
+            PerformanceTrace::BindThread("guest");
+            thread = PerformanceTrace::Thread();
+        }
+        return thread;
+    }
+
+    TraceThread* trace;
+    const char* scope;
+    const char* stage;
+    std::uint64_t link;
+    std::uint64_t batch;
+    Clock::time_point start{};
 };
 
 }
