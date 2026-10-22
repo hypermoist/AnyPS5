@@ -4862,7 +4862,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         if (argumentImport != nullptr) {
             threadArguments = std::make_shared<Graphics::Buffer>(context, 24, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            Graphics::Require(recorder.RecordDispatchArguments(commands, argumentImport->address + (arguments - argumentImport->base), threadArguments->DeviceAddress(), &record.threadGroup), "Vulkan dispatch: thread-dimension indirect arguments need the argument kernel");
+            Graphics::Require(recorder.RecordDispatchArguments(commands, argumentImport->address + Graphics::HostImportOffset(*argumentImport, arguments), threadArguments->DeviceAddress(), &record.threadGroup), "Vulkan dispatch: thread-dimension indirect arguments need the argument kernel");
             const VkBufferCopy limit{12, limitByte, 12};
             context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, threadArguments->Handle(), data, 1, &limit);
         } else {
@@ -4910,7 +4910,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.Keep(std::move(threadArguments));
     } else if (argumentImport != nullptr && argumentImport->address != 0) {
         auto checked = std::make_shared<Graphics::Buffer>(context, 12, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-        if (recorder.RecordDispatchArguments(commands, argumentImport->address + (arguments - argumentImport->base), checked->DeviceAddress())) {
+        if (recorder.RecordDispatchArguments(commands, argumentImport->address + Graphics::HostImportOffset(*argumentImport, arguments), checked->DeviceAddress())) {
             indirectBuffer = checked->Handle();
             indirectOffset = 0;
             recorder.Keep(std::move(checked));
