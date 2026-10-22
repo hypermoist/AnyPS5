@@ -16,7 +16,8 @@ enum class TessellationAttribute {
     Factor,
     PatchInput,
     InstanceOutput,
-    InstanceInput
+    InstanceInput,
+    ControlShared
 };
 
 enum class TessellationBaseKind {
@@ -53,6 +54,7 @@ enum class StageInputKind {
     BaryCoordNoPerspectiveCenter,
     BaryCoordSmoothSample,
     BaryCoordNoPerspectiveSample,
+    SampleMask,
 };
 
 constexpr StageInputKind BarycentricInputOf(StageInputKind kind) {

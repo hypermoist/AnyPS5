@@ -73,6 +73,35 @@ void ValidateOptions(const IrProgram& program, ShaderStageInputInfo inputInfo) {
     }
 }
 
+void EnsurePixelInterpolatorCoverage(const IrProgram& program, ShaderPixelInputInfo& pixel) {
+    std::uint32_t needed = pixel.inputNum;
+    const auto consider = [&](std::uint32_t attribute) {
+        if (attribute < 32u && attribute + 1u > needed) needed = attribute + 1u;
+    };
+    for (const auto& block : program.Blocks()) {
+        for (const IrValue* inst : block->Instructions()) {
+            switch (inst->Opcode()) {
+                case IrOpcode::GetAttribute:
+                case IrOpcode::GetInterpolationParameter:
+                case IrOpcode::GetInterpolationParameterF16:
+                case IrOpcode::InterpolateHostP1:
+                case IrOpcode::InterpolateHostP2: {
+                    const IrValue* attribute = inst->Argument(0)->Resolve();
+                    if (attribute->HasImmediate() && attribute->Type() == IrType::U32) consider(attribute->ImmediateU32());
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+    if (needed <= pixel.inputNum) return;
+    for (std::uint32_t input = pixel.inputNum; input < needed; ++input) {
+        pixel.interpolatorSettings[input] = 0x20u;
+    }
+    pixel.inputNum = needed;
+}
+
 void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inputInfo) {
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
@@ -143,6 +172,7 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                         }
                         case StageInputKind::Layer:
                         case StageInputKind::SampleId:
+                        case StageInputKind::SampleMask:
                         case StageInputKind::RasterPrimitive:
                         case StageInputKind::LayerExported:
                             if (program.Resources().stage != IrShaderStage::Pixel || component != 0u) {
@@ -245,7 +275,7 @@ bool IsPixelParameterFlat(const ShaderPixelInputInfo& pixel, std::uint32_t input
 }
 
 void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
-    if (pixel->HasPositionInput() || pixel->psDitheredAlphaToCoverage || pixel->QuadMasked() || pixel->SampleLocationsVary()) {
+    if (pixel->HasPositionInput() || pixel->psDitheredAlphaToCoverage || pixel->QuadMasked() || pixel->SampleLocationsVary() || pixel->ReordersSamples()) {
         AddInput(info, StageInputKind::FragCoord, 0, 4, "gl_FragCoord");
     }
     if (pixel->psFrontFace) {
@@ -335,10 +365,16 @@ void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& inf
     }
 }
 
+bool OwnControlPointWrite(const IrValue& inst) {
+    if (inst.Opcode() != IrOpcode::SetTessellationAttribute) return false;
+    const auto kind = static_cast<TessellationAttribute>(inst.Argument(0)->ImmediateU32());
+    return kind == TessellationAttribute::ControlOutput || kind == TessellationAttribute::ControlShared;
+}
+
 void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
-            if (program.Resources().stage == IrShaderStage::TessellationControl && inst->Opcode() == IrOpcode::LaneId) {
+            if (program.Resources().stage == IrShaderStage::TessellationControl && (inst->Opcode() == IrOpcode::LaneId || OwnControlPointWrite(*inst))) {
                 AddInput(info, StageInputKind::InvocationId, 0, 1, "gl_InvocationID");
             }
             if (inst->Opcode() != IrOpcode::GetBuiltin) {
@@ -378,6 +414,9 @@ void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
                     break;
                 case StageInputKind::SampleId:
                     AddInput(info, kind, 0, 1, "gl_SampleID");
+                    break;
+                case StageInputKind::SampleMask:
+                    AddInput(info, kind, 0, 1, "gl_SampleMaskIn");
                     break;
                 case StageInputKind::BaryCoordSmooth:
                 case StageInputKind::BaryCoordSmoothCenter:
@@ -538,6 +577,9 @@ void CollectSamplerUses(const IrProgram& program, ShaderInfo& info) {
 void ShaderInfoCollector::Collect(IrProgram& program, const ShaderStageInputInfo& inputInfo) const {
     if (!program.Resources().resourceTrackingComplete || program.Metadata().shaderInfoComplete) {
         return Fail(!program.Resources().resourceTrackingComplete ? "shader resources were not tracked" : "shader info already collected");
+    }
+    if (program.Resources().stage == IrShaderStage::Pixel && inputInfo.pixel != nullptr) {
+        EnsurePixelInterpolatorCoverage(program, const_cast<ShaderPixelInputInfo&>(*inputInfo.pixel));
     }
     ValidateOptions(program, inputInfo);
     ValidateValueReferences(program, inputInfo);
