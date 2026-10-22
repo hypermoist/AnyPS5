@@ -3529,7 +3529,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
                         else {
                             const StorageUploadSite site("reval-walk");
-                            expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex], 0, storageWritten[storageIndex], storageIndex < storageWriteOnly.size() && storageWriteOnly[storageIndex]);
+                            expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex], 0, storageWritten[storageIndex], std::nullopt, storageIndex < storageWriteOnly.size() && storageWriteOnly[storageIndex]);
                         }
                         if (expected != storageTextures[storageIndex]) return false;
                         const auto layers = DecodeTextureResource(words);

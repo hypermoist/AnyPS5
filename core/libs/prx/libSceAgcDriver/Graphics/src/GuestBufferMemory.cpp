@@ -1330,7 +1330,7 @@ ImportRun extentRun(const GuestAllocations::Lease& lease, std::uint64_t address,
         run.ranges.insert(run.ranges.end(), next.ranges.begin(), next.ranges.end());
     }
     if (allLarge && run.ranges.size() > 1) return {};
-    if (run.ranges.size() > 1 && Imports().unaliasedSpans.contains(run.base)) return {};
+    if (run.ranges.size() > 1 && Imports().failedBlocks.contains(std::pair{run.base, run.bytes})) return {};
     return run;
 }
 
@@ -3603,7 +3603,7 @@ void GuestBufferMemory::AcquireRegistered() {
         {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
-            const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, current->lease, mirror->base); };
+            const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, *current->lease, mirror->base); };
             if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
             else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
             else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
