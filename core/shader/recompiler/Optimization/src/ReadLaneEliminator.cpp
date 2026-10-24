@@ -225,9 +225,11 @@ std::size_t guardSpilledLanes(IrProgram& program, const std::vector<std::pair<Ir
             IrValue& current = program.CreateValue(IrOpcode::LoadVectorWindow, IrType::U32);
             current.AddArgument(store->Argument(0));
             block->InsertInstructionBefore(store, &current);
-            for (const auto key : found->second) {
+            std::map<std::uint32_t, std::uint64_t> lanes;
+            for (const auto key : found->second) lanes[static_cast<std::uint32_t>(key >> 32u)] |= std::uint64_t{1} << (static_cast<std::uint32_t>(key) & 63u);
+            for (const auto [slot, mask] : lanes) {
                 IrValue& guard = program.CreateValue(IrOpcode::WindowLaneGuard, IrType::Void);
-                for (IrValue* argument : {store->Argument(0), store->Argument(1), &current, &immediate(program, static_cast<std::uint32_t>(key >> 32u)), &immediate(program, static_cast<std::uint32_t>(key))}) guard.AddArgument(argument);
+                for (IrValue* argument : {store->Argument(0), store->Argument(1), &current, &immediate(program, slot), &immediate(program, static_cast<std::uint32_t>(mask)), &immediate(program, static_cast<std::uint32_t>(mask >> 32u))}) guard.AddArgument(argument);
                 block->InsertInstructionBefore(store, &guard);
                 ++guards;
             }

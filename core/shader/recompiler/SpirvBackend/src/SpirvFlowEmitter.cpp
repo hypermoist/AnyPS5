@@ -923,11 +923,15 @@ void EmitUnlinkedCall(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint
     StopBdaInvocationIf(state, ConstantBool(state, true));
 }
 
-void EmitWindowLaneGuard(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t index, std::uint32_t value, std::uint32_t current, std::uint32_t slot, std::uint32_t lane) {
+void EmitWindowLaneGuard(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t index, std::uint32_t value, std::uint32_t current, std::uint32_t slot, std::uint32_t lanesLow, std::uint32_t lanesHigh) {
     auto& state = ctx.state;
     if (state.faultBufferVariable == 0) ctx.Fail(inst, "checks a spilled lane without a fault buffer");
     const auto boolean = TypeBool(state);
-    const auto ownLane = Binary(state, spv::OpIEqual, boolean, EmitSubgroupLocalInvocationId(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, state.program.WaveSize() - 1u)));
+    const auto u32 = TypeU32(state);
+    const auto lane = EmitSubgroupLocalInvocationId(state);
+    const auto lanes = Select(state, u32, Binary(state, spv::OpULessThan, boolean, lane, ConstantU32(state, 32u)), lanesLow, lanesHigh);
+    const auto bit = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, lanes, Binary(state, spv::OpBitwiseAnd, u32, lane, ConstantU32(state, 31u))), ConstantU32(state, 1u));
+    const auto ownLane = Binary(state, spv::OpINotEqual, boolean, bit, ConstantU32(state, 0u));
     const auto overwritten = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpIEqual, boolean, index, slot), Binary(state, spv::OpINotEqual, boolean, value, current));
     EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, boolean, ownLane, overwritten), [&] { RecordBdaFaultWords(state, slot, lane, value, ConstantU32(state, 0u), BdaAbi::FaultReason::WindowLaneSpill); });
 }
