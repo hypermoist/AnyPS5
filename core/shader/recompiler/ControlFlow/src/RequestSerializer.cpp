@@ -957,7 +957,10 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.target.largePixelFunctionLdsBuffer = reader.ReadBool();
         result.request.target.pixelFunctionStorageDwords = reader.ReadU32();
     }
-    if (version >= 46u && reader.Remaining() != 0u) result.request.target.relaxedFloat = reader.ReadBool();
+    if (version >= 46u && reader.Remaining() != 0u) {
+        if (!reader.ReadBool()) throw std::runtime_error("RequestSerializer: unexpected trailing data");
+        result.request.target.relaxedFloat = true;
+    }
     if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     return result;
 }
