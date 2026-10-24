@@ -273,6 +273,42 @@ void TestAacRaw51(std::uint32_t maxChannels) {
     Require(sceAudiodecDeleteDecoder(handle) == 0);
 }
 
+struct M4aacExtendedParam {
+    AudiodecParamM4aac base;
+    std::uint32_t extensionMode;
+    std::uint32_t outputMode;
+};
+
+std::vector<std::uint8_t> DecodeWithModes(bool surround, std::uint32_t extensionMode, std::uint32_t outputMode) {
+    const std::uint32_t channels = surround ? 6 : 2;
+    M4aacExtendedParam param{{sizeof(param), 1, surround ? 2u : 1u, 3, channels, 0}, extensionMode, outputMode};
+    AudiodecM4aacInfo info{sizeof(info), 0, 0, 0, 0};
+    AudiodecCtrl ctrl{&param, &info, nullptr, nullptr};
+    const std::int32_t handle = sceAudiodecCreateDecoder(&ctrl, 3);
+    Require(handle > 0 && info.ui_number_of_channels == channels);
+    Streams streams;
+    std::vector<std::uint8_t> pcm;
+    const std::uint8_t* stream = surround ? AAC_RAW_51 : AAC_ADTS;
+    const std::size_t streamSize = surround ? sizeof(AAC_RAW_51) : sizeof(AAC_ADTS);
+    for (std::size_t offset = 0; offset < streamSize; offset += streams.au.ui_au_size) {
+        Require(Decode(handle, ctrl, streams, stream + offset, streamSize - offset) == 0);
+        Require(streams.pcm.ui_pcm_size == 1024 * channels * 2 && info.i_result == 0 && info.ui_number_of_channels == channels);
+        pcm.insert(pcm.end(), streams.output.begin(), streams.output.begin() + streams.pcm.ui_pcm_size);
+    }
+    Require(sceAudiodecDeleteDecoder(handle) == 0);
+    return pcm;
+}
+
+void TestAacExtendedModes() {
+    for (const bool surround : {false, true}) {
+        const std::vector<std::uint8_t> base = DecodeWithModes(surround, 0, 0);
+        Require(base.size() == (surround ? 1024 * 6 * 2u : 5 * 1024 * 2 * 2u));
+        for (std::uint32_t extensionMode = 0; extensionMode <= 1; ++extensionMode) {
+            for (std::uint32_t outputMode = 0; outputMode <= 2; ++outputMode) Require(DecodeWithModes(surround, extensionMode, outputMode) == base);
+        }
+    }
+}
+
 double UpperHalfEnergyShare(const std::int16_t* samples, std::size_t count, std::size_t stride) {
     double upper = 0;
     double total = 0;
@@ -419,11 +455,7 @@ int main() {
     aac.ui_max_channels = 6;
     aac.ui_enable_heaac = 1;
     Require(sceAudiodecCreateDecoder(&aacCtrl, 3) == static_cast<std::int32_t>(0x807F0302));
-    struct ExtendedParam {
-        AudiodecParamM4aac base;
-        std::uint32_t extensionMode;
-        std::uint32_t outputMode;
-    } extended{{32, 1, 1, 3, 2, 0}, 0, 0};
+    M4aacExtendedParam extended{{32, 1, 1, 3, 2, 0}, 0, 0};
     aacCtrl.pParam = &extended;
     for (const std::uint32_t size : {25u, 27u, 29u, 31u, 33u}) {
         extended.base.ui_size = size;
@@ -433,18 +465,21 @@ int main() {
         extended.base.ui_size = size;
         extended.extensionMode = 2;
         Require(sceAudiodecCreateDecoder(&aacCtrl, 3) == static_cast<std::int32_t>(0x807F0305));
-        extended.extensionMode = 1;
-        bool threw = false;
-        try { sceAudiodecCreateDecoder(&aacCtrl, 3); }
-        catch (const std::runtime_error&) { threw = true; }
-        Require(threw);
-        extended.extensionMode = 0;
-        const auto extendedHandle = sceAudiodecCreateDecoder(&aacCtrl, 3);
-        Require(extendedHandle > 0);
-        Require(sceAudiodecDeleteDecoder(extendedHandle) == 0);
+        for (const std::uint32_t extensionMode : {0u, 1u}) {
+            extended.extensionMode = extensionMode;
+            const auto extendedHandle = sceAudiodecCreateDecoder(&aacCtrl, 3);
+            Require(extendedHandle > 0);
+            Require(sceAudiodecDeleteDecoder(extendedHandle) == 0);
+        }
     }
     extended.outputMode = 3;
     Require(sceAudiodecCreateDecoder(&aacCtrl, 3) == static_cast<std::int32_t>(0x807F0306));
+    extended.extensionMode = 2;
+    Require(sceAudiodecCreateDecoder(&aacCtrl, 3) == static_cast<std::int32_t>(0x807F0305));
+    extended.base.ui_size = 28;
+    extended.extensionMode = 0;
+    const auto shortHandle = sceAudiodecCreateDecoder(&aacCtrl, 3);
+    Require(shortHandle > 0 && sceAudiodecDeleteDecoder(shortHandle) == 0);
 
     const std::int32_t handle = sceAudiodecCreateDecoder(&ctrl, 2);
     Require(handle > 0);
@@ -463,6 +498,7 @@ int main() {
     TestAac(false, 8);
     TestAacRaw51(6);
     TestAacRaw51(8);
+    TestAacExtendedModes();
     for (const bool adts : {true, false}) {
         for (const bool highEfficiency : {true, false}) {
             TestHeAac(HEAAC_V2_MONO, sizeof(HEAAC_V2_MONO), 1, adts, highEfficiency);

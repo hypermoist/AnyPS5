@@ -3,6 +3,7 @@
 #include "libatrac9.h"
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/log.h>
 }
 
@@ -36,6 +37,15 @@ struct PacketDeleter {
 struct FrameDeleter {
     void operator()(AVFrame* frame) const { av_frame_free(&frame); }
 };
+
+std::uint32_t surroundChannels(const AVChannelLayout& layout) {
+    std::uint32_t count = 0;
+    for (int index = 0; index < layout.nb_channels; ++index) {
+        const AVChannel channel = av_channel_layout_channel_from_index(&layout, static_cast<unsigned>(index));
+        if (channel != AV_CHAN_FRONT_LEFT && channel != AV_CHAN_FRONT_RIGHT && channel != AV_CHAN_FRONT_CENTER && channel != AV_CHAN_LOW_FREQUENCY) ++count;
+    }
+    return count;
+}
 
 class FfmpegDecoder : public Decoder {
 public:
@@ -78,6 +88,7 @@ protected:
                 }
             }
             result.channels = static_cast<std::uint32_t>(channels);
+            result.surroundChannels = surroundChannels(frame->ch_layout);
             result.sampleRate = static_cast<std::uint32_t>(frame->sample_rate);
             result.highEfficiency = context->profile == AV_PROFILE_AAC_HE || context->profile == AV_PROFILE_AAC_HE_V2;
             av_frame_unref(frame.get());

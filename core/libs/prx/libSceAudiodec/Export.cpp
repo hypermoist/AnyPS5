@@ -34,6 +34,8 @@ constexpr std::int32_t ERROR_M4AAC_INVALID_SAMPLING_FREQ = static_cast<std::int3
 constexpr std::int32_t ERROR_M4AAC_INVALID_ENABLE_HEAAC = static_cast<std::int32_t>(0x807F0302);
 constexpr std::int32_t ERROR_M4AAC_INVALID_CONFIG_NUMBER = static_cast<std::int32_t>(0x807F0303);
 constexpr std::int32_t ERROR_M4AAC_INVALID_MAX_CHANNELS = static_cast<std::int32_t>(0x807F0304);
+constexpr std::int32_t ERROR_M4AAC_INVALID_EXTENSION_MODE = static_cast<std::int32_t>(0x807F0305);
+constexpr std::int32_t ERROR_M4AAC_INVALID_OUTPUT_MODE = static_cast<std::int32_t>(0x807F0306);
 constexpr std::int32_t ERROR_AT9_INVALID_CONFIG_DATA = static_cast<std::int32_t>(0x807F1000);
 
 constexpr std::uint32_t TYPE_AT9 = 1;
@@ -55,6 +57,7 @@ struct Instance {
     Audiodec::At9Format at9{};
     std::uint32_t channels = 0;
     std::uint32_t sampleRate = 0;
+    std::uint32_t outputMode = 0;
 };
 
 std::mutex g_mutex;
@@ -140,10 +143,9 @@ std::int32_t createAac(const AudiodecParamM4aac* param, AudiodecM4aacInfo* info,
     std::uint32_t outputMode = 0;
     const auto* bytes = reinterpret_cast<const std::byte*>(param);
     if (param->ui_size >= 28) std::memcpy(&extensionMode, bytes + 24, sizeof(extensionMode));
-    if (extensionMode > 1) return static_cast<std::int32_t>(0x807F0305);
+    if (extensionMode > 1) return ERROR_M4AAC_INVALID_EXTENSION_MODE;
     if (param->ui_size == 32) std::memcpy(&outputMode, bytes + 28, sizeof(outputMode));
-    if (outputMode > 2) return static_cast<std::int32_t>(0x807F0306);
-    if (extensionMode != 0 || outputMode != 0) throw std::runtime_error("M4AAC extended decoding modes are not implemented");
+    if (outputMode > 2) return ERROR_M4AAC_INVALID_OUTPUT_MODE;
     if (param->ui_config_number != M4AAC_CONFIG_ADTS && param->ui_config_number != M4AAC_CONFIG_RAW) return ERROR_M4AAC_INVALID_CONFIG_NUMBER;
     const std::uint32_t sampleRate = Audiodec::AacSampleRate(param->ui_sampling_freq_index);
     if (param->ui_config_number == M4AAC_CONFIG_RAW && sampleRate == 0) return ERROR_M4AAC_INVALID_SAMPLING_FREQ;
@@ -153,6 +155,7 @@ std::int32_t createAac(const AudiodecParamM4aac* param, AudiodecM4aacInfo* info,
     instance.decoder = Audiodec::CreateAac(param->i_bw_pcm, param->ui_config_number == M4AAC_CONFIG_ADTS, param->ui_sampling_freq_index, channels, param->ui_enable_heaac == 1);
     instance.channels = channels;
     instance.sampleRate = sampleRate;
+    instance.outputMode = outputMode;
     info->ui_sampling_freq = sampleRate;
     info->ui_number_of_channels = channels;
     info->ui_heaac = 0;
@@ -236,6 +239,7 @@ int32_t APS5_VABI sceAudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) {
     const Audiodec::DecodeResult decoded = instance->decoder->Decode(static_cast<const std::uint8_t*>(ctrl->pAuInfo->p_au_addr), ctrl->pAuInfo->ui_au_size,
                                                                      static_cast<std::uint8_t*>(ctrl->pPcmItem->p_pcm_addr), ctrl->pPcmItem->ui_pcm_size);
     if (instance->codecType == TYPE_M4AAC) {
+        if (instance->outputMode != 0 && decoded.surroundChannels > 2) throw std::runtime_error("libSceAudiodec: M4AAC surround interleave orders are not implemented for more than two surround channels");
         auto* info = static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo);
         info->i_result = decoded.status == Audiodec::DecodeStatus::InvalidData ? M4AAC_RESULT_DECODE_ERROR
             : decoded.status == Audiodec::DecodeStatus::PartialInput ? M4AAC_RESULT_INSUFFICIENT_DATA : 0;
