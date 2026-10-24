@@ -34,6 +34,7 @@ struct DecodeResult {
     std::size_t produced = 0;
     std::uint32_t channels = 0;
     std::uint32_t sampleRate = 0;
+    std::uint32_t surroundChannels = 0;
     bool highEfficiency = false;
     Mp3Header mp3{};
 };
