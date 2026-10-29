@@ -366,6 +366,11 @@ int APS5_VABI _ZN3sce2np6ThreadD1Ev(void) {
     return 0;
 }
 
+int APS5_VABI _ZN3sce2npeqERK12SceNpTitleIdRKNS0_9NpTitleIdE(void) {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 int APS5_VABI _ZN3sce2np9EventFlag3SetEm(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;

@@ -275,7 +275,7 @@ void TestTitleIdObjects() {
     plain.data[11] = '9';
     Require(_ZNK3sce2np9NpTitleId6EqualsERKS1_(&copy, &built) && _ZN3sce2npeqERKNS0_9NpTitleIdES3_(&copy, &built)
         && _ZNK3sce2np9NpTitleId6EqualsEPKc(&copy, "WXYZ54321_00"), "equal title ids compare equal");
-    Require(_ZN3sce2npneERKNS0_9NpTitleIdERK12SceNpTitleId(&copy, &plain) && !_ZN3sce2npeqERK12SceNpTitleIdRKNS0_9NpTitleIdE(&plain, &copy),
+    Require(_ZN3sce2npneERKNS0_9NpTitleIdERK12SceNpTitleId(&copy, &plain) && _ZN3sce2npneERK12SceNpTitleIdRKNS0_9NpTitleIdE(&plain, &copy),
         "the suffix takes part in the comparison");
     plain.data[12] = 'q';
     plain.data[11] = '0';

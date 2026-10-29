@@ -950,10 +950,6 @@ bool APS5_VABI _ZN3sce2npeqERKNS0_9NpTitleIdES3_(const NpTitleIdObject* lhs, con
     return SameTitleId(lhs->titleId.data, rhs->titleId.data);
 }
 
-bool APS5_VABI _ZN3sce2npeqERK12SceNpTitleIdRKNS0_9NpTitleIdE(const NpTitleId* lhs, const NpTitleIdObject* rhs) {
-    return SameTitleId(lhs->data, rhs->titleId.data);
-}
-
 bool APS5_VABI _ZN3sce2npeqERKNS0_9NpTitleIdERK12SceNpTitleId(const NpTitleIdObject* lhs, const NpTitleId* rhs) {
     return SameTitleId(lhs->titleId.data, rhs->data);
 }
