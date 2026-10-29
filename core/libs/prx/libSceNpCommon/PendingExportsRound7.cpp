@@ -201,11 +201,6 @@ int APS5_VABI _ZN3sce2np12StreamReader4ReadEPNS0_6HandleEPNS0_9StreamCtxEPvmPm(v
     return 0;
 }
 
-int APS5_VABI _ZN3sce2np9NpTitleId5ParseEPS1_PKcm(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI _ZN3sce2np20BufferedStreamReaderD1Ev(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -367,11 +362,6 @@ int APS5_VABI _ZN3sce2np12StreamWriter9WriteDataEPNS0_6HandleEPKvmPm(void) {
 }
 
 int APS5_VABI _ZN3sce2np6ThreadD1Ev(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI _ZN3sce2npeqERK12SceNpTitleIdRKNS0_9NpTitleIdE(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -672,11 +662,6 @@ int APS5_VABI _ZN3sce2np6Thread4dtorEv(void) {
 }
 
 int APS5_VABI _ZN3sce2np4Time8AddHoursEl(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI _ZN3sce2np9NpTitleIdC2ERK12SceNpTitleId(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
